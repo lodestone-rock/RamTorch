@@ -181,11 +181,11 @@ This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENS
 If you use RamTorch in your research, please cite:
 
 ```bibtex
-@software{ramtorch2024,
+@software{ramtorch2025,
   author = {Lodestone},
   title = {RamTorch: Memory-Efficient Deep Learning with CPU-GPU Hybrid Architecture},
   url = {https://github.com/lodestone-rock/RamTorch},
-  year = {2024}
+  year = {2025}
 }
 ```
 
