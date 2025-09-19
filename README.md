@@ -114,11 +114,6 @@ for epoch in range(num_epochs):
         model.zero_grad()
         scheduler.step()
 ```
-## Configuration
-
-### Transfer Stream Management
-
-RamTorch automatically manages CUDA streams for optimal performance. The library uses a dedicated transfer stream to overlap data movement with computation.
 
 ## Performance Considerations
 
