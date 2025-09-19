@@ -18,12 +18,20 @@ import torch.nn.functional as F
 # Using a dedicated stream allows transfers to overlap with computation
 TRANSFER_STREAM = torch.cuda.Stream()
 
-# Maximum number of in-flight transfers to prevent unbounded memory growth
-# Can be configured via environment variable
-MAX_INFLIGHT = int(os.getenv("MAX_INFLIGHT", 2))
+# --- Forward Pass Synchronization Primitives ---
+TRANSFER_FORWARD_FINISHED_EVENT = torch.cuda.Event()
+COMPUTE_FORWARD_START_EVENT = torch.cuda.Event()
+W_BUFFERS = [None, None]
+B_BUFFERS = [None, None]
 
-# Queue to track pending transfer events for synchronization
-PENDING_EVENTS = []
+# --- Backward Pass Synchronization Primitives ---
+TRANSFER_BACKWARD_FINISHED_EVENT = torch.cuda.Event()
+COMPUTE_BACKWARD_START_EVENT = torch.cuda.Event()
+W_GRAD_BUFFERS = [None, None]
+
+# buffer clock, tick toc!
+FORWARD_BUFFER_CLK = 0
+BACKWARD_BUFFER_CLK = 0
 
 
 class BouncingLinearFn(torch.autograd.Function):
@@ -58,27 +66,35 @@ class BouncingLinearFn(torch.autograd.Function):
             4. Wait for transfer completion before computation
             5. Perform linear operation and return result
         """
-        global PENDING_EVENTS
+        global TRANSFER_STREAM, TRANSFER_FORWARD_FINISHED_EVENT, COMPUTE_FORWARD_START_EVENT, FORWARD_BUFFER_CLK, W_BUFFERS, B_BUFFERS
+
+        # get index from clock
+        selected_buffer = FORWARD_BUFFER_CLK
 
         # enqueue transfer on transfer stream
         with torch.cuda.stream(TRANSFER_STREAM):
-            w = weight_cpu.to(device, non_blocking=True)
-            b = bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
+            # if it's a first time, it's a no-op
+            # wait for compute event to finish first
+            TRANSFER_STREAM.wait_event(COMPUTE_FORWARD_START_EVENT)
 
-            # record event after transfer
-            evt = torch.cuda.Event()
-            evt.record(TRANSFER_STREAM)
-            PENDING_EVENTS.append(evt)
+            # alternate between buffers to prevent race condition where the transfer stream
+            # overwriting the weight buffers before the main stream finish calculating the value 
+            W_BUFFERS[selected_buffer] = weight_cpu.to(device, non_blocking=True)
+            B_BUFFERS[selected_buffer] = (
+                bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
+            )
 
-        # throttle: wait if too many inflight
-        if len(PENDING_EVENTS) > MAX_INFLIGHT:
-            PENDING_EVENTS[0].synchronize()
-            PENDING_EVENTS.pop(0)
+            # flip the clock!
+            FORWARD_BUFFER_CLK ^= 1
+            # record event after transfer is done
+            TRANSFER_FORWARD_FINISHED_EVENT.record()
 
         # make compute stream wait for this transfer
-        torch.cuda.current_stream().wait_event(evt)
+        torch.cuda.current_stream().wait_event(TRANSFER_FORWARD_FINISHED_EVENT)
 
-        out = F.linear(x, w, b)
+        # mark the start of compute event
+        COMPUTE_FORWARD_START_EVENT.record()
+        out = F.linear(x, W_BUFFERS[selected_buffer], B_BUFFERS[selected_buffer])
 
         # save for backward
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
@@ -102,28 +118,39 @@ class BouncingLinearFn(torch.autograd.Function):
             Weights need to be transferred again for gradient computation
             since they're not kept on GPU between forward and backward passes.
         """
-        global PENDING_EVENTS
+        global TRANSFER_STREAM, TRANSFER_BACKWARD_FINISHED_EVENT, COMPUTE_BACKWARD_START_EVENT, BACKWARD_BUFFER_CLK, W_GRAD_BUFFERS
+
+        # get index from clock
+        selected_buffer = BACKWARD_BUFFER_CLK
+
         x, weight_cpu, bias_cpu = ctx.saved_tensors
         device = ctx.device
 
-        # enqueue transfer on transfer stream
+        # transfer weights on transfer stream
         with torch.cuda.stream(TRANSFER_STREAM):
-            w = weight_cpu.to(device, non_blocking=True)
-            evt = torch.cuda.Event()
-            evt.record(TRANSFER_STREAM)
-            PENDING_EVENTS.append(evt)
+            # if it's a first time, it's a no-op
+            # wait for compute event to finish first
+            TRANSFER_STREAM.wait_event(COMPUTE_BACKWARD_START_EVENT)
 
-        # throttle: wait if too many inflight
-        if len(PENDING_EVENTS) > MAX_INFLIGHT:
-            PENDING_EVENTS[0].synchronize()
-            PENDING_EVENTS.pop(0)
+            # alternate between buffers to prevent race condition where the transfer stream
+            # overwriting the weight buffers before the main stream finish calculating the value 
+            W_GRAD_BUFFERS[selected_buffer] = weight_cpu.to(device, non_blocking=True)
 
-        torch.cuda.current_stream().wait_event(evt)
+            # flip the clock!
+            BACKWARD_BUFFER_CLK ^= 1
+            # record when transfer is done
+            TRANSFER_BACKWARD_FINISHED_EVENT.record()
 
-        # grad computation
-        grad_input = grad_out @ w
+        # Make the compute stream wait for the weight transfer to complete
+        torch.cuda.current_stream().wait_event(TRANSFER_BACKWARD_FINISHED_EVENT)
+
+        # mark the start of compute event
+        COMPUTE_BACKWARD_START_EVENT.record()
+
+        # Compute gradients
+        grad_input = grad_out @ W_GRAD_BUFFERS[selected_buffer]
         grad_weight = grad_out.t() @ x
-        grad_bias = grad_out.sum(0) if bias_cpu is not None else None
+        grad_bias = grad_out.sum(dim=0) if bias_cpu is not None else None
 
         return grad_input, grad_weight, grad_bias, None
 
