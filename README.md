@@ -12,7 +12,6 @@ RamTorch provides CPU-GPU hybrid implementations of neural network components th
 - **Asynchronous CUDA Streams**: Overlap computation with data transfer for minimal latency
 - **ZeRO-1 Optimizer Support**: Distributed optimizer state sharding across multiple GPUs
 - **Drop-in Replacement**: Compatible with existing PyTorch code
-- **Configurable Transfer Throttling**: Controllable memory usage
 
 ## Installation
 
@@ -116,13 +115,6 @@ for epoch in range(num_epochs):
         scheduler.step()
 ```
 ## Configuration
-
-### Environment Variables
-
-- `MAX_INFLIGHT`: Maximum number of concurrent CPU-to-GPU transfers (default: 2)
-  ```bash
-  export MAX_INFLIGHT=4  # Allow more concurrent transfers
-  ```
 
 ### Transfer Stream Management
 
