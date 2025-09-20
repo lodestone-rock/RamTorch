@@ -133,9 +133,8 @@ for epoch in range(num_epochs):
 ### Optimization Tips
 
 1. **Use Larger Batch Sizes**: Helps amortize transfer costs
-2. **Configure MAX_INFLIGHT**: Tune based on your GPU memory availability
-3. **Mixed Precision**: Combine with `torch.cuda.amp` for additional memory savings
-4. **Strategic Placement**: Use RamTorch layers for the largest components only
+2. **Mixed Precision**: Combine with `torch.cuda.amp` for additional memory savings
+3. **Strategic Placement**: Use RamTorch layers for the largest components only
 
 ## Architecture
 
@@ -145,7 +144,6 @@ for epoch in range(num_epochs):
 1. Stores parameters on CPU memory (with `share_memory_()` for multiprocessing)
 2. Asynchronously transfers weights to GPU during forward pass
 3. Uses CUDA events for proper stream synchronization
-4. Automatically throttles transfers to prevent memory overflow
 
 ### Memory Flow
 
