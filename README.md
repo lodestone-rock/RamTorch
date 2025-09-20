@@ -35,13 +35,13 @@ Replace `torch.nn.Linear` with `ramtorch.modules.Linear` for automatic memory op
 
 ```python
 import torch
-import ramtorch.modules as ram_modules
+from ramtorch import Linear
 
 # Standard PyTorch approach (high GPU memory usage)
 # linear = torch.nn.Linear(1000, 1000)
 
 # RamTorch approach (low GPU memory usage)
-linear = ram_modules.Linear(1000, 1000, device="cuda")
+linear = Linear(1000, 1000, device="cuda")
 
 # Use exactly like a normal PyTorch layer
 x = torch.randn(32, 1000, device="cuda")
@@ -52,17 +52,17 @@ output = linear(x)  # Parameters automatically transferred from CPU to GPU
 
 ```python
 import torch.nn as nn
-import ramtorch.modules as ram_modules
+from ramtorch import Linear
 
 class MemoryEfficientModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.layers = nn.Sequential(
-            ram_modules.Linear(1000, 2000),
+            Linear(1000, 2000),
             nn.ReLU(),
-            ram_modules.Linear(2000, 2000),
+            Linear(2000, 2000),
             nn.ReLU(),
-            ram_modules.Linear(2000, 100)
+            Linear(2000, 100)
         )
     
     def forward(self, x):
