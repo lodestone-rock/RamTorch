@@ -111,6 +111,7 @@ for epoch in range(num_epochs):
         # Broadcast updated parameters from owners to all ranks
         broadcast_zero_params(all_params, owner_ranks)
         
+        # It has to be model.zero_grad()! because optimizer on each rank only handles its own shard
         model.zero_grad()
         scheduler.step()
 ```
