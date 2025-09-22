@@ -88,8 +88,8 @@ world_size = dist.get_world_size()
 
 # Create ZeRO-1 sharded optimizer
 param_groups = [{'params': all_params, 'lr': 1e-3, 'weight_decay': 0.01}]
-sharded_groups, owner_ranks = create_zero_param_groups(param_groups, rank, world_size)
-optimizer = torch.optim.AdamW(sharded_groups)
+rank_param_groups = create_zero_param_groups(param_groups, world_size)
+optimizer = torch.optim.AdamW(sharded_groups[rank]) # only optimize the shard
 
 # Scheduler works normally with sharded optimizer
 scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
@@ -109,7 +109,7 @@ for epoch in range(num_epochs):
         optimizer.step()
         
         # Broadcast updated parameters from owners to all ranks
-        broadcast_zero_params(all_params, owner_ranks)
+        broadcast_zero_params(rank_param_groups)
         
         # It has to be model.zero_grad()! because optimizer on each rank only handles its own shard
         model.zero_grad()
