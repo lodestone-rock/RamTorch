@@ -1,66 +1,51 @@
-from typing import List, Dict, Any, Tuple
-
 import torch
 import torch.distributed as dist
 
-
-def create_zero_param_groups(
-    param_groups: List[Dict[str, Any]], rank: int, world_size: int
-) -> Tuple[List[Dict[str, Any]], List[int]]:
+def create_zero_param_groups(param_groups, world_size):
     """
     Create parameter groups for ZeRO-1 optimizer sharding and generate a map
     of parameter owners for broadcasting.
 
     Args:
-        param_groups: Original parameter groups (list of dicts with 'params' key)
-        rank: Current process rank
-        world_size: Total number of processes
+        param_groups: A list of parameter groups in the standard PyTorch format.
+            Example: [{'params': model.parameters(), 'lr': 0.001}]
+        world_size: Total number of ranks.
 
     Returns:
-        A tuple containing:
-        - List of parameter groups containing only parameters owned by this rank.
-        - A list where the index corresponds to a parameter's global index and
-          the value is the rank of the process that owns it. This is the pre-computed
-          index for the broadcast function.
+        dict: similar to param_groups but chunked into ranks
     """
-    if not dist.is_initialized():
-        raise RuntimeError("torch.distributed must be initialized")
-
-    sharded_groups = []
-    owner_ranks = []
-    global_param_idx = 0
-
-    for group in param_groups:
-        # Copy all group settings except params
-        sharded_group = {k: v for k, v in group.items() if k != "params"}
-        sharded_group["params"] = []
-
-        # Add only parameters owned by this rank
-        for param in group["params"]:
-            owner_rank = global_param_idx % world_size
-            owner_ranks.append(owner_rank)
-
-            if owner_rank == rank:
-                sharded_group["params"].append(param)
-            global_param_idx += 1
-
-        # Only add group if it has parameters for this rank
-        if sharded_group["params"]:
-            sharded_groups.append(sharded_group)
-
-    return sharded_groups, owner_ranks
+    rank_param_groups = {rank: [] for rank in range(world_size)}
+    
+    for group_idx, group in enumerate(param_groups):
+        # empty groups for each rank for (lr, weight_decay, whatever)
+        group_config = {k: v for k, v in group.items() if k != 'params'}
+        
+        for rank in range(world_size):
+            rank_param_groups[rank].append({
+                'params': [],
+                **group_config
+            })
+        
+        # round-robin the param reference 
+        current_rank = 0
+        for param in group['params']:
+            # put it to current_rank
+            rank_param_groups[current_rank][group_idx]['params'].append(param)
+            
+            current_rank = (current_rank + 1) % world_size
+    
+    return rank_param_groups
 
 
-def broadcast_zero_params(all_params: List[torch.Tensor], owner_ranks: List[int]):
+def broadcast_zero_params(rank_param_groups):
     """
-    Broadcast updated parameters from their owning ranks to all other ranks
-    using a pre-computed index of owner ranks.
-
+    Broadcast parameters from owner ranks to the rest of the ranks after grad sync and optim step.
+    
     Args:
-        all_params: List of all model parameters (in the same order across all ranks)
-        owner_ranks: A list mapping each parameter's global index to its owner rank.
+        rank_param_groups: Dict mapping rank -> list of param groups for that rank
     """
     with torch.no_grad():
-        for i, param in enumerate(all_params):
-            owner_rank = owner_ranks[i]
-            dist.broadcast(param.data, src=owner_rank)
+        for owner_rank, param_groups in rank_param_groups.items():
+            for group in param_groups:
+                for param in group['params']:
+                    dist.broadcast(param.data, src=owner_rank)
