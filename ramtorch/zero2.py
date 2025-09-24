@@ -30,7 +30,6 @@ def setup_grad_sharding_hooks(rank_param_groups, current_rank):
             
             if current_rank == owner_rank:
                 # owner rank keeps the reduced gradient
-                grad /= dist.get_world_size()
                 return grad
             else:
                 # boot grad on non-owner ranks 
