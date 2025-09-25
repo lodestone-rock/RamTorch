@@ -175,7 +175,7 @@ class CPUBouncingLinear(nn.Module):
     - Inference scenarios with memory constraints
     """
 
-    def __init__(self, in_features, out_features, bias=True, device="cuda"):
+    def __init__(self, in_features, out_features, bias=True, dtype=None, device="cuda"):
         """
         Initialize CPU linear layer.
 
@@ -193,13 +193,15 @@ class CPUBouncingLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.device = device
-
+        if dtype is None:
+            dtype = torch.float32
+        
         # parameters live on CPU
         self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, device="cpu").share_memory_().pin_memory()
+            torch.empty(out_features, in_features, dtype=dtype, device="cpu").share_memory_().pin_memory()
         )
         self.bias = (
-            nn.Parameter(torch.empty(out_features, device="cpu").share_memory_().pin_memory())
+            nn.Parameter(torch.empty(out_features, dtype=dtype, device="cpu").share_memory_().pin_memory())
             if bias
             else None
         )
