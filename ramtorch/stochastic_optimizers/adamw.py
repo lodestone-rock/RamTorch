@@ -3,16 +3,21 @@ from torch.optim import Optimizer
 
 
 # @torch.compile
-def copy_stochastic_(target: torch.Tensor, source: torch.Tensor):
+def copy_stochastic_(target: torch.Tensor, source: torch.Tensor, seed=0):
     # thanks to Nerogar for fast stochastic pytorch implementation
     # https://github.com/pytorch/pytorch/issues/120376#issuecomment-1974828905
     with torch.no_grad():
-        # create a random 16 bit integer
-        result = torch.randint_like(
-            source,
-            dtype=torch.int32,
+        generator = torch.Generator(device=source.device)
+        generator.manual_seed(seed)
+
+        # create a random 16 bit integer using torch.randint with explicit shape
+        result = torch.randint(
             low=0,
             high=(1 << 16),
+            size=source.shape,
+            dtype=torch.int32,
+            device=source.device,
+            generator=generator,
         )
 
         # add the random number to the lower 16 bit of the mantissa
@@ -55,9 +60,12 @@ class AdamW(Optimizer):
         lr=1e-3,
         betas=(0.9, 0.999),
         eps=1e-8,
-        weight_decay=0,
+        weight_decay=1e-2,
         centralization=0,
         chunk_size=64,
+        dtype=torch.bfloat16,
+        storage_device="cpu",
+        # device=None
     ):
         defaults = dict(
             lr=lr,
@@ -69,6 +77,9 @@ class AdamW(Optimizer):
         super(AdamW, self).__init__(params, defaults)
 
         self.chunk_size = chunk_size
+        self.optim_state_dtype = dtype
+        self.optim_state_device = storage_device
+        # self.device = device
 
         # Initialize state in pinned memory for faster async transfers
         for group in self.param_groups:
@@ -76,12 +87,21 @@ class AdamW(Optimizer):
                 state = self.state[p]
                 if not state:
                     state["step"] = 0
-                    state["ema"] = torch.zeros_like(
-                        p.data, dtype=torch.bfloat16, device="cpu"
-                    ).pin_memory()
-                    state["ema_squared"] = torch.zeros_like(
-                        p.data, dtype=torch.bfloat16, device="cpu"
-                    ).pin_memory()
+
+                    if self.optim_state_device == "cpu":
+                        state["ema"] = torch.zeros_like(
+                            p.data, dtype=dtype, device=self.optim_state_device
+                        ).pin_memory()
+                        state["ema_squared"] = torch.zeros_like(
+                            p.data, dtype=dtype, device=self.optim_state_device
+                        ).pin_memory()
+                    else:
+                        state["ema"] = torch.zeros_like(
+                            p.data, dtype=dtype, device=self.optim_state_device
+                        )
+                        state["ema_squared"] = torch.zeros_like(
+                            p.data, dtype=dtype, device=self.optim_state_device
+                        )
 
     def step(self, closure=None):
         loss = None
@@ -94,7 +114,6 @@ class AdamW(Optimizer):
                 if p.grad is None:
                     continue
 
-                assert p.dtype == torch.bfloat16, "only bfloat 16 is supported."
                 grad = p.grad
                 if grad.is_sparse:
                     raise RuntimeError("Compass does not support sparse gradients")
@@ -105,12 +124,28 @@ class AdamW(Optimizer):
                 # Lazy state initialization
                 if not state:
                     state["step"] = 0
-                    state["ema"] = torch.zeros_like(
-                        p.data, dtype=torch.bfloat16, device="cpu"
-                    ).pin_memory()
-                    state["ema_squared"] = torch.zeros_like(
-                        p.data, dtype=torch.bfloat16, device="cpu"
-                    ).pin_memory()
+                    if self.optim_state_device == "cpu":
+                        state["ema"] = torch.zeros_like(
+                            p.data,
+                            dtype=self.optim_state_dtype,
+                            device=self.optim_state_device,
+                        ).pin_memory()
+                        state["ema_squared"] = torch.zeros_like(
+                            p.data,
+                            dtype=self.optim_state_dtype,
+                            device=self.optim_state_device,
+                        ).pin_memory()
+                    else:
+                        state["ema"] = torch.zeros_like(
+                            p.data,
+                            dtype=self.optim_state_dtype,
+                            device=self.optim_state_device,
+                        )
+                        state["ema_squared"] = torch.zeros_like(
+                            p.data,
+                            dtype=self.optim_state_dtype,
+                            device=self.optim_state_device,
+                        )
 
                 # ========= Asynchronously queue all operations for this parameter =========
 
@@ -153,13 +188,22 @@ class AdamW(Optimizer):
 
                 p_fp32.data.addcdiv_(ema_fp32, denom, value=-step_size)
 
-                copy_stochastic_(p, p_fp32)
-                copy_stochastic_(ema_gpu, ema_fp32)
-                copy_stochastic_(ema_squared_gpu, ema_squared_fp32)
-
                 # 3. Queue Device-to-Host copy
-                state["ema"].copy_(ema_gpu, non_blocking=True)
-                state["ema_squared"].copy_(ema_squared_gpu, non_blocking=True)
+                # only use stochastic rounding if using bf16
+                if p.dtype == torch.bfloat16:
+                    copy_stochastic_(p, p_fp32, state["step"] + 42)
+                else:
+                    p.data.copy_(p_fp32, non_blocking=True)
+                if self.optim_state_dtype == torch.bfloat16:
+                    copy_stochastic_(ema_gpu, ema_fp32, state["step"] + 69)
+                    copy_stochastic_(
+                        ema_squared_gpu, ema_squared_fp32, state["step"] + 420
+                    )
+                    state["ema"].copy_(ema_gpu, non_blocking=True)
+                    state["ema_squared"].copy_(ema_squared_gpu, non_blocking=True)
+                else:
+                    state["ema"].copy_(ema_fp32, non_blocking=True)
+                    state["ema_squared"].copy_(ema_squared_fp32, non_blocking=True)
 
                 # ========= Check if we need to synchronize =========
                 # We synchronize after processing a chunk of parameters.
