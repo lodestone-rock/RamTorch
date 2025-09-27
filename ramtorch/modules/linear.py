@@ -9,29 +9,37 @@ This approach interleave compute and data transfer, making it useful for:
 - Scenarios where GPU memory is limited but CPU memory is abundant
 """
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Global CUDA stream for asynchronous weight transfers
-# Using a dedicated stream allows transfers to overlap with computation
-TRANSFER_STREAM = torch.cuda.Stream()
+# --- Per-device global state registry ---
+_DEVICE_STATE = {}
 
-# --- Forward Pass Synchronization Primitives ---
-TRANSFER_FORWARD_FINISHED_EVENT = torch.cuda.Event()
-COMPUTE_FORWARD_START_EVENT = torch.cuda.Event()
-W_BUFFERS = [None, None]
-B_BUFFERS = [None, None]
 
-# --- Backward Pass Synchronization Primitives ---
-TRANSFER_BACKWARD_FINISHED_EVENT = torch.cuda.Event()
-COMPUTE_BACKWARD_START_EVENT = torch.cuda.Event()
-W_GRAD_BUFFERS = [None, None]
+def _get_device_state(device=torch.cuda.current_device()):
+    """Get or initialize per-device state."""
+    if isinstance(device, str):
+        device = torch.device(device)
 
-# buffer clock, tick toc!
-FORWARD_BUFFER_CLK = 0
-BACKWARD_BUFFER_CLK = 0
+    if device not in _DEVICE_STATE:
+        with torch.cuda.device(device):
+            _DEVICE_STATE[device] = {
+                # streams & events
+                "transfer_stream": torch.cuda.Stream(device=device),
+                "transfer_forward_finished_event": torch.cuda.Event(),
+                "compute_forward_start_event": torch.cuda.Event(),
+                "transfer_backward_finished_event": torch.cuda.Event(),
+                "compute_backward_start_event": torch.cuda.Event(),
+                # buffers
+                "w_buffers": [None, None],
+                "b_buffers": [None, None],
+                "w_grad_buffers": [None, None],
+                # clocks
+                "forward_clk": 0,
+                "backward_clk": 0,
+            }
+    return _DEVICE_STATE[device]
 
 
 class BouncingLinearFn(torch.autograd.Function):
@@ -66,35 +74,40 @@ class BouncingLinearFn(torch.autograd.Function):
             4. Wait for transfer completion before computation
             5. Perform linear operation and return result
         """
-        global TRANSFER_STREAM, TRANSFER_FORWARD_FINISHED_EVENT, COMPUTE_FORWARD_START_EVENT, FORWARD_BUFFER_CLK, W_BUFFERS, B_BUFFERS
+        state = _get_device_state(device)
+        transfer_stream = state["transfer_stream"]
+        w_buffers = state["w_buffers"]
+        b_buffers = state["b_buffers"]
+        transfer_forward_finished_event = state["transfer_forward_finished_event"]
+        compute_forward_start_event = state["compute_forward_start_event"]
 
         # get index from clock
-        selected_buffer = FORWARD_BUFFER_CLK
+        selected_buffer = state["forward_clk"]
 
         # enqueue transfer on transfer stream
-        with torch.cuda.stream(TRANSFER_STREAM):
+        with torch.cuda.stream(transfer_stream):
             # if it's a first time, it's a no-op
             # wait for compute event to finish first
-            TRANSFER_STREAM.wait_event(COMPUTE_FORWARD_START_EVENT)
+            transfer_stream.wait_event(compute_forward_start_event)
 
             # alternate between buffers to prevent race condition where the transfer stream
-            # overwriting the weight buffers before the main stream finish calculating the value 
-            W_BUFFERS[selected_buffer] = weight_cpu.to(device, non_blocking=True)
-            B_BUFFERS[selected_buffer] = (
+            # overwriting the weight buffers before the main stream finish calculating the value
+            w_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
+            b_buffers[selected_buffer] = (
                 bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
             )
 
             # flip the clock!
-            FORWARD_BUFFER_CLK ^= 1
+            state["forward_clk"] ^= 1
             # record event after transfer is done
-            TRANSFER_FORWARD_FINISHED_EVENT.record()
+            transfer_forward_finished_event.record()
 
         # make compute stream wait for this transfer
-        torch.cuda.current_stream().wait_event(TRANSFER_FORWARD_FINISHED_EVENT)
+        torch.cuda.current_stream().wait_event(transfer_forward_finished_event)
 
         # mark the start of compute event
-        COMPUTE_FORWARD_START_EVENT.record()
-        out = F.linear(x, W_BUFFERS[selected_buffer], B_BUFFERS[selected_buffer])
+        compute_forward_start_event.record()
+        out = F.linear(x, w_buffers[selected_buffer], b_buffers[selected_buffer])
 
         # save for backward
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
@@ -118,37 +131,40 @@ class BouncingLinearFn(torch.autograd.Function):
             Weights need to be transferred again for gradient computation
             since they're not kept on GPU between forward and backward passes.
         """
-        global TRANSFER_STREAM, TRANSFER_BACKWARD_FINISHED_EVENT, COMPUTE_BACKWARD_START_EVENT, BACKWARD_BUFFER_CLK, W_GRAD_BUFFERS
-
-        # get index from clock
-        selected_buffer = BACKWARD_BUFFER_CLK
-
         x, weight_cpu, bias_cpu = ctx.saved_tensors
         device = ctx.device
+        state = _get_device_state(device)
+        transfer_stream = state["transfer_stream"]
+        w_grad_buffers = state["w_grad_buffers"]
+        transfer_backward_finished_event = state["transfer_backward_finished_event"]
+        compute_backward_start_event = state["compute_backward_start_event"]
+
+        # get index from clock
+        selected_buffer = state["backward_clk"]
 
         # transfer weights on transfer stream
-        with torch.cuda.stream(TRANSFER_STREAM):
+        with torch.cuda.stream(transfer_stream):
             # if it's a first time, it's a no-op
             # wait for compute event to finish first
-            TRANSFER_STREAM.wait_event(COMPUTE_BACKWARD_START_EVENT)
+            transfer_stream.wait_event(compute_backward_start_event)
 
             # alternate between buffers to prevent race condition where the transfer stream
-            # overwriting the weight buffers before the main stream finish calculating the value 
-            W_GRAD_BUFFERS[selected_buffer] = weight_cpu.to(device, non_blocking=True)
+            # overwriting the weight buffers before the main stream finish calculating the value
+            w_grad_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
 
             # flip the clock!
-            BACKWARD_BUFFER_CLK ^= 1
+            state["backward_clk"] ^= 1
             # record when transfer is done
-            TRANSFER_BACKWARD_FINISHED_EVENT.record()
+            transfer_backward_finished_event.record()
 
         # Make the compute stream wait for the weight transfer to complete
-        torch.cuda.current_stream().wait_event(TRANSFER_BACKWARD_FINISHED_EVENT)
+        torch.cuda.current_stream().wait_event(transfer_backward_finished_event)
 
         # mark the start of compute event
-        COMPUTE_BACKWARD_START_EVENT.record()
+        compute_backward_start_event.record()
 
         # Compute gradients
-        grad_input = grad_out @ W_GRAD_BUFFERS[selected_buffer]
+        grad_input = grad_out @ w_grad_buffers[selected_buffer]
         # TODO: maybe stream this
         grad_weight = (grad_out.mT @ x).to("cpu")
         grad_bias = grad_out.sum(dim=0).to("cpu") if bias_cpu is not None else None
@@ -195,13 +211,19 @@ class CPUBouncingLinear(nn.Module):
         self.device = device
         if dtype is None:
             dtype = torch.float32
-        
+
         # parameters live on CPU
         self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, dtype=dtype, device="cpu").share_memory_().pin_memory()
+            torch.empty(out_features, in_features, dtype=dtype, device="cpu")
+            .share_memory_()
+            .pin_memory()
         )
         self.bias = (
-            nn.Parameter(torch.empty(out_features, dtype=dtype, device="cpu").share_memory_().pin_memory())
+            nn.Parameter(
+                torch.empty(out_features, dtype=dtype, device="cpu")
+                .share_memory_()
+                .pin_memory()
+            )
             if bias
             else None
         )
