@@ -165,6 +165,14 @@ class BouncingLinearFn(torch.autograd.Function):
 
         # Compute gradients
         grad_input = grad_out @ w_grad_buffers[selected_buffer]
+        grad_weight = grad_out.flatten(0, -2).T @ x.flatten(0, -2)
+        if bias_cpu is not None:
+            # sum over all batch-like dims, keep only last dim (Out)
+            reduce_dims = tuple(range(grad_out.ndim - 1))
+            grad_bias = grad_out.sum(dim=reduce_dims)
+        else:
+            grad_bias = None
+
         # TODO: maybe stream this
         grad_weight = (grad_out.mT @ x).to("cpu")
         grad_bias = grad_out.sum(dim=0).to("cpu") if bias_cpu is not None else None
