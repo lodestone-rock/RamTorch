@@ -174,8 +174,8 @@ class BouncingLinearFn(torch.autograd.Function):
             grad_bias = None
 
         # TODO: maybe stream this
-        grad_weight = (grad_out.mT @ x).to("cpu")
-        grad_bias = grad_out.sum(dim=0).to("cpu") if bias_cpu is not None else None
+        grad_weight = grad_weight.to("cpu", non_blocking=True)
+        grad_bias = grad_bias.to("cpu", non_blocking=True) if bias_cpu is not None else None
         return grad_input, grad_weight, grad_bias, None
 
 
