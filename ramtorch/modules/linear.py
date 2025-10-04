@@ -27,14 +27,20 @@ def _get_device_state(device=torch.cuda.current_device()):
             _DEVICE_STATE[device] = {
                 # streams & events
                 "transfer_stream": torch.cuda.Stream(device=device),
+                "transfer_grad_stream": torch.cuda.Stream(device=device),
                 "transfer_forward_finished_event": torch.cuda.Event(),
                 "compute_forward_start_event": torch.cuda.Event(),
                 "transfer_backward_finished_event": torch.cuda.Event(),
+                "transfer_weight_backward_finished_event": torch.cuda.Event(),
                 "compute_backward_start_event": torch.cuda.Event(),
+                "compute_backward_finished_event": torch.cuda.Event(),
                 # buffers
                 "w_buffers": [None, None],
                 "b_buffers": [None, None],
+                "w_bwd_buffers": [None, None],
                 "w_grad_buffers": [None, None],
+                "b_grad_buffers": [None, None],
+
                 # clocks
                 "forward_clk": 0,
                 "backward_clk": 0,
@@ -135,9 +141,14 @@ class BouncingLinearFn(torch.autograd.Function):
         device = ctx.device
         state = _get_device_state(device)
         transfer_stream = state["transfer_stream"]
+        transfer_grad_stream = state["transfer_grad_stream"]
+        w_bwd_buffers = state["w_bwd_buffers"]
         w_grad_buffers = state["w_grad_buffers"]
+        b_grad_buffers = state["b_grad_buffers"]
         transfer_backward_finished_event = state["transfer_backward_finished_event"]
+        transfer_weight_backward_finished_event = state["transfer_weight_backward_finished_event"]
         compute_backward_start_event = state["compute_backward_start_event"]
+        compute_backward_finished_event = state["compute_backward_finished_event"]
 
         # get index from clock
         selected_buffer = state["backward_clk"]
@@ -150,7 +161,7 @@ class BouncingLinearFn(torch.autograd.Function):
 
             # alternate between buffers to prevent race condition where the transfer stream
             # overwriting the weight buffers before the main stream finish calculating the value
-            w_grad_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
+            w_bwd_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
 
             # flip the clock!
             state["backward_clk"] ^= 1
@@ -163,19 +174,28 @@ class BouncingLinearFn(torch.autograd.Function):
         # mark the start of compute event
         compute_backward_start_event.record()
 
-        # Compute gradients
-        grad_input = grad_out @ w_grad_buffers[selected_buffer]
-        grad_weight = grad_out.flatten(0, -2).T @ x.flatten(0, -2)
+        # compute input grad
+        grad_input = grad_out @ w_bwd_buffers[selected_buffer]
+
+        # this must launch after the transfer stream is done
+        torch.cuda.current_stream().wait_event(transfer_weight_backward_finished_event)
+        w_grad_buffers[selected_buffer] = grad_out.flatten(0, -2).T @ x.flatten(0, -2)
         if bias_cpu is not None:
             # sum over all batch-like dims, keep only last dim (Out)
             reduce_dims = tuple(range(grad_out.ndim - 1))
-            grad_bias = grad_out.sum(dim=reduce_dims)
+            b_grad_buffers[selected_buffer] = grad_out.sum(dim=reduce_dims)
         else:
             grad_bias = None
+        compute_backward_finished_event.record()
 
-        # TODO: maybe stream this
-        grad_weight = grad_weight.to("cpu", non_blocking=True)
-        grad_bias = grad_bias.to("cpu", non_blocking=True) if bias_cpu is not None else None
+        # send the tensor back using another stream, PCI-E is able to do full duplex comms so this should overlap
+        with torch.cuda.stream(transfer_grad_stream):
+            transfer_grad_stream.wait_event(compute_backward_finished_event)
+            grad_weight = w_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
+            grad_bias = b_grad_buffers[selected_buffer].to("cpu", non_blocking=True) if bias_cpu is not None else None
+
+            # record when transfer is done
+            transfer_weight_backward_finished_event.record()
         return grad_input, grad_weight, grad_bias, None
 
 
