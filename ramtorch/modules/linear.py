@@ -40,7 +40,6 @@ def _get_device_state(device=torch.cuda.current_device()):
                 "w_bwd_buffers": [None, None],
                 "w_grad_buffers": [None, None],
                 "b_grad_buffers": [None, None],
-
                 # clocks
                 "forward_clk": 0,
                 "backward_clk": 0,
@@ -146,7 +145,9 @@ class BouncingLinearFn(torch.autograd.Function):
         w_grad_buffers = state["w_grad_buffers"]
         b_grad_buffers = state["b_grad_buffers"]
         transfer_backward_finished_event = state["transfer_backward_finished_event"]
-        transfer_weight_backward_finished_event = state["transfer_weight_backward_finished_event"]
+        transfer_weight_backward_finished_event = state[
+            "transfer_weight_backward_finished_event"
+        ]
         compute_backward_start_event = state["compute_backward_start_event"]
         compute_backward_finished_event = state["compute_backward_finished_event"]
 
@@ -192,7 +193,11 @@ class BouncingLinearFn(torch.autograd.Function):
         with torch.cuda.stream(transfer_grad_stream):
             transfer_grad_stream.wait_event(compute_backward_finished_event)
             grad_weight = w_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
-            grad_bias = b_grad_buffers[selected_buffer].to("cpu", non_blocking=True) if bias_cpu is not None else None
+            grad_bias = (
+                b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
+                if bias_cpu is not None
+                else None
+            )
 
             # record when transfer is done
             transfer_weight_backward_finished_event.record()
