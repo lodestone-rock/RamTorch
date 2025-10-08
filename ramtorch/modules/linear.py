@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.profiler import record_function  # just for profiling
+
 # --- Per-device global state registry ---
 _DEVICE_STATE = {}
 
@@ -31,6 +33,7 @@ def _get_device_state(device=torch.cuda.current_device()):
                 "transfer_forward_finished_event": torch.cuda.Event(),
                 "compute_forward_start_event": torch.cuda.Event(),
                 "transfer_backward_finished_event": torch.cuda.Event(),
+                "transfer_weight_backward_start_event": torch.cuda.Event(),
                 "transfer_weight_backward_finished_event": torch.cuda.Event(),
                 "compute_backward_start_event": torch.cuda.Event(),
                 "compute_backward_finished_event": torch.cuda.Event(),
@@ -40,6 +43,8 @@ def _get_device_state(device=torch.cuda.current_device()):
                 "w_bwd_buffers": [None, None],
                 "w_grad_buffers": [None, None],
                 "b_grad_buffers": [None, None],
+                "w_grad_accum_buffers": [None, None],
+                "b_grad_accum_buffers": [None, None],
                 # clocks
                 "forward_clk": 0,
                 "backward_clk": 0,
@@ -88,6 +93,7 @@ class BouncingLinearFn(torch.autograd.Function):
 
         # get index from clock
         selected_buffer = state["forward_clk"]
+        state["forward_clk"] ^= 1
 
         # enqueue transfer on transfer stream
         with torch.cuda.stream(transfer_stream):
@@ -95,24 +101,32 @@ class BouncingLinearFn(torch.autograd.Function):
             # wait for compute event to finish first
             transfer_stream.wait_event(compute_forward_start_event)
 
-            # alternate between buffers to prevent race condition where the transfer stream
-            # overwriting the weight buffers before the main stream finish calculating the value
-            w_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
-            b_buffers[selected_buffer] = (
-                bias_cpu.to(device, non_blocking=True) if bias_cpu is not None else None
-            )
+            with record_function(
+                "forward_weight_bias_transfer"
+            ):  # for profiling and easy debugging
+
+                # alternate between buffers to prevent race condition where the transfer stream
+                # overwriting the weight buffers before the main stream finish calculating the value
+                w_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
+                b_buffers[selected_buffer] = (
+                    bias_cpu.to(device, non_blocking=True)
+                    if bias_cpu is not None
+                    else None
+                )
 
             # flip the clock!
-            state["forward_clk"] ^= 1
             # record event after transfer is done
             transfer_forward_finished_event.record()
 
-        # make compute stream wait for this transfer
-        torch.cuda.current_stream().wait_event(transfer_forward_finished_event)
+        with record_function(
+            "forward_linear_compute"
+        ):  # for profiling and easy debugging
+            # make compute stream wait for this transfer
+            torch.cuda.current_stream().wait_event(transfer_forward_finished_event)
 
-        # mark the start of compute event
-        compute_forward_start_event.record()
-        out = F.linear(x, w_buffers[selected_buffer], b_buffers[selected_buffer])
+            # mark the start of compute event
+            compute_forward_start_event.record()
+            out = F.linear(x, w_buffers[selected_buffer], b_buffers[selected_buffer])
 
         # save for backward
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
@@ -144,6 +158,8 @@ class BouncingLinearFn(torch.autograd.Function):
         w_bwd_buffers = state["w_bwd_buffers"]
         w_grad_buffers = state["w_grad_buffers"]
         b_grad_buffers = state["b_grad_buffers"]
+        w_grad_accum_buffers = state["w_grad_accum_buffers"]
+        b_grad_accum_buffers = state["b_grad_accum_buffers"]
         transfer_backward_finished_event = state["transfer_backward_finished_event"]
         transfer_weight_backward_finished_event = state[
             "transfer_weight_backward_finished_event"
@@ -153,21 +169,41 @@ class BouncingLinearFn(torch.autograd.Function):
 
         # get index from clock
         selected_buffer = state["backward_clk"]
+        state["backward_clk"] ^= 1
 
         # transfer weights on transfer stream
         with torch.cuda.stream(transfer_stream):
-            # if it's a first time, it's a no-op
-            # wait for compute event to finish first
-            transfer_stream.wait_event(compute_backward_start_event)
+            with record_function(
+                "backward_weight_transfer"
+            ):  # for profiling and easy debugging
+                # if it's a first time, it's a no-op
+                # wait for compute event to finish first
+                transfer_stream.wait_event(compute_backward_start_event)
 
-            # alternate between buffers to prevent race condition where the transfer stream
-            # overwriting the weight buffers before the main stream finish calculating the value
-            w_bwd_buffers[selected_buffer] = weight_cpu.to(device, non_blocking=True)
+                # alternate between buffers to prevent race condition where the transfer stream
+                # overwriting the weight buffers before the main stream finish calculating the value
+                w_bwd_buffers[selected_buffer] = weight_cpu.to(
+                    device, non_blocking=True
+                )
 
-            # flip the clock!
-            state["backward_clk"] ^= 1
-            # record when transfer is done
-            transfer_backward_finished_event.record()
+                # load gradient for manual accumulation
+
+            with record_function(
+                "backward_grad_accumulator_transfer"
+            ):  # for profiling and easy debugging
+                w_grad_accum_buffers[selected_buffer] = (
+                    weight_cpu.grad.to(device, non_blocking=True)
+                    if weight_cpu.grad is not None
+                    else None
+                )
+                b_grad_accum_buffers[selected_buffer] = (
+                    bias_cpu.grad.to(device, non_blocking=True)
+                    if bias_cpu.grad is not None
+                    else None
+                )
+                # flip the clock!
+                # record when transfer is done
+                transfer_backward_finished_event.record()
 
         # Make the compute stream wait for the weight transfer to complete
         torch.cuda.current_stream().wait_event(transfer_backward_finished_event)
@@ -175,33 +211,65 @@ class BouncingLinearFn(torch.autograd.Function):
         # mark the start of compute event
         compute_backward_start_event.record()
 
-        # compute input grad
-        grad_input = grad_out @ w_bwd_buffers[selected_buffer]
+        with record_function(
+            "backward_linear_compute"
+        ):  # for profiling and easy debugging
+            # compute input grad
+            grad_input = grad_out @ w_bwd_buffers[selected_buffer]
 
-        # this must launch after the transfer stream is done
-        torch.cuda.current_stream().wait_event(transfer_weight_backward_finished_event)
-        w_grad_buffers[selected_buffer] = grad_out.flatten(0, -2).T @ x.flatten(0, -2)
-        if bias_cpu is not None:
-            # sum over all batch-like dims, keep only last dim (Out)
-            reduce_dims = tuple(range(grad_out.ndim - 1))
-            b_grad_buffers[selected_buffer] = grad_out.sum(dim=reduce_dims)
-        else:
-            grad_bias = None
-        compute_backward_finished_event.record()
-
-        # send the tensor back using another stream, PCI-E is able to do full duplex comms so this should overlap
-        with torch.cuda.stream(transfer_grad_stream):
-            transfer_grad_stream.wait_event(compute_backward_finished_event)
-            grad_weight = w_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
-            grad_bias = (
-                b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
-                if bias_cpu is not None
-                else None
+            # this must launch after the transfer stream is done
+            torch.cuda.current_stream().wait_event(
+                transfer_weight_backward_finished_event
+            )
+            w_grad_buffers[selected_buffer] = grad_out.flatten(0, -2).T @ x.flatten(
+                0, -2
             )
 
-            # record when transfer is done
-            transfer_weight_backward_finished_event.record()
-        return grad_input, grad_weight, grad_bias, None
+            # gradient accumulation is being performed directly 
+            with record_function(
+                "backward_weight_grad_accumulate"
+            ):  # for profiling and easy debugging
+                if w_grad_accum_buffers[selected_buffer] is not None:
+                    w_grad_buffers[selected_buffer] += w_grad_accum_buffers[
+                        selected_buffer
+                    ]
+            if bias_cpu is not None:
+                # sum over all batch-like dims, keep only last dim (Out)
+                reduce_dims = tuple(range(grad_out.ndim - 1))
+                b_grad_buffers[selected_buffer] = grad_out.sum(dim=reduce_dims)
+
+                with record_function(
+                    "backward_bias_grad_accumulate"
+                ):  # for profiling and easy debugging
+                    if w_grad_accum_buffers[selected_buffer] is not None:
+                        b_grad_buffers[selected_buffer] += b_grad_accum_buffers[
+                            selected_buffer
+                        ]
+            else:
+                grad_bias = None
+            compute_backward_finished_event.record()
+
+        with record_function(
+            "backward_grad_transfer"
+        ):  # for profiling and easy debugging
+            # TODO: directly populate the grad and do grad accumulation here instead of relying on autograd
+            with torch.cuda.stream(transfer_grad_stream):
+                transfer_grad_stream.wait_event(compute_backward_finished_event)
+
+                # transfer_weight_backward_start_event.record()
+                weight_cpu.grad = w_grad_buffers[selected_buffer].to(
+                    "cpu", non_blocking=True
+                )
+                bias_cpu.grad = (
+                    b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
+                    if bias_cpu is not None
+                    else None
+                )
+
+                # record when transfer is done
+                transfer_weight_backward_finished_event.record()
+
+        return grad_input, None, None, None
 
 
 class CPUBouncingLinear(nn.Module):
