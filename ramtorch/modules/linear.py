@@ -143,12 +143,24 @@ class BouncingLinearFn(torch.autograd.Function):
             grad_out (torch.Tensor): Gradient w.r.t. layer output
 
         Returns:
-            tuple: Gradients w.r.t. (input, weight, bias, device)
-                  Device gradient is None (not differentiable)
+            tuple: Gradients w.r.t. (input, weight, bias, device).
+                   The gradients for weight and bias are returned as None
+                   because they are handled manually.
 
-        Note:
-            Weights need to be transferred again for gradient computation
-            since they're not kept on GPU between forward and backward passes.
+        Gradient Handling Note:
+            This function manually computes and accumulates gradients for the
+            weight and bias parameters, which reside on the CPU. The process is:
+            1. Asynchronously transfer the current gradients (if any) from
+               CPU to GPU for accumulation.
+            2. Compute new gradients on the GPU.
+            3. Add the existing gradients to the new ones on the GPU.
+            4. Asynchronously transfer the final accumulated gradients back to
+               the .grad attribute of the CPU parameters.
+
+            Because this process bypasses the standard autograd mechanism for
+            parameters, this function returns None for the weight and bias
+            gradients. A key consequence is that standard PyTorch hooks
+            registered on `weight.grad` or `bias.grad` will not be triggered.
         """
         x, weight_cpu, bias_cpu = ctx.saved_tensors
         device = ctx.device
@@ -290,6 +302,16 @@ class CPUBouncingLinear(nn.Module):
     Best suited for:
     - Models too large for GPU memory
     - Inference scenarios with memory constraints
+
+    Gradient Handling and Autograd Hooks:
+        This module uses a custom autograd function that manually computes and
+        accumulates gradients for the weight and bias parameters. It returns
+        `None` for the parameter gradients in the backward pass and directly
+        writes the calculated gradients to the `.grad` attribute.
+
+        As a result, any standard PyTorch hooks registered on the `.grad`
+        attribute of this layer's parameters (e.g., `layer.weight.register_hook(...)`)
+        will not be executed, as they are bypassed by this manual implementation.
     """
 
     def __init__(self, in_features, out_features, bias=True, dtype=None, device="cuda"):
