@@ -237,7 +237,7 @@ class BouncingLinearFn(torch.autograd.Function):
                 0, -2
             )
 
-            # gradient accumulation is being performed directly 
+            # gradient accumulation is being performed directly
             with record_function(
                 "backward_weight_grad_accumulate"
             ):  # for profiling and easy debugging
@@ -264,7 +264,7 @@ class BouncingLinearFn(torch.autograd.Function):
         with record_function(
             "backward_grad_transfer"
         ):  # for profiling and easy debugging
-            # TODO: directly populate the grad and do grad accumulation here instead of relying on autograd
+            # directly populate the grad and do grad accumulation here instead of relying on autograd
             with torch.cuda.stream(transfer_grad_stream):
                 transfer_grad_stream.wait_event(compute_backward_finished_event)
 
