@@ -27,7 +27,7 @@ def copy_stochastic_(target: torch.Tensor, source: torch.Tensor, seed=0):
         result.bitwise_and_(-65536)  # -65536 = FFFF0000 as a signed int32
 
         # copy the higher 16 bit into the target tensor
-        target.copy_(result.view(dtype=torch.float32))
+        target.copy_(result.view(dtype=torch.float32), non_blocking=True)
 
 
 class AdamW(Optimizer):
@@ -148,17 +148,28 @@ class AdamW(Optimizer):
                         )
 
                 # ========= Asynchronously queue all operations for this parameter =========
+                # Determine target GPU device for computation
+                if device.type == "cpu":
+                    # If param is on CPU, use default GPU for computation
+                    compute_device = torch.cuda.current_device()
+                else:
+                    # If param is on GPU, use its device
+                    compute_device = device
 
                 # 1. Queue Host-to-Device copy
-                ema_gpu = state["ema"].to(device, non_blocking=True)
-                ema_squared_gpu = state["ema_squared"].to(device, non_blocking=True)
+                ema_fp32 = state["ema"].to(
+                    compute_device, non_blocking=True, dtype=torch.float32
+                )
+                ema_squared_fp32 = state["ema_squared"].to(
+                    compute_device, non_blocking=True, dtype=torch.float32
+                )
+
+                grad = grad.to(torch.float32).to(compute_device, non_blocking=True)
+                p_fp32 = (
+                    p.clone().to(torch.float32).to(compute_device, non_blocking=True)
+                )
 
                 # 2. Queue computations on the GPU
-                grad = grad.to(torch.float32)
-                p_fp32 = p.clone().to(torch.float32)
-                ema_fp32 = ema_gpu.to(torch.float32)
-                ema_squared_fp32 = ema_squared_gpu.to(torch.float32)
-
                 beta1, beta2 = group["betas"]
                 lr = group["lr"]
                 weight_decay = group["weight_decay"]
@@ -190,17 +201,22 @@ class AdamW(Optimizer):
 
                 # 3. Queue Device-to-Host copy
                 # only use stochastic rounding if using bf16
-                if p.dtype == torch.bfloat16:
-                    copy_stochastic_(p, p_fp32, state["step"] + 42)
+                if device.type == "cpu":
+                    if p.dtype == torch.bfloat16:
+                        copy_stochastic_(p.data, p_fp32, state["step"] + 42)
+                    else:
+                        p.data.copy_(p_fp32)
                 else:
-                    p.data.copy_(p_fp32, non_blocking=True)
+                    # Original GPU path
+                    if p.dtype == torch.bfloat16:
+                        copy_stochastic_(p, p_fp32, state["step"] + 42)
+                    else:
+                        p.data.copy_(p_fp32, non_blocking=True)
                 if self.optim_state_dtype == torch.bfloat16:
-                    copy_stochastic_(ema_gpu, ema_fp32, state["step"] + 69)
+                    copy_stochastic_(state["ema"], ema_fp32, state["step"] + 69)
                     copy_stochastic_(
-                        ema_squared_gpu, ema_squared_fp32, state["step"] + 420
+                        state["ema_squared"], ema_squared_fp32, state["step"] + 420
                     )
-                    state["ema"].copy_(ema_gpu, non_blocking=True)
-                    state["ema_squared"].copy_(ema_squared_gpu, non_blocking=True)
                 else:
                     state["ema"].copy_(ema_fp32, non_blocking=True)
                     state["ema_squared"].copy_(ema_squared_fp32, non_blocking=True)
