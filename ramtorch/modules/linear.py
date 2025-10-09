@@ -98,6 +98,7 @@ class BouncingLinearFn(torch.autograd.Function):
 
         # get index from clock
         selected_buffer = state["forward_clk"]
+        # flip the clock!
         state["forward_clk"] ^= 1
 
         # enqueue transfer on transfer stream
@@ -119,7 +120,6 @@ class BouncingLinearFn(torch.autograd.Function):
                     else None
                 )
 
-            # flip the clock!
             # record event after transfer is done
             transfer_forward_finished_event.record()
 
@@ -186,6 +186,7 @@ class BouncingLinearFn(torch.autograd.Function):
 
         # get index from clock
         selected_buffer = state["backward_clk"]
+        # flip the clock!
         state["backward_clk"] ^= 1
 
         # transfer weights on transfer stream
@@ -203,8 +204,7 @@ class BouncingLinearFn(torch.autograd.Function):
                     device, non_blocking=True
                 )
 
-                # load gradient for manual accumulation
-
+            # load gradient for manual accumulation
             with record_function(
                 "backward_grad_accumulator_transfer"
             ):  # for profiling and easy debugging
@@ -218,7 +218,6 @@ class BouncingLinearFn(torch.autograd.Function):
                     if bias_cpu.grad is not None
                     else None
                 )
-                # flip the clock!
                 # record when transfer is done
                 transfer_backward_finished_event.record()
 
