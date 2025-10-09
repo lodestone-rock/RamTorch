@@ -58,8 +58,7 @@ class BouncingLinearFn(torch.autograd.Function):
 
     This function handles:
     1. Asynchronous transfer of weights from CPU to GPU
-    2. Throttling of concurrent transfers to manage memory
-    3. Proper synchronization between transfer and compute streams
+    2. Proper synchronization between transfer and compute streams
     """
 
     @staticmethod
@@ -78,11 +77,17 @@ class BouncingLinearFn(torch.autograd.Function):
             torch.Tensor: Linear transformation output (x @ weight.T + bias)
 
         Flow:
-            1. Initiate async transfer of weights to GPU
-            2. Record completion event and add to pending queue
-            3. Throttle if too many transfers are in-flight
-            4. Wait for transfer completion before computation
-            5. Perform linear operation and return result
+            1. Select buffer using ping-pong clock (alternates between 0 and 1)
+            2. On transfer stream: wait for previous compute to finish, then
+               initiate async transfer of weights/bias to selected GPU buffer
+            3. Record transfer completion event
+            4. On compute stream: wait for transfer completion, then perform
+               linear operation using the transferred weights
+            5. Record compute start event for next iteration's synchronization
+
+        The ping-pong buffering prevents race conditions by ensuring the
+        transfer stream never overwrites buffers that the compute stream
+        is still using.
         """
         state = _get_device_state(device)
         transfer_stream = state["transfer_stream"]
