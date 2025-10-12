@@ -52,6 +52,44 @@ def _get_device_state(device=torch.cuda.current_device()):
     return _DEVICE_STATE[device]
 
 
+def _invoke_tensor_hooks(tensor, grad):
+    """
+    Invoke backward hooks registered on a tensor.
+
+    Args:
+        tensor: The parameter tensor that may have hooks
+        grad: The gradient tensor to pass through hooks
+
+    Returns:
+        The potentially modified gradient after all hooks
+    """
+    # Standard backward hooks
+    if hasattr(tensor, "_ramtorch_backward_hooks") and tensor._ramtorch_backward_hooks:
+        for hook_id, hook_fn in tensor._ramtorch_backward_hooks.items():
+            result = hook_fn(grad)
+            if result is not None:
+                grad = result
+
+    return grad
+
+
+def _invoke_post_accum_tensor_hooks(tensor):
+    """
+    Invoke post accumulate grad hooks registered on a tensor.
+
+    Args:
+        tensor: The parameter tensor that may have hooks
+
+    """
+    # Post-accumulate grad hooks (PyTorch 2.0+)
+    if (
+        hasattr(tensor, "_ramtorch_post_accumulate_grad_hooks")
+        and tensor._ramtorch_post_accumulate_grad_hooks
+    ):
+        for hook_id, hook_fn in tensor._ramtorch_post_accumulate_grad_hooks.items():
+            hook_fn(tensor)
+
+
 class BouncingLinearFn(torch.autograd.Function):
     """
     Custom autograd function implementing the bouncing linear operation.
@@ -159,13 +197,13 @@ class BouncingLinearFn(torch.autograd.Function):
                CPU to GPU for accumulation.
             2. Compute new gradients on the GPU.
             3. Add the existing gradients to the new ones on the GPU.
-            4. Asynchronously transfer the final accumulated gradients back to
+            4. Invoke any registered backward hooks on the GPU gradients.
+            5. Asynchronously transfer the final accumulated gradients back to
                the .grad attribute of the CPU parameters.
 
             Because this process bypasses the standard autograd mechanism for
             parameters, this function returns None for the weight and bias
-            gradients. A key consequence is that standard PyTorch hooks
-            registered on `weight.grad` or `bias.grad` will not be triggered.
+            gradients. Hooks are manually invoked to maintain compatibility.
         """
         x, weight_cpu, bias_cpu = ctx.saved_tensors
         device = ctx.device
@@ -245,10 +283,25 @@ class BouncingLinearFn(torch.autograd.Function):
             with record_function(
                 "backward_weight_grad_accumulate"
             ):  # for profiling and easy debugging
+
+                # invoke grad hooks on weight gradient
+                w_grad_buffers[selected_buffer] = _invoke_tensor_hooks(
+                    weight_cpu, w_grad_buffers[selected_buffer]
+                )
+
                 if w_grad_accum_buffers[selected_buffer] is not None:
+
+                    # accumulate weight
                     w_grad_buffers[selected_buffer] += w_grad_accum_buffers[
                         selected_buffer
                     ]
+
+                # invoke post accum hooks on weight gradient
+                # use temporary reference to simplify post accum ipl
+                weight_cpu.ramtorch_grad = w_grad_buffers[selected_buffer]
+                _invoke_post_accum_tensor_hooks(weight_cpu)
+                del weight_cpu.ramtorch_grad
+
             if bias_cpu is not None:
                 # sum over all batch-like dims, keep only last dim (Out)
                 reduce_dims = tuple(range(grad_out.ndim - 1))
@@ -257,10 +310,24 @@ class BouncingLinearFn(torch.autograd.Function):
                 with record_function(
                     "backward_bias_grad_accumulate"
                 ):  # for profiling and easy debugging
-                    if w_grad_accum_buffers[selected_buffer] is not None:
+
+                    # invoke grad hooks on bias gradient
+                    b_grad_buffers[selected_buffer] = _invoke_tensor_hooks(
+                        bias_cpu, b_grad_buffers[selected_buffer]
+                    )
+
+                    if b_grad_accum_buffers[selected_buffer] is not None:
+
+                        # accumulate bias
                         b_grad_buffers[selected_buffer] += b_grad_accum_buffers[
                             selected_buffer
                         ]
+
+                    # invoke post accum hooks on bias gradient
+                    # use temporary reference to simplify post accum ipl
+                    bias_cpu.ramtorch_grad = b_grad_buffers[selected_buffer]
+                    _invoke_post_accum_tensor_hooks(bias_cpu)
+                    del bias_cpu.ramtorch_grad
             else:
                 grad_bias = None
             compute_backward_finished_event.record()
@@ -309,13 +376,16 @@ class CPUBouncingLinear(nn.Module):
 
     Gradient Handling and Autograd Hooks:
         This module uses a custom autograd function that manually computes and
-        accumulates gradients for the weight and bias parameters. It returns
-        `None` for the parameter gradients in the backward pass and directly
-        writes the calculated gradients to the `.grad` attribute.
+        accumulates gradients for the weight and bias parameters. Backward hooks
+        registered on weight/bias tensors ARE supported and will be invoked on
+        the GPU before transferring gradients back to CPU.
 
-        As a result, any standard PyTorch hooks registered on the `.grad`
-        attribute of this layer's parameters (e.g., `layer.weight.register_hook(...)`)
-        will not be executed, as they are bypassed by this manual implementation.
+        Hooks are called in this order:
+        1. Gradient computation on GPU
+        2. Gradient accumulation on GPU
+        3. Backward hooks invoked on GPU (tensor._ramtorch_backward_hooks)
+        4. Post-accumulate hooks invoked on GPU (tensor._ramtorch_post_accumulate_grad_hooks)
+        5. Transfer modified gradient back to CPU
     """
 
     def __init__(self, in_features, out_features, bias=True, dtype=None, device="cuda"):
@@ -354,6 +424,10 @@ class CPUBouncingLinear(nn.Module):
             if bias
             else None
         )
+
+        # create a flag to indicate if the tensors are ramtorch tensors
+        self.weight.is_ramtorch = True
+        self.bias.is_ramtorch = True
 
         # init
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
