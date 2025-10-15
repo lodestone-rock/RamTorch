@@ -253,7 +253,7 @@ class BouncingLinearFn(torch.autograd.Function):
                 )
                 b_grad_accum_buffers[selected_buffer] = (
                     bias_cpu.grad.to(device, non_blocking=True)
-                    if bias_cpu.grad is not None
+                    if bias_cpu is not None and bias_cpu.grad is not None
                     else None
                 )
                 # record when transfer is done
@@ -343,11 +343,13 @@ class BouncingLinearFn(torch.autograd.Function):
                 weight_cpu.grad = w_grad_buffers[selected_buffer].to(
                     "cpu", non_blocking=True
                 )
-                bias_cpu.grad = (
-                    b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
-                    if bias_cpu is not None
-                    else None
-                )
+
+                if bias_cpu is not None:
+                    bias_cpu.grad = (
+                        b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
+                        if bias_cpu is not None
+                        else None
+                    )
 
                 # record when transfer is done
                 transfer_weight_backward_finished_event.record()
@@ -427,7 +429,8 @@ class CPUBouncingLinear(nn.Module):
 
         # create a flag to indicate if the tensors are ramtorch tensors
         self.weight.is_ramtorch = True
-        self.bias.is_ramtorch = True
+        if bias:
+            self.bias.is_ramtorch = True
 
         # init
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
