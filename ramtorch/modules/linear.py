@@ -338,7 +338,7 @@ class BouncingLinearFn(torch.autograd.Function):
             # directly populate the grad and do grad accumulation here instead of relying on autograd
             with torch.cuda.stream(transfer_grad_stream):
                 transfer_grad_stream.wait_event(compute_backward_finished_event)
-
+                # TODO: put zero 2 hooks here and only store grad w.r.t to the assigned gpu
                 # transfer_weight_backward_start_event.record()
                 weight_cpu.grad = w_grad_buffers[selected_buffer].to(
                     "cpu", non_blocking=True
@@ -390,7 +390,14 @@ class CPUBouncingLinear(nn.Module):
         5. Transfer modified gradient back to CPU
     """
 
-    def __init__(self, in_features, out_features, bias=True, dtype=None, device="cuda"):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        bias=True,
+        dtype=None,
+        device=torch.cuda.current_device(),
+    ):
         """
         Initialize CPU linear layer.
 
@@ -413,15 +420,13 @@ class CPUBouncingLinear(nn.Module):
 
         # parameters live on CPU
         self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, dtype=dtype, device="cpu")
-            .share_memory_()
-            .pin_memory()
+            torch.empty(
+                out_features, in_features, dtype=dtype, device="cpu"
+            ).pin_memory()
         )
         self.bias = (
             nn.Parameter(
-                torch.empty(out_features, dtype=dtype, device="cpu")
-                .share_memory_()
-                .pin_memory()
+                torch.empty(out_features, dtype=dtype, device="cpu").pin_memory()
             )
             if bias
             else None
