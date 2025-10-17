@@ -1,6 +1,8 @@
 from collections import OrderedDict
 from typing import Callable, Dict
 import torch
+import torch.nn as nn
+from .modules.linear import Linear
 
 
 def add_custom_hooks(tensor: torch.Tensor, hook_name: str = "_custom_hooks"):
@@ -142,3 +144,72 @@ def register_ramtorch_post_accumulate_grad_hook(module, hook_fn, param_names=Non
                 handles.append(handle)
 
     return handles
+
+
+def move_model_to_device(
+    model: nn.Module, device: torch.device = torch.cuda.current_device()
+):
+    """
+    Moves model parameters and buffers to the specified device,
+    but skips any parameter or buffer that has `is_ramtorch = True`.
+    """
+    for name, param in model.named_parameters(recurse=True):
+        if getattr(param, "is_ramtorch", False):
+            # Skip moving this param
+            continue
+        # Move only if not already on the target device
+        if param.device != device:
+            with torch.no_grad():
+                new_param = param.to(device)
+            param.data = new_param
+            if param._grad is not None:
+                param._grad = param._grad.to(device)
+
+    for name, buf in model.named_buffers(recurse=True):
+        if getattr(buf, "is_ramtorch", False):
+            continue
+        if buf.device != device:
+            with torch.no_grad():
+                new_buf = buf.to(device)
+            model._buffers[name] = new_buf
+
+    return model
+
+
+def replace_linear_with_ramtorch(module: nn.Module, device: str = "cuda"):
+    """
+    Recursively replaces all nn.Linear layers in a model with CPUBouncingLinear.
+
+    Args:
+        module (nn.Module): The input model or submodule.
+        device (str): Target device for computation (used by CPUBouncingLinear).
+
+    Returns:
+        nn.Module: The modified model with replacements applied in-place.
+    """
+    for name, child in list(module.named_children()):
+        if isinstance(child, nn.Linear):
+            # Create a replacement
+            new_layer = Linear(
+                child.in_features,
+                child.out_features,
+                bias=child.bias is not None,
+                device=device,
+                dtype=child.weight.dtype,
+            )
+
+            # Reference weights and bias
+            with torch.no_grad():
+                new_layer.weight.data = child.weight.data
+                new_layer.weight.is_ramtorch = True
+                if child.bias is not None:
+                    new_layer.bias.data = child.bias.data
+
+            # Replace the module in-place
+            setattr(module, name, new_layer)
+
+        else:
+            # Recurse into children
+            replace_linear_with_ramtorch(child, device=device)
+
+    return module
