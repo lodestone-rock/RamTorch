@@ -1,6 +1,8 @@
 import torch
 from torch.optim import Optimizer
 
+from ..accelerator import Accelerator
+
 
 # @torch.compile
 def copy_stochastic_(target: torch.Tensor, source: torch.Tensor, seed=0):
@@ -110,6 +112,7 @@ class AdamW(Optimizer):
 
         for group in self.param_groups:
             # Enumerate to keep track of the parameter index for chunking
+            last_accelerator = None
             for i, p in enumerate(group["params"]):
                 if p.grad is None:
                     continue
@@ -151,10 +154,14 @@ class AdamW(Optimizer):
                 # Determine target GPU device for computation
                 if device.type == "cpu":
                     # If param is on CPU, use default GPU for computation
-                    compute_device = torch.cuda.current_device()
+                    accelerator = Accelerator.create()
+                    compute_device = accelerator.tensor_device
                 else:
                     # If param is on GPU, use its device
-                    compute_device = device
+                    accelerator = Accelerator.create(device)
+                    compute_device = accelerator.tensor_device
+
+                last_accelerator = accelerator
 
                 # 1. Queue Host-to-Device copy
                 ema_fp32 = state["ema"].to(
@@ -225,10 +232,12 @@ class AdamW(Optimizer):
                 # We synchronize after processing a chunk of parameters.
                 # The (i + 1) ensures we sync after the 1st, 2nd, ... chunk.
                 if (i + 1) % self.chunk_size == 0:
-                    torch.cuda.synchronize()
+                    if last_accelerator is not None:
+                        last_accelerator.synchronize()
 
             # Final synchronization to handle the last partial chunk
             # This ensures all operations for the group are complete before exiting.
-            torch.cuda.synchronize()
+            if last_accelerator is not None:
+                last_accelerator.synchronize()
 
         return loss

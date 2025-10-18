@@ -3,6 +3,7 @@ from typing import Callable, Dict
 import torch
 import torch.nn as nn
 from .modules.linear import Linear
+from .accelerator import Accelerator
 
 
 def add_custom_hooks(tensor: torch.Tensor, hook_name: str = "_custom_hooks"):
@@ -146,31 +147,47 @@ def register_ramtorch_post_accumulate_grad_hook(module, hook_fn, param_names=Non
     return handles
 
 
-def move_model_to_device(
-    model: nn.Module, device: torch.device = torch.cuda.current_device()
-):
+def move_model_to_device(model: nn.Module, device="cuda"):
     """
     Moves model parameters and buffers to the specified device,
     but skips any parameter or buffer that has `is_ramtorch = True`.
     """
+    if isinstance(device, torch.device):
+        target = device
+    elif isinstance(device, str):
+        spec = device.strip()
+        lower_spec = spec.lower()
+        if lower_spec.startswith("hip"):
+            spec = "cuda" + spec[3:]
+        target = torch.device(spec)
+    elif isinstance(device, int):
+        target = torch.device("cuda", device)
+    else:
+        raise TypeError(f"Unsupported device specifier: {device!r}")
+
+    if target.type == "cpu":
+        target_device = target
+    else:
+        target_device = Accelerator.create(target).tensor_device
+
     for name, param in model.named_parameters(recurse=True):
         if getattr(param, "is_ramtorch", False):
             # Skip moving this param
             continue
         # Move only if not already on the target device
-        if param.device != device:
+        if param.device != target_device:
             with torch.no_grad():
-                new_param = param.to(device)
+                new_param = param.to(target_device)
             param.data = new_param
             if param._grad is not None:
-                param._grad = param._grad.to(device)
+                param._grad = param._grad.to(target_device)
 
     for name, buf in model.named_buffers(recurse=True):
         if getattr(buf, "is_ramtorch", False):
             continue
-        if buf.device != device:
+        if buf.device != target_device:
             with torch.no_grad():
-                new_buf = buf.to(device)
+                new_buf = buf.to(target_device)
             model._buffers[name] = new_buf
 
     return model
