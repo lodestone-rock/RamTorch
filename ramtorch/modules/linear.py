@@ -444,6 +444,33 @@ class CPUBouncingLinear(nn.Module):
             bound = 1 / fan_in**0.5
             nn.init.uniform_(self.bias, -bound, bound)
 
+    def _apply(self, fn):
+        """
+        Override _apply to allow dtype changes but prevent device moves.
+        """
+        # Test what fn does with a dummy tensor on CPU
+        dummy = torch.tensor(0.0, device="cpu")
+        result = fn(dummy)
+
+        # If dtype changed, apply it (but keep on CPU)
+        if result.dtype != dummy.dtype:
+            new_dtype = result.dtype
+            self.weight.data = self.weight.data.to(dtype=new_dtype)
+            if self.bias is not None:
+                self.bias.data = self.bias.data.to(dtype=new_dtype)
+
+        # Ignore any device changes by always staying on CPU
+        del dummy
+        return self
+
+    def cuda(self, device=None):
+        """Override .cuda() to no-op."""
+        return self
+
+    def cpu(self):
+        """Override .cpu() to no-op (already on CPU)."""
+        return self
+
     def forward(self, x):
         """
         Forward pass through CPU linear layer.
