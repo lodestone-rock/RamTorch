@@ -97,12 +97,13 @@ class BouncingLinearFn(torch.autograd.Function):
     This function handles:
     1. Asynchronous transfer of weights from CPU to GPU
     2. Proper synchronization between transfer and compute streams
+    3. Manual dtype handling when inside autocast context
     """
 
     @staticmethod
     def forward(ctx, x, weight_cpu, bias_cpu, device="cuda"):
         """
-        Forward pass of bouncing linear layer.
+        Forward pass of bouncing linear layer with autocast support.
 
         Args:
             ctx: PyTorch autograd context for saving backward pass info
@@ -127,6 +128,10 @@ class BouncingLinearFn(torch.autograd.Function):
         transfer stream never overwrites buffers that the compute stream
         is still using.
         """
+        # Detect autocast state
+        autocast_enabled = torch.is_autocast_enabled()
+        autocast_dtype = torch.get_autocast_gpu_dtype() if autocast_enabled else None
+
         state = _get_device_state(device)
         transfer_stream = state["transfer_stream"]
         w_buffers = state["w_buffers"]
@@ -169,17 +174,33 @@ class BouncingLinearFn(torch.autograd.Function):
 
             # mark the start of compute event
             compute_forward_start_event.record()
-            out = F.linear(x, w_buffers[selected_buffer], b_buffers[selected_buffer])
+
+            # Manual casting when autocast is enabled
+            if autocast_enabled:
+                x_compute = x.to(autocast_dtype)
+                w_compute = w_buffers[selected_buffer].to(autocast_dtype)
+                b_compute = (
+                    b_buffers[selected_buffer].to(autocast_dtype)
+                    if b_buffers[selected_buffer] is not None
+                    else None
+                )
+                out = F.linear(x_compute, w_compute, b_compute)
+            else:
+                out = F.linear(
+                    x, w_buffers[selected_buffer], b_buffers[selected_buffer]
+                )
 
         # save for backward
         ctx.save_for_backward(x, weight_cpu, bias_cpu)
         ctx.device = device
+        ctx.autocast_enabled = autocast_enabled
+        ctx.autocast_dtype = autocast_dtype
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         """
-        Backward pass for gradient computation.
+        Backward pass for gradient computation with autocast support.
 
         Args:
             ctx: Autograd context containing saved forward pass data
@@ -268,16 +289,33 @@ class BouncingLinearFn(torch.autograd.Function):
         with record_function(
             "backward_linear_compute"
         ):  # for profiling and easy debugging
-            # compute input grad
-            grad_input = grad_out @ w_bwd_buffers[selected_buffer]
+            # Manual casting for backward when autocast is enabled
+            if ctx.autocast_enabled:
+                grad_out_compute = grad_out.to(ctx.autocast_dtype)
+                x_compute = x.to(ctx.autocast_dtype)
+                w_compute = w_bwd_buffers[selected_buffer].to(ctx.autocast_dtype)
 
-            # this must launch after the transfer stream is done
-            torch.cuda.current_stream().wait_event(
-                transfer_weight_backward_finished_event
-            )
-            w_grad_buffers[selected_buffer] = grad_out.flatten(0, -2).T @ x.flatten(
-                0, -2
-            )
+                # compute input grad
+                grad_input = grad_out_compute @ w_compute
+
+                # this must launch after the transfer stream is done
+                torch.cuda.current_stream().wait_event(
+                    transfer_weight_backward_finished_event
+                )
+                w_grad_buffers[selected_buffer] = (
+                    grad_out_compute.flatten(0, -2).T @ x_compute.flatten(0, -2)
+                ).to(weight_cpu.dtype)
+            else:
+                # compute input grad
+                grad_input = grad_out @ w_bwd_buffers[selected_buffer]
+
+                # this must launch after the transfer stream is done
+                torch.cuda.current_stream().wait_event(
+                    transfer_weight_backward_finished_event
+                )
+                w_grad_buffers[selected_buffer] = grad_out.flatten(0, -2).T @ x.flatten(
+                    0, -2
+                )
 
             # gradient accumulation is being performed directly
             with record_function(
@@ -305,7 +343,14 @@ class BouncingLinearFn(torch.autograd.Function):
             if bias_cpu is not None:
                 # sum over all batch-like dims, keep only last dim (Out)
                 reduce_dims = tuple(range(grad_out.ndim - 1))
-                b_grad_buffers[selected_buffer] = grad_out.sum(dim=reduce_dims)
+
+                # Keep bias gradient in fp32 for numerical stability when autocast is enabled
+                if ctx.autocast_enabled:
+                    b_grad_buffers[selected_buffer] = (
+                        grad_out.float().sum(dim=reduce_dims).to(bias_cpu.dtype)
+                    )
+                else:
+                    b_grad_buffers[selected_buffer] = grad_out.sum(dim=reduce_dims)
 
                 with record_function(
                     "backward_bias_grad_accumulate"
