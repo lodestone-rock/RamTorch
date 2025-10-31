@@ -73,6 +73,27 @@ def _invoke_tensor_hooks(tensor, grad):
     return grad
 
 
+def _invoke_zero_2_tensor_hooks(tensor, grad):
+    """
+    Invoke backward hooks registered on a tensor.
+
+    Args:
+        tensor: The parameter tensor that may have hooks
+        grad: The gradient tensor to pass through hooks
+
+    Returns:
+        The potentially modified gradient after all hooks
+    """
+    # Standard backward hooks
+    if hasattr(tensor, "_ramtorch_zero_2_hooks") and tensor._ramtorch_zero_2_hooks:
+        for hook_id, hook_fn in tensor._ramtorch_zero_2_hooks.items():
+            result = hook_fn(grad)
+            if result is not None:
+                grad = result
+
+    return grad
+
+
 def _invoke_post_accum_tensor_hooks(tensor):
     """
     Invoke post accumulate grad hooks registered on a tensor.
@@ -384,17 +405,26 @@ class BouncingLinearFn(torch.autograd.Function):
             with torch.cuda.stream(transfer_grad_stream):
                 transfer_grad_stream.wait_event(compute_backward_finished_event)
                 # TODO: put zero 2 hooks here and only store grad w.r.t to the assigned gpu
-                # transfer_weight_backward_start_event.record()
-                weight_cpu.grad = w_grad_buffers[selected_buffer].to(
-                    "cpu", non_blocking=True
+
+                w_grad_buffers[selected_buffer] = _invoke_zero_2_tensor_hooks(
+                    weight_cpu, w_grad_buffers[selected_buffer]
                 )
+                b_grad_buffers[selected_buffer] = _invoke_zero_2_tensor_hooks(
+                    bias_cpu, b_grad_buffers[selected_buffer]
+                )
+                # transfer_weight_backward_start_event.record()
+                if w_grad_buffers[selected_buffer] is not None:
+                    weight_cpu.grad = w_grad_buffers[selected_buffer].to(
+                        "cpu", non_blocking=True
+                    )
 
                 if bias_cpu is not None:
-                    bias_cpu.grad = (
-                        b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
-                        if bias_cpu is not None
-                        else None
-                    )
+                    if b_grad_buffers[selected_buffer] is not None:
+                        bias_cpu.grad = (
+                            b_grad_buffers[selected_buffer].to("cpu", non_blocking=True)
+                            if bias_cpu is not None
+                            else None
+                        )
 
                 # record when transfer is done
                 transfer_weight_backward_finished_event.record()

@@ -78,11 +78,12 @@ def broadcast_zero_params(rank_param_groups, async_op=True):
         for owner_rank, param_groups in rank_param_groups.items():
             for group in param_groups:
                 for param in group["params"]:
-                    work_handle = dist.broadcast(
-                        param.data, src=owner_rank, async_op=async_op
-                    )
-                    if async_op:
-                        work_handles.append(work_handle)
+                    if not getattr(param, "is_ramtorch", False):
+                        work_handle = dist.broadcast(
+                            param.data, src=owner_rank, async_op=async_op
+                        )
+                        if async_op:
+                            work_handles.append(work_handle)
 
         if not work_handles:
             return

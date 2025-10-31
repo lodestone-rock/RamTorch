@@ -165,13 +165,22 @@ def move_model_to_device(
             if param._grad is not None:
                 param._grad = param._grad.to(device)
 
-    for name, buf in model.named_buffers(recurse=True):
+    for full_name, buf in model.named_buffers(recurse=True):
         if getattr(buf, "is_ramtorch", False):
             continue
-        if buf.device != device:
-            with torch.no_grad():
-                new_buf = buf.to(device)
-            model._buffers[name] = new_buf
+        if buf.device == device:
+            continue
+
+        with torch.no_grad():
+            new_buf = buf.to(device)
+
+        # Traverse to the owning module
+        module = model
+        *parents, attr = full_name.split(".")
+        for p in parents:
+            module = getattr(module, p)
+
+        module._buffers[attr] = new_buf
 
     return model
 
