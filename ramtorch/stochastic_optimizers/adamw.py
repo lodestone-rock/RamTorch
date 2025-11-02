@@ -166,7 +166,7 @@ class AdamW(Optimizer):
 
                 grad = grad.to(torch.float32).to(compute_device, non_blocking=True)
                 p_fp32 = (
-                    p.clone().to(torch.float32).to(compute_device, non_blocking=True)
+                    p.to(compute_device, dtype=torch.float32, non_blocking=True)
                 )
 
                 # 2. Queue computations on the GPU
