@@ -472,6 +472,7 @@ class CPUBouncingLinear(nn.Module):
         bias=True,
         dtype=None,
         device=torch.cuda.current_device(),
+        skip_init=False,
     ):
         """
         Initialize CPU linear layer.
@@ -513,11 +514,12 @@ class CPUBouncingLinear(nn.Module):
             self.bias.is_ramtorch = True
 
         # init
-        nn.init.kaiming_uniform_(self.weight, a=5**0.5)
-        if self.bias is not None:
-            fan_in = in_features
-            bound = 1 / fan_in**0.5
-            nn.init.uniform_(self.bias, -bound, bound)
+        if not skip_init:
+            nn.init.kaiming_uniform_(self.weight, a=5**0.5)
+            if self.bias is not None:
+                fan_in = in_features
+                bound = 1 / fan_in**0.5
+                nn.init.uniform_(self.bias, -bound, bound)
 
     def _apply(self, fn):
         """

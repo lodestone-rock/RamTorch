@@ -205,6 +205,7 @@ def replace_linear_with_ramtorch(module: nn.Module, device: str = "cuda"):
                 bias=child.bias is not None,
                 device=device,
                 dtype=child.weight.dtype,
+                skip_init=True,
             )
 
             # Reference weights and bias
