@@ -526,7 +526,7 @@ class CPUBouncingLinear(nn.Module):
         Override _apply to allow dtype changes but prevent device moves.
         """
         # Test what fn does with a dummy tensor on CPU
-        dummy = torch.tensor(0.0, device="cpu")
+        dummy = torch.tensor(0.0, device="cpu", dtype=self.weight.dtype)
         result = fn(dummy)
 
         # If dtype changed, apply it (but keep on CPU)
