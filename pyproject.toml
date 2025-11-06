@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "RamTorch"
-version = "0.2.0"
+version = "0.2.1"
 authors = [{name = "Lodestone", email = "lodestone.rock@gmail.com"}]
 description = "RAM is All You Need"
 readme = "README.md"
