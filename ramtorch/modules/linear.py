@@ -494,6 +494,7 @@ class CPUBouncingLinear(nn.Module):
         if dtype is None:
             dtype = torch.float32
 
+        self.is_ramtorch = True
         # parameters live on CPU
         self.weight = nn.Parameter(
             torch.empty(

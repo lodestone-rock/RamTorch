@@ -214,6 +214,7 @@ def replace_linear_with_ramtorch(module: nn.Module, device: str = "cuda"):
                 new_layer.weight.is_ramtorch = True
                 if child.bias is not None:
                     new_layer.bias.data = child.bias.data
+                    new_layer.bias.is_ramtorch = True
 
             # Replace the module in-place
             setattr(module, name, new_layer)
@@ -223,3 +224,30 @@ def replace_linear_with_ramtorch(module: nn.Module, device: str = "cuda"):
             replace_linear_with_ramtorch(child, device=device)
 
     return module
+
+
+def reattach_is_ramtorch_flags(module: nn.Module):
+    """
+    Recursively traverse the module hierarchy and reattach `is_ramtorch = True`
+    flags to all parameters and buffers inside any module that declares
+    `is_ramtorch = True`.
+
+    This is useful after model deserialization, replacement, or rebuilds where
+    the attribute may have been lost.
+
+    Args:
+        module (nn.Module): Root module to process.
+    """
+    # If the current module itself is marked as a RAMTorch module,
+    # mark all its parameter and buffer tensors.
+    if getattr(module, "is_ramtorch", False):
+        for name, param in module.named_parameters(recurse=False):
+            if isinstance(param, torch.Tensor):
+                param.is_ramtorch = True
+        for name, buffer in module.named_buffers(recurse=False):
+            if isinstance(buffer, torch.Tensor):
+                buffer.is_ramtorch = True
+
+    # Recurse into children
+    for child in module.children():
+        reattach_is_ramtorch_flags(child)
