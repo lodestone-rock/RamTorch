@@ -1,4 +1,4 @@
-from .modules.linear import RamTorchLinear
+from .modules.linear import Linear
 from .stochastic_optimizers.adamw import AdamW
 
-__all__ = ["RamTorchLinear", "AdamW"]
+__all__ = ["Linear", "AdamW"]
