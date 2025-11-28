@@ -566,4 +566,4 @@ class CPUBouncingLinear(nn.Module):
         return BouncingLinearFn.apply(x, self.weight, self.bias, self.device)
 
 
-Linear = CPUBouncingLinear
+RamTorchLinear = CPUBouncingLinear
