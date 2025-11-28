@@ -13,8 +13,8 @@ setup(
     long_description_content_type="text/markdown",
     license="Apache 2.0 License",
     url="https://github.com/lodestone-rock/RamTorch",
-    package_dir={"": "src"},
-    packages=find_packages("src"),
+    package_dir={"": "."},
+    packages=find_packages("."),
     install_requires=["torch"],
     classifiers=[
         "Development Status :: 4 - Beta",
