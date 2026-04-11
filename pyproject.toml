@@ -1,6 +1,6 @@
 [project]
 name = "RamTorch"
-version = "0.2.1.dev0"
+version = "0.2.2"
 authors = [{name = "Lodestone", email = "lodestone.rock@gmail.com"}]
 description = "RAM is All You Need"
 readme = "README.md"
@@ -19,3 +19,6 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/lodestone-rock/RamTorch"
+
+[tool.setuptools.packages.find]
+exclude = ["examples*"]
