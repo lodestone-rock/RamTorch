@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="ramtorch",
-    version="0.2.1.dev0",
+    version="0.2.3",
     author="Lodestone",
     author_email="lodestone.rock@gmail.com",
     description="RAM is All You Need",
@@ -21,7 +21,6 @@ setup(
         "Intended Audience :: Developers",
         "Intended Audience :: Education",
         "Intended Audience :: Science/Research",
-        "License :: OSI Approved :: Apache Software License",
         "Operating System :: OS Independent",
         "Topic :: Scientific/Engineering :: Artificial Intelligence",
         "Programming Language :: Python :: 3",

@@ -1,17 +1,15 @@
 [project]
 name = "RamTorch"
-version = "0.2.2"
+version = "0.2.3"
 authors = [{name = "Lodestone", email = "lodestone.rock@gmail.com"}]
 description = "RAM is All You Need"
 readme = "README.md"
-license = {text = "Apache-2.0"}
 requires-python = ">=3.8"
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Education",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Programming Language :: Python :: 3",
@@ -22,3 +20,6 @@ Homepage = "https://github.com/lodestone-rock/RamTorch"
 
 [tool.setuptools.packages.find]
 exclude = ["examples*"]
+
+[tool.setuptools]
+license-files = []

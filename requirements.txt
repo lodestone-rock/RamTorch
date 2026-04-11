@@ -1,1 +1,4 @@
 torch
+safetensors
+torchvision
+tqdm
