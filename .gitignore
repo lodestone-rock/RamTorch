@@ -9,3 +9,7 @@ init.sh
 *.jpg
 data
 __pycache__
+*.json
+*.zip
+*.ipynb
+/scraped
