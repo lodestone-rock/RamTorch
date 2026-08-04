@@ -58,7 +58,7 @@ from .pipeline import (
     _build_staggered_1b1f_rank_ops,
 )
 
-__all__ = ["run_pipeline_relay"]
+__all__ = ["run_pipeline_relay", "Pipeline"]
 
 
 # ── Mailbox ───────────────────────────────────────────────────────────────────
@@ -348,6 +348,197 @@ def _run_sequential(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+class Pipeline:
+    """
+    A reusable pipeline-parallel wrapper around ``model``.
+
+    Splits the model ONCE (via ``torch.distributed.pipelining.pipeline``) and
+    builds the per-device ``Stage`` objects ONCE, then :meth:`step` runs a
+    pipeline schedule on each new batch without re-splitting. This is the
+    correct entry point for iterative training: calling the one-shot
+    :func:`run_pipeline_relay` repeatedly re-traces the model every step, which
+    both is wasteful and fails (re-splitting an already-split model nests the
+    traced forward and blows the recursion limit).
+
+    Parameters
+    ----------
+    model          : full model (traced/split once; stage modules moved to devices)
+    example_input  : one example microbatch input for the tracer (must match the
+                     model's current device; CPU model -> CPU example)
+    split_spec     : ``{layer_name: SplitPoint.BEGINNING|END}`` for pipeline()
+    devices        : one device per stage (default: cuda:i round-robin / CPU)
+    fake_compute   : None | "replace" | {"fwd": s|[s...], "bwd": s|[s...]}
+    overlap        : per-stage worker threads (True) or sequential debug (False)
+
+    After construction, ``self.stages`` holds the Stage objects (which own the
+    gradient accumulators) and the original model's parameters are shared with
+    those stages — so a single optimizer over ``model.parameters()`` sees the
+    accumulated grads after ``step()`` + :meth:`flush_grads`.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        example_input: torch.Tensor,
+        split_spec: dict,
+        *,
+        devices: Optional[Sequence[Union[str, torch.device]]] = None,
+        fake_compute=None,
+        overlap: bool = True,
+    ):
+        from torch.distributed.pipelining import pipeline as _split_pipeline
+
+        self.model = model
+        self.overlap = overlap
+
+        pipe = _split_pipeline(
+            module=model, mb_args=(example_input,), split_spec=split_spec
+        )
+        self.num_stages = pipe.num_stages
+
+        if devices is None:
+            n_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            if n_cuda > 0:
+                devices = [
+                    torch.device("cuda", i % n_cuda) for i in range(self.num_stages)
+                ]
+            else:
+                devices = [torch.device("cpu")] * self.num_stages
+        else:
+            devices = [torch.device(d) for d in devices]
+            assert len(devices) == self.num_stages, (
+                f"need {self.num_stages} devices, got {len(devices)}"
+            )
+        self.devices = devices
+
+        fake = (
+            _FakeCompute(fake_compute, self.num_stages)
+            if fake_compute is not None
+            else None
+        )
+
+        self.stages = [
+            Stage(pipe.get_stage_module(i), i, self.num_stages, device=devices[i],
+                  fake=fake, tracer=None)
+            for i in range(self.num_stages)
+        ]
+
+    def step(
+        self,
+        data: torch.Tensor,
+        *,
+        targets: Optional[torch.Tensor] = None,
+        schedule: str = "1f1b",
+        n_microbatches: int = 4,
+        loss_fn: Optional[Callable] = None,
+        trace_path: Optional[str] = None,
+        profile_path: Optional[str] = None,
+    ) -> PipelineResult:
+        """
+        Run one pipeline-parallel step on ``data`` (dim 0 split into microbatches).
+
+        Returns a :class:`PipelineResult`; call ``result.flush_grads()`` to write
+        accumulated microbatch grads (mean-scaled) into ``.grad`` before an
+        optimizer step. See :func:`run_pipeline_relay` for parameter details.
+        """
+        return _run_step(
+            self.stages,
+            data,
+            targets=targets,
+            schedule=schedule,
+            n_microbatches=n_microbatches,
+            loss_fn=loss_fn,
+            overlap=self.overlap,
+            trace_path=trace_path,
+            profile_path=profile_path,
+        )
+
+    def flush_grads(self, scale: Optional[float] = None, n_microbatches: int = 1):
+        """Write accumulated grads into ``.grad`` (default scale 1/n_microbatches)."""
+        s = scale if scale is not None else 1.0 / n_microbatches
+        for st in self.stages:
+            st.flush_grads(scale=s)
+
+
+def _run_step(
+    stages: List[Stage],
+    data: torch.Tensor,
+    *,
+    targets: Optional[torch.Tensor],
+    schedule: str,
+    n_microbatches: int,
+    loss_fn: Optional[Callable],
+    overlap: bool,
+    trace_path: Optional[str],
+    profile_path: Optional[str],
+) -> PipelineResult:
+    """Run one pipeline step on pre-built stages (no re-split). Shared by
+    ``Pipeline.step`` and the one-shot ``run_pipeline_relay``."""
+    if schedule not in ("gpipe", "1f1b", "staggered_1b1f"):
+        raise ValueError(
+            f"supported schedules: 'gpipe', '1f1b', 'staggered_1b1f'; got {schedule!r}"
+        )
+    loss_fn = loss_fn or (lambda out, _: out.sum())
+    num_stages = len(stages)
+
+    # Microbatch sharding
+    assert data.shape[0] % n_microbatches == 0, (
+        f"batch {data.shape[0]} not divisible by n_microbatches={n_microbatches}"
+    )
+    mbs = [mb.to(stages[0].device) for mb in data.chunk(n_microbatches, dim=0)]
+    tgts = (
+        [t.to(stages[-1].device) for t in targets.chunk(n_microbatches, dim=0)]
+        if targets is not None
+        else None
+    )
+    m = len(mbs)
+
+    tracer = PerfettoTracer() if trace_path else None
+    # Attach the tracer to stages for this step (stages are built with tracer=None
+    # when reused; the one-shot path builds them fresh each call).
+    for st in stages:
+        st.tracer = tracer
+        st.clear()
+        st.zero_grad_acc()
+
+    # Static per-stage execution order
+    if schedule == "gpipe":
+        rank_ops = _build_gpipe_rank_ops(num_stages, m)
+    elif schedule == "1f1b":
+        rank_ops = _build_1f1b_rank_ops(num_stages, m)
+    else:  # staggered_1b1f
+        rank_ops = _build_staggered_1b1f_rank_ops(num_stages, m)
+
+    if profile_path:
+        from torch.profiler import ProfilerActivity, profile as _torch_profile
+        with _torch_profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=False,
+            with_stack=False,
+        ) as _prof:
+            outputs, losses = _run_and_capture(stages, m, overlap, rank_ops,
+                                               mbs, tgts, loss_fn)
+            # Drain all device work BEFORE the profiler stops so the full kernel
+            # timeline is captured.
+            for d in {st.device for st in stages if st.device.type == "cuda"}:
+                torch.cuda.synchronize(d)
+        _prof.export_chrome_trace(profile_path)
+    else:
+        outputs, losses = _run_and_capture(stages, m, overlap, rank_ops,
+                                           mbs, tgts, loss_fn)
+
+    # Make sure all device work is done before reporting/exporting timings.
+    for d in {st.device for st in stages if st.device.type == "cuda"}:
+        torch.cuda.synchronize(d)
+
+    if tracer is not None:
+        tracer.export(trace_path)
+        for st in stages:
+            st.tracer = None
+
+    return PipelineResult(outputs, losses, stages)
+
+
 def run_pipeline_relay(
     model: nn.Module,
     example_input: torch.Tensor,
@@ -391,95 +582,31 @@ def run_pipeline_relay(
     -------
     PipelineResult with per-microbatch outputs/losses and stages holding
     accumulated param grads (``result.flush_grads()`` writes them to ``.grad``).
+
+    Note
+    ----
+    This splits the model every call. For iterative training, build a
+    :class:`Pipeline` once and call its ``step()`` per batch instead — reusing
+    the split avoids re-tracing (which is slow and fails on an already-split
+    model).
     """
-    from torch.distributed.pipelining import pipeline as _split_pipeline
-
-    if schedule not in ("gpipe", "1f1b", "staggered_1b1f"):
-        raise ValueError(
-            f"run_pipeline_relay supports 'gpipe', '1f1b' and 'staggered_1b1f', "
-            f"got {schedule!r} (interleaved deferred until the orchestrator is proven)"
-        )
-
-    loss_fn = loss_fn or (lambda out, _: out.sum())
-
-    pipe = _split_pipeline(module=model, mb_args=(example_input,), split_spec=split_spec)
-    num_stages = pipe.num_stages
-
-    # ── Devices ───────────────────────────────────────────────────────────────
-    if devices is None:
-        n_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        if n_cuda > 0:
-            devices = [torch.device("cuda", i % n_cuda) for i in range(num_stages)]
-        else:
-            devices = [torch.device("cpu")] * num_stages
-    else:
-        devices = [torch.device(d) for d in devices]
-        assert len(devices) == num_stages, (
-            f"need {num_stages} devices, got {len(devices)}"
-        )
-
-    fake = _FakeCompute(fake_compute, num_stages) if fake_compute is not None else None
-    tracer = PerfettoTracer() if trace_path else None
-
-    stages = [
-        Stage(pipe.get_stage_module(i), i, num_stages, device=devices[i],
-              fake=fake, tracer=tracer)
-        for i in range(num_stages)
-    ]
-
-    # ── Microbatch sharding ───────────────────────────────────────────────────
-    assert data.shape[0] % n_microbatches == 0, (
-        f"batch {data.shape[0]} not divisible by n_microbatches={n_microbatches}"
+    pipe = Pipeline(
+        model,
+        example_input,
+        split_spec,
+        devices=devices,
+        fake_compute=fake_compute,
+        overlap=overlap,
     )
-    mbs = [mb.to(stages[0].device) for mb in data.chunk(n_microbatches, dim=0)]
-    tgts = (
-        [t.to(stages[-1].device) for t in targets.chunk(n_microbatches, dim=0)]
-        if targets is not None
-        else None
+    return pipe.step(
+        data,
+        targets=targets,
+        schedule=schedule,
+        n_microbatches=n_microbatches,
+        loss_fn=loss_fn,
+        trace_path=trace_path,
+        profile_path=profile_path,
     )
-    m = len(mbs)
-
-    for st in stages:
-        st.clear()
-        st.zero_grad_acc()
-
-    # ── Static per-stage execution order ──────────────────────────────────────
-    if schedule == "gpipe":
-        rank_ops = _build_gpipe_rank_ops(num_stages, m)
-    elif schedule == "1f1b":
-        rank_ops = _build_1f1b_rank_ops(num_stages, m)
-    else:  # staggered_1b1f
-        rank_ops = _build_staggered_1b1f_rank_ops(num_stages, m)
-
-    if profile_path:
-        from torch.profiler import ProfilerActivity, profile as _torch_profile
-        with _torch_profile(
-            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            record_shapes=False,
-            with_stack=False,
-        ) as _prof:
-            outputs, losses = _run_and_capture(stages, m, overlap, rank_ops,
-                                               mbs, tgts, loss_fn)
-            # Drain all device work BEFORE the profiler stops. CUDA kernels are
-            # timestamped when they execute on the device; if the profiler is
-            # torn down while trailing kernels are still enqueued, the tail of
-            # the computation is lost from the trace. Synchronize inside the
-            # profile region so the full timeline is captured.
-            for d in {st.device for st in stages if st.device.type == "cuda"}:
-                torch.cuda.synchronize(d)
-        _prof.export_chrome_trace(profile_path)
-    else:
-        outputs, losses = _run_and_capture(stages, m, overlap, rank_ops,
-                                           mbs, tgts, loss_fn)
-
-    # Make sure all device work is done before reporting/exporting timings.
-    for d in {st.device for st in stages if st.device.type == "cuda"}:
-        torch.cuda.synchronize(d)
-
-    if tracer is not None:
-        tracer.export(trace_path)
-
-    return PipelineResult(outputs, losses, stages)
 
 
 def _run_and_capture(stages, m, overlap, rank_ops, mbs, tgts, loss_fn):

@@ -13,6 +13,7 @@ RamTorch provides CPU-GPU hybrid implementations of neural network components th
 - **ZeRO-Style Distributed Training**: 
   - **ZeRO-1**: Optimizer state sharding across multiple GPUs
   - **ZeRO-2**: Gradient sharding with automatic reduction
+- **Pipeline Parallelism**: Single-process pipeline-parallel training & inference across GPUs — no `torchrun`, no process groups — with GPipe / 1F1B / staggered-1B1F schedules
 - **Shared CPU Memory**: Multi-GPU workers share the same CPU tensor storage
 - **Drop-in Replacement**: Compatible with existing PyTorch code
 
@@ -181,6 +182,75 @@ if __name__ == "__main__":
     
     mp.spawn(train, args=(world_size, model), nprocs=world_size)
 ```
+
+## Pipeline Parallelism
+
+RamTorch also provides **single-process pipeline parallelism**: split a model across multiple GPUs and train/infer pipeline-parallel **without `torchrun`, without process groups, without NCCL**. Each stage runs on its own GPU driven by one worker thread; activations and gradients are relayed between stages through lightweight thread-safe handoffs.
+
+### Why
+
+Pipeline parallelism splits a model *vertically* (by layers) so each GPU holds only a slice — complementary to RamTorch's CPU-offload (which reduces per-GPU memory) and ZeRO (which shards optimizer/gradients). Use it when the model is too big for one GPU but you want a simple single-process program instead of a distributed launcher.
+
+### The `PipelineModel` API (single-GPU feel)
+
+The easiest way in. Auto-splits your model into balanced stages and gives you a normal-looking `nn.Module`:
+
+```python
+import torch
+from ramtorch import PipelineModel
+
+# Your ordinary model (any nn.Module with top-level children to split on)
+model = MyModel()
+
+# One example microbatch for the tracer (same device as the model)
+example = torch.randn(16, *input_shape)
+
+# Auto-split across your GPUs (balanced by parameter count)
+pipe = PipelineModel(model, example, devices=["cuda:0", "cuda:1"])
+
+# Inference — one call, returns logits (arbitrary batch size OK)
+logits = pipe.forward(images)
+
+# Training — step + flush + a single optimizer over the wrapper
+opt = torch.optim.Adam(pipe.parameters(), lr=1e-3)
+for x, y in train_loader:
+    result = pipe.step(x, targets=y,
+                       schedule="staggered_1b1f",   # or "gpipe" / "1f1b"
+                       n_microbatches=4,
+                       loss_fn=torch.nn.CrossEntropyLoss())
+    result.flush_grads()   # write mean-scaled microbatch grads into .grad
+    opt.step()
+    opt.zero_grad()
+```
+
+### Schedules
+
+Two schedules are recommended for everyday use:
+
+| Schedule | Bubble | Peak in-flight activations | Notes |
+|---|---|---|---|
+| `staggered_1b1f` (default) | **lowest** | ~`num_stages` | Backward-eager + staggered warmup; GPipe-level throughput at 1F1B-class memory. **Recommended.** |
+| `gpipe` | fill + drain | all `n_microbatches` | Simple, highest memory; useful as a correctness baseline |
+
+A third schedule, `1f1b` (textbook forward-first one-forward-one-backward), is kept **for education and comparison only** — it is *not* recommended for real runs. It exists to make the importance of execution order concrete: `1f1b` and `staggered_1b1f` compute the *same* math, but `1f1b` forwards before backwarding, which leaves a large steady-state bubble. On a 10.9 GB model `1f1b` reached only ~50% GPU utilization vs ~92-98% for `staggered_1b1f` — identical work, very different wall-clock, purely from op ordering. Compare them with the schedule simulator (`python -m ramtorch.schedule_simulator`) or `examples/benchmark_schedules.py`.
+
+### Auto-split & heterogeneous GPUs
+
+By default stages are balanced by parameter count. For machines with GPUs of different speed, weight the split so faster GPUs take more layers:
+
+```python
+pipe = PipelineModel(model, example,
+                     devices=["cuda:0", "cuda:1"],
+                     device_weights=[2.0, 1.0])   # cuda:0 is ~2x faster
+```
+
+Or pass an explicit `split_spec` for full manual control over where the model is cut.
+
+### Notes & gotchas
+
+- **Batch size for inference**: the traced stages are specialized to the example microbatch's batch size. `forward()` automatically chunks larger/smaller batches and pads the final partial chunk (emitting a silence-able `PipelinePaddingWarning` when padding is used).
+- **Numerics**: microbatch gradient accumulation is *mean-of-microbatch-means*, bit-identical to sequential gradient accumulation. It differs from a single full-batch backward only by normal fp32 reduction-order noise (same as any gradient-accumulation setup).
+- **Example reference**: see `examples/mnist_pipeline_example.py` for a complete, self-contained MNIST training + inference script.
 
 ## Performance Considerations
 
