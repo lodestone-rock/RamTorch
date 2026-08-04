@@ -1,3 +1,5 @@
+__version__ = "1.0.0"
+
 from .modules.linear import Linear
 from .stochastic_optimizers.adamw import AdamW
 from .pipeline import Stage, run_pipeline, PipelineResult

@@ -1,6 +1,6 @@
 [project]
 name = "RamTorch"
-version = "0.2.3"
+version = "1.0.0"
 authors = [{name = "Lodestone", email = "lodestone.rock@gmail.com"}]
 description = "RAM is All You Need"
 readme = "README.md"
@@ -19,7 +19,8 @@ classifiers = [
 Homepage = "https://github.com/lodestone-rock/RamTorch"
 
 [tool.setuptools.packages.find]
-exclude = ["examples*"]
+include = ["ramtorch*"]
+exclude = ["examples*", "env*", "scraped*", "kernels*", "data*", "tests*"]
 
 [tool.setuptools]
 license-files = []
