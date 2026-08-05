@@ -241,16 +241,26 @@ def main() -> int:
     for st in stages:
         st.eval()
     correct = total = 0
-    for x, y in test_loader:
+    for bi, (x, y) in enumerate(test_loader):
         # pipe.infer() microbatches the batch through the stages concurrently
         # (forward-only GPipe) instead of a sequential whole-batch relay, so the
         # GPUs stay busy. no_grad + no activation retention.
-        logits = pipe.infer(x, n_microbatches=args.micro)
+        # Profile just the first eval batch so the inference-overlap trace stays
+        # small (mirrors the bounded training profiler).
+        profile_inf = args.profile and bi == 0
+        logits = pipe.infer(
+            x,
+            n_microbatches=args.micro,
+            trace_path=("trace_infer.json" if profile_inf else None),
+            profile_path=("profile_infer.json" if profile_inf else None),
+        )
         pred = logits.argmax(1).cpu()
         correct += (pred == y).sum().item()
         total += y.size(0)
     acc = correct / total
     print(f"\ntest accuracy after {step} steps: {acc:.4f}")
+    if args.profile:
+        print("  inference profile -> profile_infer.json + trace_infer.json (first eval batch)")
 
     # ── Checkpoint: save each stage's state_dict ──────────────────────────────
     if args.save:

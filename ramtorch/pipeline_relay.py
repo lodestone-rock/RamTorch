@@ -450,6 +450,7 @@ def _run_inference(
     *,
     n_microbatches: int,
     trace_path: Optional[str],
+    profile_path: Optional[str] = None,
 ) -> torch.Tensor:
     """
     Forward-only GPipe-style pipelined inference (no backward, no grad).
@@ -487,10 +488,28 @@ def _run_inference(
                      last_outputs, tracer)
         for s in range(p)
     ]
-    for w in workers:
-        w.start()
-    for w in workers:
-        w.join()
+
+    def _run():
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+
+    if profile_path:
+        from torch.profiler import ProfilerActivity, profile as _torch_profile
+        with _torch_profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=False,
+            with_stack=False,
+        ) as _prof:
+            _run()
+            # Drain device work BEFORE the profiler stops so the full kernel
+            # timeline is captured.
+            for d in {st.device for st in stages if st.device.type == "cuda"}:
+                torch.cuda.synchronize(d)
+        _prof.export_chrome_trace(profile_path)
+    else:
+        _run()
 
     for w in workers:
         if w.error is not None:
@@ -670,6 +689,7 @@ class Pipeline:
         *,
         n_microbatches: int = 4,
         trace_path: Optional[str] = None,
+        profile_path: Optional[str] = None,
     ) -> torch.Tensor:
         """
         Pipelined inference: a forward-only GPipe-style run (no backward).
@@ -684,10 +704,12 @@ class Pipeline:
         concatenated last-stage outputs for the full batch (dim 0).
 
         ``trace_path`` optionally writes an op-level Chrome-trace (Perfetto) of
-        the forward spans so you can see the overlap.
+        the forward spans so you can see the overlap. ``profile_path`` captures
+        a full torch.profiler (kineto) trace of the run.
         """
         return _run_inference(
-            self.stages, data, n_microbatches=n_microbatches, trace_path=trace_path
+            self.stages, data, n_microbatches=n_microbatches,
+            trace_path=trace_path, profile_path=profile_path,
         )
 
 
