@@ -246,11 +246,41 @@ pipe = PipelineModel(model, example,
 
 Or pass an explicit `split_spec` for full manual control over where the model is cut.
 
+### Complex models: pre-partition the stages yourself (recommended)
+
+`PipelineModel`'s auto-split relies on `torch.export` to trace your model. That works well for simple models (linear stacks, basic CNNs), but **complex architectures break the tracer** — `nn.MultiheadAttention`, dynamic reshapes, data-dependent control flow, or custom ops can cause `torch.export` to fail or to emit a subtly-wrong graph.
+
+For anything non-trivial, **partition the model yourself** into a list of stage modules and bypass the tracer entirely with `Pipeline(stage_modules=[...])`. Each stage is a plain `nn.Module` whose forward consumes the previous stage's output — a trivial change to make in your own model class, and the robust choice for real architectures:
+
+```python
+import itertools, torch
+from ramtorch import Pipeline
+
+# You define the split in your model code — no torch.export involved.
+stage0 = EmbedAndFirstBlocks(...)    # nn.Module: image -> tokens
+stage1 = RemainingBlocksAndHead(...) # nn.Module: tokens -> logits
+
+pipe = Pipeline(stage_modules=[stage0, stage1],
+                devices=["cuda:0", "cuda:1"])
+
+# Optimize over the stages' own parameters (they're separate modules).
+opt = torch.optim.Adam(itertools.chain(*(s.parameters() for s in (stage0, stage1))), lr=1e-3)
+
+for x, y in train_loader:
+    result = pipe.step(x, targets=y, schedule="staggered_1b1f",
+                       n_microbatches=4, loss_fn=loss_fn)
+    result.flush_grads()
+    opt.step()
+    opt.zero_grad()
+```
+
+**Guidance:** `PipelineModel` is the convenient API for simple models; `Pipeline(stage_modules=...)` is the recommended API for real/complex architectures. See `examples/mnist_pipeline_big_transformer_manual.py` for a full ~85M-param ViT-style transformer trained this way (the auto-traced equivalent fails on its attention reshapes).
+
 ### Notes & gotchas
 
 - **Batch size for inference**: the traced stages are specialized to the example microbatch's batch size. `forward()` automatically chunks larger/smaller batches and pads the final partial chunk (emitting a silence-able `PipelinePaddingWarning` when padding is used).
 - **Numerics**: microbatch gradient accumulation is *mean-of-microbatch-means*, bit-identical to sequential gradient accumulation. It differs from a single full-batch backward only by normal fp32 reduction-order noise (same as any gradient-accumulation setup).
-- **Example reference**: see `examples/mnist_pipeline_example.py` for a complete, self-contained MNIST training + inference script.
+- **Example references**: `examples/mnist_pipeline_example.py` (simple MLP, auto-split via `PipelineModel`) and `examples/mnist_pipeline_big_transformer_manual.py` (complex transformer, manual pre-partitioned stages via `Pipeline`).
 
 ## Performance Considerations
 

@@ -94,6 +94,11 @@ class _Mailbox:
         self._value = value
         self._ready.set()
 
+    def release(self):
+        """Wake any blocked :meth:`get` with no value (used on abort)."""
+        self._value = None
+        self._ready.set()
+
     def get(self) -> Optional[torch.Tensor]:
         self._ready.wait()
         if self._cuda_event is not None:
@@ -128,6 +133,8 @@ class _RelayWorker(threading.Thread):
         fwd_out: List[List[_Mailbox]],  # fwd_out[s][mb]: activation OUT of stage s for mb
         bwd_in: List[List[_Mailbox]],   # bwd_in[s][mb]: grad INTO stage s for mb
         bwd_out: List[List[_Mailbox]],  # bwd_out[s][mb]: grad OUT of stage s for mb
+        abort: threading.Event,          # set by any failing worker to stop the rest
+        on_error,                        # callback(worker) invoked on failure
     ):
         super().__init__(daemon=True, name=f"relay-stage-{stage.stage_index}")
         self.stage = stage
@@ -139,8 +146,17 @@ class _RelayWorker(threading.Thread):
         self.fwd_out = fwd_out
         self.bwd_in = bwd_in
         self.bwd_out = bwd_out
+        self.abort = abort
+        self._on_error = on_error
         self.error: Optional[BaseException] = None
         self._pending_loss: Dict[int, torch.Tensor] = {}  # mb -> loss (last stage)
+
+    def _check_abort(self):
+        if self.abort.is_set():
+            raise RuntimeError(
+                f"relay aborted (stage {self.stage.stage_index} stopping because "
+                f"another stage failed)"
+            )
 
     def run(self):
         s = self.stage.stage_index
@@ -149,6 +165,7 @@ class _RelayWorker(threading.Thread):
             if dev.type == "cuda":
                 torch.cuda.set_device(dev)
             for kind, mb in self.ops:
+                self._check_abort()
                 if kind == "F":
                     self._do_forward(s, mb)
                 elif kind == "W":
@@ -158,7 +175,11 @@ class _RelayWorker(threading.Thread):
                 else:
                     raise ValueError(f"unknown op kind: {kind!r}")
         except BaseException as e:  # noqa: BLE001 - propagate to orchestrator
-            self.error = e
+            # Record the error and signal the engine to abort the other workers,
+            # releasing every mailbox so no stage stays blocked on get() forever.
+            if self.error is None:
+                self.error = e
+            self._on_error(self)
 
     # ------------------------------------------------------------------
     def _do_forward(self, s: int, mb: int):
@@ -166,6 +187,7 @@ class _RelayWorker(threading.Thread):
             x = self.micro_batches[mb]
         else:
             x = self.fwd_in[s][mb].get()  # relay: wait for activation (s-1, mb)
+            self._check_abort()           # released mailbox (abort) returns None
         out = self.stage.forward_one_chunk(mb, x)
         if not self.stage.is_last:
             self.fwd_out[s][mb].put(out)  # relay: hand activation to (s+1, mb)
@@ -190,6 +212,7 @@ class _RelayWorker(threading.Thread):
             grad_in = self.stage.backward_one_chunk(mb, loss=loss)
         else:
             grad_output = self.bwd_in[s][mb].get()  # relay: wait for grad (s+1, mb)
+            self._check_abort()                   # released mailbox (abort)
             grad_in = self.stage.backward_one_chunk(mb, grad_output=grad_output)
         if not self.stage.is_first:
             self.bwd_out[s][mb].put(grad_in)  # relay: hand grad to (s-1, mb)
@@ -236,6 +259,18 @@ class _RelayEngine:
         bwd_in = [bwd_edge[e] for e in range(self.p - 1)] + [None]   # stage s reads edge s
         bwd_out = [None] + [bwd_edge[e] for e in range(self.p - 1)]  # stage s writes edge s-1
 
+        # Abort wiring: if any worker fails, set `abort` and RELEASE every mailbox
+        # so blocked get()s wake up and the other workers exit too (instead of
+        # deadlocking the join on mailboxes that will never be filled).
+        self.abort = threading.Event()
+        all_boxes = [box for row in fwd_edge for box in row] + \
+                    [box for row in bwd_edge for box in row]
+
+        def _on_error(_worker):
+            self.abort.set()
+            for box in all_boxes:
+                box.release()
+
         self.workers = [
             _RelayWorker(
                 stage=stages[s],
@@ -247,6 +282,8 @@ class _RelayEngine:
                 fwd_out=fwd_out,
                 bwd_in=bwd_in,
                 bwd_out=bwd_out,
+                abort=self.abort,
+                on_error=_on_error,
             )
             for s in range(self.p)
         ]
@@ -256,11 +293,19 @@ class _RelayEngine:
             w.start()
         for w in self.workers:
             w.join()
+        # Surface the FIRST real worker error (not the secondary abort errors
+        # raised by stages that were unblocked by the abort).
+        first_error = None
         for w in self.workers:
-            if w.error is not None:
-                raise RuntimeError(
-                    f"relay worker (stage {w.stage.stage_index}) failed"
-                ) from w.error
+            if w.error is not None and not (
+                isinstance(w.error, RuntimeError) and "relay aborted" in str(w.error)
+            ):
+                first_error = w.error
+                break
+        if first_error is not None:
+            raise RuntimeError(
+                f"relay worker failed: {first_error}"
+            ) from first_error
         # Barrier: a worker thread returns as soon as it has *enqueued* its last
         # CUDA kernel, not when that kernel has finished on the device. Without
         # this sync, run() can return while trailing kernels are still in flight
@@ -362,40 +407,93 @@ class Pipeline:
 
     Parameters
     ----------
-    model          : full model (traced/split once; stage modules moved to devices)
+    model          : full model (traced/split once; stage modules moved to devices).
+                     Not required if ``stage_modules`` is given.
     example_input  : one example microbatch input for the tracer (must match the
-                     model's current device; CPU model -> CPU example)
-    split_spec     : ``{layer_name: SplitPoint.BEGINNING|END}`` for pipeline()
+                     model's current device; CPU model -> CPU example).
+                     Not required if ``stage_modules`` is given.
+    split_spec     : ``{layer_name: SplitPoint.BEGINNING|END}`` for pipeline().
+                     Not required if ``stage_modules`` is given.
+    stage_modules  : optional list of PRE-PARTITIONED ``nn.Module`` stages, one
+                     per pipeline stage, in order. When provided, the
+                     ``torch.export`` tracer is **bypassed entirely** — use this
+                     when the model is too complex for ``torch.export`` to trace
+                     (graph breaks, data-dependent control flow, custom ops).
+                     Each module's forward takes the previous stage's output and
+                     returns its own output, exactly like a manually-split model.
+                     ``model``/``example_input``/``split_spec`` are ignored.
     devices        : one device per stage (default: cuda:i round-robin / CPU)
     fake_compute   : None | "replace" | {"fwd": s|[s...], "bwd": s|[s...]}
     overlap        : per-stage worker threads (True) or sequential debug (False)
 
     After construction, ``self.stages`` holds the Stage objects (which own the
-    gradient accumulators) and the original model's parameters are shared with
-    those stages — so a single optimizer over ``model.parameters()`` sees the
-    accumulated grads after ``step()`` + :meth:`flush_grads`.
+    gradient accumulators). With the traced path, the original model's parameters
+    are shared with those stages — so a single optimizer over ``model.parameters()``
+    sees the accumulated grads after ``step()`` + :meth:`flush_grads`. With
+    ``stage_modules``, optimize over the modules' own parameters (e.g.
+    ``itertools.chain(*(m.parameters() for m in stage_modules))``).
     """
 
     def __init__(
         self,
-        model: nn.Module,
-        example_input: torch.Tensor,
-        split_spec: dict,
+        model: Optional[nn.Module] = None,
+        example_input: Optional[torch.Tensor] = None,
+        split_spec: Optional[dict] = None,
         *,
+        stage_modules: Optional[Sequence[nn.Module]] = None,
         devices: Optional[Sequence[Union[str, torch.device]]] = None,
         fake_compute=None,
         overlap: bool = True,
     ):
-        from torch.distributed.pipelining import pipeline as _split_pipeline
-
         self.model = model
         self.overlap = overlap
+
+        if stage_modules is not None:
+            # ── Manual path: bypass torch.export entirely ─────────────────────
+            stage_modules = list(stage_modules)
+            if len(stage_modules) < 1:
+                raise ValueError("stage_modules must contain at least one module")
+            self.num_stages = len(stage_modules)
+            self.devices = self._resolve_devices(devices)
+            fake = (
+                _FakeCompute(fake_compute, self.num_stages)
+                if fake_compute is not None
+                else None
+            )
+            self.stages = [
+                Stage(mod, i, self.num_stages, device=self.devices[i],
+                      fake=fake, tracer=None)
+                for i, mod in enumerate(stage_modules)
+            ]
+            return
+
+        # ── Traced path: split the full model via torch.export ────────────────
+        if model is None or example_input is None or split_spec is None:
+            raise ValueError(
+                "either provide stage_modules (pre-partitioned stages) OR all of "
+                "model, example_input, and split_spec (to trace+split)"
+            )
+        from torch.distributed.pipelining import pipeline as _split_pipeline
 
         pipe = _split_pipeline(
             module=model, mb_args=(example_input,), split_spec=split_spec
         )
         self.num_stages = pipe.num_stages
+        self.devices = self._resolve_devices(devices)
 
+        fake = (
+            _FakeCompute(fake_compute, self.num_stages)
+            if fake_compute is not None
+            else None
+        )
+
+        self.stages = [
+            Stage(pipe.get_stage_module(i), i, self.num_stages, device=self.devices[i],
+                  fake=fake, tracer=None)
+            for i in range(self.num_stages)
+        ]
+
+    def _resolve_devices(self, devices):
         if devices is None:
             n_cuda = torch.cuda.device_count() if torch.cuda.is_available() else 0
             if n_cuda > 0:
@@ -409,19 +507,7 @@ class Pipeline:
             assert len(devices) == self.num_stages, (
                 f"need {self.num_stages} devices, got {len(devices)}"
             )
-        self.devices = devices
-
-        fake = (
-            _FakeCompute(fake_compute, self.num_stages)
-            if fake_compute is not None
-            else None
-        )
-
-        self.stages = [
-            Stage(pipe.get_stage_module(i), i, self.num_stages, device=devices[i],
-                  fake=fake, tracer=None)
-            for i in range(self.num_stages)
-        ]
+        return devices
 
     def step(
         self,
