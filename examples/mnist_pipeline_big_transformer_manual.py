@@ -237,18 +237,18 @@ def main() -> int:
                 done = True
                 break
 
-    # ── Evaluate: run inference by relaying through the stages manually ───────
+    # ── Evaluate: pipelined inference (GPipe-forward, keeps all GPUs busy) ────
     for st in stages:
         st.eval()
     correct = total = 0
-    with torch.no_grad():
-        for x, y in test_loader:
-            h = x
-            for st, dev in zip(stages, args.devices):
-                h = st(h.to(dev))          # relay activations stage -> stage
-            pred = h.argmax(1).cpu()
-            correct += (pred == y).sum().item()
-            total += y.size(0)
+    for x, y in test_loader:
+        # pipe.infer() microbatches the batch through the stages concurrently
+        # (forward-only GPipe) instead of a sequential whole-batch relay, so the
+        # GPUs stay busy. no_grad + no activation retention.
+        logits = pipe.infer(x, n_microbatches=args.micro)
+        pred = logits.argmax(1).cpu()
+        correct += (pred == y).sum().item()
+        total += y.size(0)
     acc = correct / total
     print(f"\ntest accuracy after {step} steps: {acc:.4f}")
 

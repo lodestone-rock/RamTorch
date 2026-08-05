@@ -391,6 +391,124 @@ def _run_sequential(
             raise RuntimeError("sequential executor made no progress (dead schedule)")
 
 
+# ── Forward-only (inference) engine ───────────────────────────────────────────
+
+class _InferWorker(threading.Thread):
+    """
+    One thread per stage for forward-only pipelined inference.
+
+    Each stage walks microbatches in order: wait for the previous stage's
+    activation (or take the local microbatch on stage 0), compute the forward
+    under ``no_grad``, and hand the output to the next stage. Stage ``s+1``
+    working on microbatch ``k`` overlaps with stage ``s`` on microbatch ``k+1``.
+    """
+
+    def __init__(self, stage, micro_batches, fwd_in, fwd_out, abort, on_error,
+                 last_outputs, tracer):
+        super().__init__(daemon=True, name=f"infer-stage-{stage.stage_index}")
+        self.stage = stage
+        self.micro_batches = micro_batches
+        self.fwd_in = fwd_in
+        self.fwd_out = fwd_out
+        self.abort = abort
+        self._on_error = on_error
+        self.last_outputs = last_outputs  # dict mb -> output (last stage writes)
+        self.tracer = tracer
+        self.error: Optional[BaseException] = None
+
+    def run(self):
+        s = self.stage.stage_index
+        dev = self.stage.device
+        try:
+            if dev.type == "cuda":
+                torch.cuda.set_device(dev)
+            for mb in range(len(self.micro_batches)):
+                if self.abort.is_set():
+                    return
+                x = self.micro_batches[mb] if self.stage.is_first else self.fwd_in[s][mb].get()
+                if self.abort.is_set():
+                    return
+                t0 = self.tracer._ts() if self.tracer else 0.0
+                out = self.stage.module(x.to(dev))
+                if self.tracer:
+                    self.tracer.record_cpu(
+                        f"F mb{mb}", "fwd", f"stage {s}", t0, self.tracer._ts()
+                    )
+                if self.stage.is_last:
+                    self.last_outputs[mb] = out
+                else:
+                    self.fwd_out[s][mb].put(out)
+        except BaseException as e:  # noqa: BLE001
+            if self.error is None:
+                self.error = e
+            self._on_error(self)
+
+
+def _run_inference(
+    stages: List[Stage],
+    data: torch.Tensor,
+    *,
+    n_microbatches: int,
+    trace_path: Optional[str],
+) -> torch.Tensor:
+    """
+    Forward-only GPipe-style pipelined inference (no backward, no grad).
+
+    Splits ``data`` into microbatches and relays them through the stages with one
+    worker thread per stage, so stages stay busy on different microbatches
+    concurrently. Returns the concatenated last-stage outputs (dim 0).
+    """
+    p = len(stages)
+    # Pad/trim so the batch divides evenly into microbatches.
+    bs = data.shape[0]
+    n_microbatches = max(1, min(n_microbatches, bs))
+    # Chunk as evenly as possible (last chunk may be smaller).
+    mbs = list(torch.chunk(data, n_microbatches, dim=0))
+    m = len(mbs)
+
+    tracer = PerfettoTracer() if trace_path else None
+
+    # Mailboxes for the forward relay, one per (edge, microbatch).
+    fwd_edge = [[_Mailbox() for _ in range(m)] for _ in range(p - 1)]
+    fwd_in = [None] + [fwd_edge[e] for e in range(p - 1)]
+    fwd_out = [fwd_edge[e] for e in range(p - 1)] + [None]
+
+    abort = threading.Event()
+    all_boxes = [box for row in fwd_edge for box in row]
+
+    def _on_error(_w):
+        abort.set()
+        for box in all_boxes:
+            box.release()
+
+    last_outputs: Dict[int, torch.Tensor] = {}
+    workers = [
+        _InferWorker(stages[s], mbs, fwd_in, fwd_out, abort, _on_error,
+                     last_outputs, tracer)
+        for s in range(p)
+    ]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+
+    for w in workers:
+        if w.error is not None:
+            raise RuntimeError(
+                f"inference worker (stage {w.stage.stage_index}) failed"
+            ) from w.error
+
+    # Drain device work before reading outputs / exporting the trace.
+    for d in {st.device for st in stages if st.device.type == "cuda"}:
+        torch.cuda.synchronize(d)
+
+    if tracer is not None:
+        tracer.export(trace_path)
+
+    # Concatenate last-stage outputs in microbatch order, on the last device.
+    return torch.cat([last_outputs[i] for i in range(m)], dim=0)
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 class Pipeline:
@@ -544,6 +662,33 @@ class Pipeline:
         s = scale if scale is not None else 1.0 / n_microbatches
         for st in self.stages:
             st.flush_grads(scale=s)
+
+    @torch.no_grad()
+    def infer(
+        self,
+        data: torch.Tensor,
+        *,
+        n_microbatches: int = 4,
+        trace_path: Optional[str] = None,
+    ) -> torch.Tensor:
+        """
+        Pipelined inference: a forward-only GPipe-style run (no backward).
+
+        The batch is split into ``n_microbatches`` microbatches and relayed
+        through the stages with one worker thread per stage, so while stage
+        ``s+1`` computes microbatch ``k``, stage ``s`` is already computing
+        microbatch ``k+1`` — keeping every GPU busy instead of the whole-batch
+        sequential relay (which leaves all but one GPU idle at any moment).
+
+        Runs under ``no_grad`` and does not retain activations. Returns the
+        concatenated last-stage outputs for the full batch (dim 0).
+
+        ``trace_path`` optionally writes an op-level Chrome-trace (Perfetto) of
+        the forward spans so you can see the overlap.
+        """
+        return _run_inference(
+            self.stages, data, n_microbatches=n_microbatches, trace_path=trace_path
+        )
 
 
 def _run_step(
