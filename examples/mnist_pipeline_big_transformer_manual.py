@@ -151,6 +151,14 @@ def main() -> int:
                     help="one device per pipeline stage")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", type=str, default="", help="optional checkpoint path")
+    # ── Profiling (bounded to a small step window so files stay small) ──
+    ap.add_argument("--profile", action="store_true",
+                    help="capture a kineto profile + op-level Perfetto trace "
+                         "during the profile window")
+    ap.add_argument("--profile-start", type=int, default=20,
+                    help="first step to profile (after this many warm steps)")
+    ap.add_argument("--profile-steps", type=int, default=3,
+                    help="how many steps to profile (keeps the trace small)")
     args = ap.parse_args()
 
     n_stages = len(args.devices)
@@ -194,14 +202,27 @@ def main() -> int:
 
     # ── Train ─────────────────────────────────────────────────────────────────
     print(f"\ntraining ({args.steps} steps) ...")
+    if args.profile:
+        stop = args.profile_start + args.profile_steps
+        print(f"  profiling steps [{args.profile_start}, {stop}) "
+              f"-> profile_win.json + trace_win.json")
     step = 0
     running = 0.0
     done = False
     while not done:
         for x, y in train_loader:
+            # Profile only inside the small window so the trace files stay small.
+            # Each profiled step writes its own file (trace_win_<step>.json), so
+            # you can open any single step's full F/B relay in Perfetto.
+            in_window = (
+                args.profile
+                and args.profile_start <= step < args.profile_start + args.profile_steps
+            )
             result = pipe.step(
                 x, targets=y, schedule=args.schedule,
                 n_microbatches=args.micro, loss_fn=loss_fn,
+                trace_path=(f"trace_win_{step}.json" if in_window else None),
+                profile_path=(f"profile_win_{step}.json" if in_window else None),
             )
             result.flush_grads()
             opt.step()
