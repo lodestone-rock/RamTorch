@@ -46,7 +46,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from ramtorch import Pipeline
+from ramtorch import Pipeline, PipelineOptimizer
 
 
 # ── Shared transformer block ──────────────────────────────────────────────────
@@ -174,6 +174,9 @@ def main() -> int:
                     choices=["gpipe", "staggered_1b1f", "1f1b"])
     ap.add_argument("--devices", nargs=2, default=["cuda:1", "cuda:3"])
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--parallel-opt", action="store_true",
+                    help="use PipelineOptimizer (per-stage parallel) instead of "
+                         "a single sequential Adam for the trained model")
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--profile-start", type=int, default=30)
     ap.add_argument("--profile-steps", type=int, default=2)
@@ -214,9 +217,14 @@ def main() -> int:
         tr1 = TrainHead(dim=args.dim, heads=args.heads,
                         n_blocks=args.depth - args.depth // 2, num_classes=10)
         pipe = Pipeline(stage_modules=[tr0, tr1], devices=args.devices)
-        opt = torch.optim.Adam(
-            itertools.chain(*(st.parameters() for st in (tr0, tr1))), lr=args.lr
-        )
+        if args.parallel_opt:
+            opt = PipelineOptimizer(
+                pipe.stages, lambda p: torch.optim.Adam(p, lr=args.lr)
+            )
+        else:
+            opt = torch.optim.Adam(
+                itertools.chain(*(st.parameters() for st in (tr0, tr1))), lr=args.lr
+            )
         return tr0, tr1, pipe, opt
 
     n_train = sum(p.numel() for p in TrainEmbed(dim=args.dim, heads=args.heads,
@@ -261,6 +269,8 @@ def main() -> int:
             prof.__enter__()
             print(f"  profiling steps [{start}, {start + nrec}) -> profile_serial.json")
         t0 = time.perf_counter()
+        t_fwd_bwd = 0.0
+        t_opt = 0.0
         for x, y in train_loader:
             if step >= args.steps:
                 break
@@ -277,9 +287,17 @@ def main() -> int:
             #    as its inference is done, without waiting for the rest.
             x_mbs = x.chunk(args.micro, dim=0)
             nested = tuple((ctx_mbs[k], x_mbs[k]) for k in range(args.micro))
+            t_a = time.perf_counter()
             result = pipe.step(nested, targets=y, schedule=args.schedule,
                                n_microbatches=args.micro, loss_fn=loss_fn)
-            result.flush_grads(); opt.step(); opt.zero_grad(set_to_none=True)
+            result.flush_grads()
+            torch.cuda.synchronize()
+            t_b = time.perf_counter()
+            opt.step(); opt.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            t_c = time.perf_counter()
+            t_fwd_bwd += t_b - t_a
+            t_opt += t_c - t_b
             running += result.loss.item(); losses.append(result.loss.item()); step += 1
             if prof is not None:
                 prof.step()
@@ -289,6 +307,12 @@ def main() -> int:
         dt = time.perf_counter() - t0
         if prof is not None:
             prof.__exit__(None, None, None)
+        if args.parallel_opt:
+            opt.close()
+        print(f"\n  timing breakdown over {step} steps:")
+        print(f"    pipeline fwd+bwd : {t_fwd_bwd*1e3:8.1f}ms  ({t_fwd_bwd/step*1e3:6.2f} ms/step)")
+        print(f"    optimizer step   : {t_opt*1e3:8.1f}ms  ({t_opt/step*1e3:6.2f} ms/step)")
+        print(f"    optimizer share  : {100*t_opt/(t_fwd_bwd+t_opt):.1f}% of step time")
         return dt, losses
 
     dt, losses = run_loop()
