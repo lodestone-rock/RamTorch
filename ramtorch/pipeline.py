@@ -178,28 +178,34 @@ class Stage:
             time.sleep(t)
 
     # ------------------------------------------------------------------
-    def forward_one_chunk(self, mb_index: int, x: torch.Tensor) -> torch.Tensor:
+    def forward_one_chunk(self, mb_index: int, x) -> torch.Tensor:
         t0 = self.tracer._ts() if self.tracer else 0.0
         ev0 = ev1 = None
         if self.tracer and self.device.type == "cuda":
             ev0 = torch.cuda.Event(enable_timing=True)
             ev0.record()
 
-        x = x.to(self.device)
-        if not self.is_first:
-            x = x.detach().requires_grad_(x.is_floating_point())
-        else:
-            x = x.detach().requires_grad_(x.is_floating_point())
+        # ``x`` may be a single tensor or a tuple of tensors (multi-input stage).
+        # Normalize to a tuple internally; single-tensor input becomes (x,).
+        is_tuple = isinstance(x, (tuple, list))
+        xs = tuple(x) if is_tuple else (x,)
+
+        def _prep(t):
+            t = t.to(self.device)
+            return t.detach().requires_grad_(t.is_floating_point())
+
+        xs = tuple(_prep(t) for t in xs)
 
         if self.fake is not None and self.fake.replace:
             self._sleep("fwd")
-            out = self._fake_output(x)
+            out = self._fake_output(xs[0])
         else:
             self._sleep("fwd")
-            out = self.module(x)
+            out = self.module(*xs) if is_tuple else self.module(xs[0])
 
         with self._lock:
-            self._cache[mb_index] = (x, out)
+            # Cache the (possibly multi-tensor) input for the backward pass.
+            self._cache[mb_index] = (xs if is_tuple else xs[0], out)
 
         if self.tracer:
             name = f"F mb{mb_index}"
@@ -245,7 +251,14 @@ class Stage:
 
         self._sleep("bwd")
 
-        inputs = [inp] + self.params
+        # ``inp`` may be a single tensor or a tuple of tensors (multi-input stage).
+        # Flatten tuple inputs into the autograd inputs list; the returned
+        # input-grads then come back as a matching tuple.
+        inp_is_tuple = isinstance(inp, (tuple, list))
+        inp_list = list(inp) if inp_is_tuple else [inp]
+        inputs = inp_list + self.params
+        n_inp = len(inp_list)
+
         if self.is_last:
             if loss is None:
                 assert loss_fn is not None, "last stage needs loss_fn+target or loss"
@@ -259,7 +272,9 @@ class Stage:
                 allow_unused=True,
             )
 
-        input_grad, param_grads = grads[0], grads[1:]
+        input_grads, param_grads = grads[:n_inp], grads[n_inp:]
+        # Single-tensor input -> single grad; tuple input -> tuple of grads.
+        input_grad = input_grads if inp_is_tuple else input_grads[0]
         with self._lock:
             for p, g in zip(self.params, param_grads):
                 if g is not None:

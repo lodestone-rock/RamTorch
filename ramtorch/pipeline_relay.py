@@ -429,7 +429,12 @@ class _InferWorker(threading.Thread):
                 if self.abort.is_set():
                     return
                 t0 = self.tracer._ts() if self.tracer else 0.0
-                out = self.stage.module(x.to(dev))
+                # ``x`` may be a single tensor or a tuple of tensors (multi-input
+                # stage). Move each to the device and unpack into the module call.
+                if isinstance(x, (tuple, list)):
+                    out = self.stage.module(*[t.to(dev) for t in x])
+                else:
+                    out = self.stage.module(x.to(dev))
                 if self.tracer:
                     self.tracer.record_cpu(
                         f"F mb{mb}", "fwd", f"stage {s}", t0, self.tracer._ts()
@@ -446,25 +451,34 @@ class _InferWorker(threading.Thread):
 
 def _run_inference(
     stages: List[Stage],
-    data: torch.Tensor,
+    data,
     *,
     n_microbatches: int,
     trace_path: Optional[str],
     profile_path: Optional[str] = None,
-) -> torch.Tensor:
+):
     """
     Forward-only GPipe-style pipelined inference (no backward, no grad).
 
     Splits ``data`` into microbatches and relays them through the stages with one
     worker thread per stage, so stages stay busy on different microbatches
-    concurrently. Returns the concatenated last-stage outputs (dim 0).
+    concurrently.
+
+    ``data`` accepts the same forms as :meth:`Pipeline.step` (tensor, flat tuple,
+    or nested pre-diced tuple). The OUTPUT mirrors the input shape: a nested
+    pre-diced input yields a nested tuple of per-microbatch outputs (so a
+    downstream consumer can start on microbatch 0 without waiting for the rest);
+    a tensor or flat-tuple input yields a single concatenated tensor (dim 0).
     """
     p = len(stages)
-    # Pad/trim so the batch divides evenly into microbatches.
-    bs = data.shape[0]
-    n_microbatches = max(1, min(n_microbatches, bs))
-    # Chunk as evenly as possible (last chunk may be smaller).
-    mbs = list(torch.chunk(data, n_microbatches, dim=0))
+    # Detect whether the input was pre-diced (nested) so we can mirror it in the
+    # output. _shard_input normalizes all forms into per-microbatch inputs.
+    was_prediced = (
+        isinstance(data, (tuple, list))
+        and len(data) == n_microbatches
+        and all(isinstance(e, (torch.Tensor, tuple, list)) for e in data)
+    )
+    mbs, _ = _shard_input(data, n_microbatches, stages[0].device)
     m = len(mbs)
 
     tracer = PerfettoTracer() if trace_path else None
@@ -524,7 +538,11 @@ def _run_inference(
     if tracer is not None:
         tracer.export(trace_path)
 
-    # Concatenate last-stage outputs in microbatch order, on the last device.
+    if was_prediced:
+        # Mirror the pre-diced input: return per-microbatch outputs as a nested
+        # tuple (independent tensors), so downstream can start on mb0 eagerly.
+        return tuple(last_outputs[i] for i in range(m))
+    # Tensor / flat-tuple input -> single concatenated tensor (dim 0).
     return torch.cat([last_outputs[i] for i in range(m)], dim=0)
 
 
@@ -584,6 +602,9 @@ class Pipeline:
     ):
         self.model = model
         self.overlap = overlap
+        # Tuple / nested-tuple inputs are only supported on the manual
+        # (stage_modules) path; the traced torch.export path does not support them.
+        self._manual = stage_modules is not None
 
         if stage_modules is not None:
             # ── Manual path: bypass torch.export entirely ─────────────────────
@@ -663,7 +684,17 @@ class Pipeline:
         Returns a :class:`PipelineResult`; call ``result.flush_grads()`` to write
         accumulated microbatch grads (mean-scaled) into ``.grad`` before an
         optimizer step. See :func:`run_pipeline_relay` for parameter details.
+
+        ``data`` may be a tensor, a flat tuple of tensors (unpacked as positional
+        args into the stage-0 module), or a nested pre-diced tuple of microbatches.
+        Tuple forms require the manual ``stage_modules`` path.
         """
+        if isinstance(data, (tuple, list)) and not self._manual:
+            raise ValueError(
+                "tuple / nested-tuple pipeline inputs are only supported on the "
+                "manual stage_modules path (Pipeline(stage_modules=[...])). The "
+                "traced PipelineModel path (torch.export) does not support them."
+            )
         return _run_step(
             self.stages,
             data,
@@ -685,12 +716,12 @@ class Pipeline:
     @torch.no_grad()
     def infer(
         self,
-        data: torch.Tensor,
+        data,
         *,
         n_microbatches: int = 4,
         trace_path: Optional[str] = None,
         profile_path: Optional[str] = None,
-    ) -> torch.Tensor:
+    ):
         """
         Pipelined inference: a forward-only GPipe-style run (no backward).
 
@@ -700,8 +731,13 @@ class Pipeline:
         microbatch ``k+1`` — keeping every GPU busy instead of the whole-batch
         sequential relay (which leaves all but one GPU idle at any moment).
 
-        Runs under ``no_grad`` and does not retain activations. Returns the
-        concatenated last-stage outputs for the full batch (dim 0).
+        Runs under ``no_grad`` and does not retain activations.
+
+        ``data`` accepts the same forms as :meth:`step` (tensor, flat tuple, or
+        nested pre-diced tuple). The OUTPUT mirrors the input shape: a nested
+        pre-diced input yields a nested tuple of per-microbatch outputs (so a
+        downstream consumer can start on microbatch 0 without waiting for the
+        rest); a tensor or flat-tuple input yields a single concatenated tensor.
 
         ``trace_path`` optionally writes an op-level Chrome-trace (Perfetto) of
         the forward spans so you can see the overlap. ``profile_path`` captures
@@ -713,9 +749,84 @@ class Pipeline:
         )
 
 
+def _shard_input(data, n_microbatches: int, device):
+    """
+    Normalize the pipeline input into a list of per-microbatch inputs.
+
+    Accepted forms (manual ``stage_modules`` path only — see note below):
+      * tensor                -> chunked into ``n_microbatches`` along dim 0;
+                                 each microbatch is a tensor.
+      * (t0, t1, ...)         -> FLAT tuple of tensors, each chunked along dim 0;
+                                 each microbatch is a tuple ``(t0_mb, t1_mb, ...)``
+                                 passed to the stage-0 module as *positional args*.
+      * ((mb0...), (mb1...))  -> NESTED tuple = PRE-DICED microbatches. The outer
+                                 tuple has one entry per microbatch; each entry is
+                                 itself a tensor or a tuple of tensors. These are
+                                 used as-is (independent microbatches, no shared
+                                 storage), so downstream consumers can start on
+                                 microbatch 0 without waiting for the rest.
+
+    Returns ``(mbs, is_tuple)`` where ``mbs[mb]`` is the input for microbatch mb
+    (a tensor, or a tuple of tensors to be unpacked as positional args), and
+    ``is_tuple`` tells the caller whether to unpack on the way into the module.
+
+    NOTE: tuple / nested-tuple inputs are only supported on the manual
+    ``stage_modules`` path. The traced ``PipelineModel`` path (torch.export) does
+    NOT support them — ``Pipeline.__init__`` asserts this.
+    """
+    def _to_dev(t):
+        return t.to(device) if isinstance(t, torch.Tensor) else t
+
+    if isinstance(data, (tuple, list)):
+        # NESTED tuple = pre-diced microbatches: outer length == n_microbatches
+        # and every entry is itself a tuple/list of tensors. Each entry is one
+        # independent microbatch (used as-is, no shared storage).
+        if (
+            len(data) == n_microbatches
+            and all(isinstance(e, (tuple, list)) for e in data)
+        ):
+            mbs = [tuple(_to_dev(t) for t in e) for e in data]
+            return mbs, True
+
+        # NESTED tuple of single-tensor microbatches: outer length ==
+        # n_microbatches and every entry is a tensor. Treat as pre-diced.
+        if (
+            len(data) == n_microbatches
+            and all(isinstance(e, torch.Tensor) for e in data)
+        ):
+            mbs = [_to_dev(e) for e in data]
+            return mbs, False
+
+        # FLAT tuple of full-batch tensors: chunk each element per microbatch and
+        # pass the per-microbatch tuple as positional args to the stage-0 module.
+        if all(isinstance(e, torch.Tensor) for e in data):
+            for e in data:
+                assert e.shape[0] % n_microbatches == 0, (
+                    f"tuple element batch {e.shape[0]} not divisible by "
+                    f"n_microbatches={n_microbatches}"
+                )
+            per_elem = [e.chunk(n_microbatches, dim=0) for e in data]
+            mbs = [
+                tuple(_to_dev(per_elem[k][mb]) for k in range(len(data)))
+                for mb in range(n_microbatches)
+            ]
+            return mbs, True
+
+    # Single tensor.
+    assert isinstance(data, torch.Tensor), (
+        f"unsupported pipeline input type: {type(data)} "
+        "(expected tensor, flat tuple of tensors, or nested pre-diced tuple)"
+    )
+    assert data.shape[0] % n_microbatches == 0, (
+        f"batch {data.shape[0]} not divisible by n_microbatches={n_microbatches}"
+    )
+    mbs = [_to_dev(mb) for mb in data.chunk(n_microbatches, dim=0)]
+    return mbs, False
+
+
 def _run_step(
     stages: List[Stage],
-    data: torch.Tensor,
+    data,
     *,
     targets: Optional[torch.Tensor],
     schedule: str,
@@ -726,7 +837,13 @@ def _run_step(
     profile_path: Optional[str],
 ) -> PipelineResult:
     """Run one pipeline step on pre-built stages (no re-split). Shared by
-    ``Pipeline.step`` and the one-shot ``run_pipeline_relay``."""
+    ``Pipeline.step`` and the one-shot ``run_pipeline_relay``.
+
+    ``data`` may be a tensor, a flat tuple of tensors (unpacked as positional
+    args into the stage-0 module), or a nested pre-diced tuple of microbatches.
+    See :func:`_shard_input`. Tuple forms require the manual ``stage_modules``
+    path (not the traced ``PipelineModel`` path).
+    """
     if schedule not in ("gpipe", "1f1b", "staggered_1b1f"):
         raise ValueError(
             f"supported schedules: 'gpipe', '1f1b', 'staggered_1b1f'; got {schedule!r}"
@@ -734,11 +851,8 @@ def _run_step(
     loss_fn = loss_fn or (lambda out, _: out.sum())
     num_stages = len(stages)
 
-    # Microbatch sharding
-    assert data.shape[0] % n_microbatches == 0, (
-        f"batch {data.shape[0]} not divisible by n_microbatches={n_microbatches}"
-    )
-    mbs = [mb.to(stages[0].device) for mb in data.chunk(n_microbatches, dim=0)]
+    # Microbatch sharding (handles tensor / flat tuple / nested pre-diced tuple).
+    mbs, is_tuple_input = _shard_input(data, n_microbatches, stages[0].device)
     tgts = (
         [t.to(stages[-1].device) for t in targets.chunk(n_microbatches, dim=0)]
         if targets is not None

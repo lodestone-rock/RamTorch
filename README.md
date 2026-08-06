@@ -185,6 +185,8 @@ if __name__ == "__main__":
 
 ## Pipeline Parallelism
 
+> **Full guide: [docs/pipeline_parallel.md](docs/pipeline_parallel.md)** — torch.export gotchas, manual model splitting, tuple/pre-diced inputs, schedules, profiling, and numerics.
+
 RamTorch also provides **single-process pipeline parallelism**: split a model across multiple GPUs and train/infer pipeline-parallel **without `torchrun`, without process groups, without NCCL**. Each stage runs on its own GPU driven by one worker thread; activations and gradients are relayed between stages through lightweight thread-safe handoffs.
 
 ### Why
