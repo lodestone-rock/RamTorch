@@ -469,6 +469,10 @@ def _run_inference(
     pre-diced input yields a nested tuple of per-microbatch outputs (so a
     downstream consumer can start on microbatch 0 without waiting for the rest);
     a tensor or flat-tuple input yields a single concatenated tensor (dim 0).
+
+    If the batch size is not divisible by ``n_microbatches``, the input is padded
+    up to the next multiple (by repeating rows) before sharding and the padding is
+    sliced off the output afterward — so any batch size works.
     """
     p = len(stages)
     # Detect whether the input was pre-diced (nested) so we can mirror it in the
@@ -478,6 +482,29 @@ def _run_inference(
         and len(data) == n_microbatches
         and all(isinstance(e, (torch.Tensor, tuple, list)) for e in data)
     )
+
+    # ── Pad to a multiple of n_microbatches (tensor / flat-tuple inputs) ──────
+    # Pre-diced (nested) inputs are already per-microbatch and skip this.
+    pad_rows = 0
+    if not was_prediced:
+        def _pad_to_multiple(t: torch.Tensor) -> torch.Tensor:
+            nonlocal pad_rows
+            bs = t.shape[0]
+            rem = bs % n_microbatches
+            if rem == 0:
+                return t
+            pad_rows = n_microbatches - rem
+            pad = t[:1].expand(pad_rows, *t.shape[1:])
+            return torch.cat([t, pad], dim=0)
+
+        if isinstance(data, torch.Tensor):
+            data = _pad_to_multiple(data)
+        elif isinstance(data, (tuple, list)) and all(
+            isinstance(e, torch.Tensor) for e in data
+        ):
+            # Flat tuple of full-batch tensors: pad each element the same amount.
+            data = type(data)(_pad_to_multiple(e) for e in data)
+
     mbs, _ = _shard_input(data, n_microbatches, stages[0].device)
     m = len(mbs)
 
@@ -542,8 +569,12 @@ def _run_inference(
         # Mirror the pre-diced input: return per-microbatch outputs as a nested
         # tuple (independent tensors), so downstream can start on mb0 eagerly.
         return tuple(last_outputs[i] for i in range(m))
-    # Tensor / flat-tuple input -> single concatenated tensor (dim 0).
-    return torch.cat([last_outputs[i] for i in range(m)], dim=0)
+    # Tensor / flat-tuple input -> single concatenated tensor (dim 0). Slice off
+    # any padding rows added to make the batch divisible by n_microbatches.
+    out = torch.cat([last_outputs[i] for i in range(m)], dim=0)
+    if pad_rows > 0:
+        out = out[: out.shape[0] - pad_rows]
+    return out
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
