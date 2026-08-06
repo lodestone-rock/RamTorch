@@ -5,6 +5,7 @@ from .stochastic_optimizers.adamw import AdamW
 from .pipeline import Stage, run_pipeline, PipelineResult
 from .pipeline_relay import run_pipeline_relay, Pipeline
 from .pipeline_easy import PipelineModel, auto_split_spec, PipelinePaddingWarning
+from .pipeline_optimizer import PipelineOptimizer
 from . import schedule_simulator
 
 __all__ = [
@@ -15,6 +16,7 @@ __all__ = [
     "run_pipeline_relay",
     "Pipeline",
     "PipelineModel",
+    "PipelineOptimizer",
     "auto_split_spec",
     "PipelinePaddingWarning",
     "PipelineResult",

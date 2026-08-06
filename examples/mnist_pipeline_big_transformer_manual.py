@@ -38,7 +38,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from ramtorch import Pipeline
+from ramtorch import Pipeline, PipelineOptimizer
 
 
 # ── Building blocks ───────────────────────────────────────────────────────────
@@ -151,6 +151,9 @@ def main() -> int:
                     help="one device per pipeline stage")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", type=str, default="", help="optional checkpoint path")
+    ap.add_argument("--parallel-opt", action="store_true",
+                    help="use PipelineOptimizer (per-stage parallel optimizer) "
+                         "instead of a single sequential Adam")
     # ── Profiling (bounded to a small step window so files stay small) ──
     ap.add_argument("--profile", action="store_true",
                     help="capture a kineto profile + op-level Perfetto trace "
@@ -194,9 +197,16 @@ def main() -> int:
     # ── Build the pipeline from the manual stages ─────────────────────────────
     pipe = Pipeline(stage_modules=stages, devices=args.devices)
     # Optimize over ALL stage params (they're separate modules, not one model).
-    opt = torch.optim.Adam(
-        itertools.chain(*(st.parameters() for st in stages)), lr=args.lr
-    )
+    if args.parallel_opt:
+        opt = PipelineOptimizer(
+            pipe.stages, lambda p: torch.optim.Adam(p, lr=args.lr)
+        )
+        print("optimizer: PipelineOptimizer (per-stage parallel)")
+    else:
+        opt = torch.optim.Adam(
+            itertools.chain(*(st.parameters() for st in stages)), lr=args.lr
+        )
+        print("optimizer: single sequential Adam")
     loss_fn = nn.CrossEntropyLoss()
     print(f"schedule={args.schedule}  microbatches={args.micro}  Adam lr={args.lr}")
 
@@ -206,8 +216,11 @@ def main() -> int:
         stop = args.profile_start + args.profile_steps
         print(f"  profiling steps [{args.profile_start}, {stop}) "
               f"-> profile_win.json + trace_win.json")
+    import time
     step = 0
     running = 0.0
+    t_fwd_bwd = 0.0   # pipeline step time
+    t_opt = 0.0       # optimizer step time
     done = False
     while not done:
         for x, y in train_loader:
@@ -218,6 +231,7 @@ def main() -> int:
                 args.profile
                 and args.profile_start <= step < args.profile_start + args.profile_steps
             )
+            t0 = time.perf_counter()
             result = pipe.step(
                 x, targets=y, schedule=args.schedule,
                 n_microbatches=args.micro, loss_fn=loss_fn,
@@ -225,8 +239,14 @@ def main() -> int:
                 profile_path=(f"profile_win_{step}.json" if in_window else None),
             )
             result.flush_grads()
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
             opt.step()
             opt.zero_grad(set_to_none=True)
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            t_fwd_bwd += t1 - t0
+            t_opt += t2 - t1
 
             running += result.loss.item()
             step += 1
@@ -236,6 +256,11 @@ def main() -> int:
             if step >= args.steps:
                 done = True
                 break
+
+    print(f"\ntiming breakdown over {step} steps:")
+    print(f"  pipeline fwd+bwd : {t_fwd_bwd*1e3:8.1f}ms  ({t_fwd_bwd/step*1e3:6.2f} ms/step)")
+    print(f"  optimizer step   : {t_opt*1e3:8.1f}ms  ({t_opt/step*1e3:6.2f} ms/step)")
+    print(f"  optimizer share  : {100*t_opt/(t_fwd_bwd+t_opt):.1f}% of step time")
 
     # ── Evaluate: pipelined inference (GPipe-forward, keeps all GPUs busy) ────
     for st in stages:
@@ -267,6 +292,10 @@ def main() -> int:
         ckpt = {f"stage_{i}": st.state_dict() for i, st in enumerate(stages)}
         torch.save(ckpt, args.save)
         print(f"saved checkpoint -> {args.save}")
+
+    # Shut down the parallel optimizer's worker threads, if used.
+    if args.parallel_opt:
+        opt.close()
 
     return 0
 
