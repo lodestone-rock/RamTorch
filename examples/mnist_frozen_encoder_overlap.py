@@ -159,6 +159,45 @@ def build_even_blocks(dim, heads, n_blocks):
     return nn.Sequential(*[Block(dim, heads) for _ in range(n_blocks)])
 
 
+# ── Stage builders (scale to N GPUs) ──────────────────────────────────────────
+# Both models follow the same shape: an embed stage (first), zero or more middle
+# block-stacks, and a head stage (last). Blocks are distributed as evenly as
+# possible across the stages, matching the big-transformer example.
+
+def _block_counts(depth: int, n_stages: int) -> list:
+    base = depth // n_stages
+    rem = depth % n_stages
+    return [base + (1 if i < rem else 0) for i in range(n_stages)]
+
+
+def build_encoder_stages(vocab, dim, heads, ctx_len, depth, n_stages):
+    """Frozen encoder split into n_stages: embed+blocks, [blocks...], blocks+pool."""
+    counts = _block_counts(depth, n_stages)
+    stages = []
+    for i, cnt in enumerate(counts):
+        if i == 0:
+            stages.append(FrozenEncoderEmbed(vocab, dim, heads, cnt, ctx_len))
+        elif i == n_stages - 1:
+            stages.append(FrozenEncoderHead(dim, heads, cnt))
+        else:
+            stages.append(build_even_blocks(dim, heads, cnt))
+    return stages
+
+
+def build_train_stages(dim, heads, patch, depth, num_classes, n_stages, n_microbatches):
+    """Trained model split into n_stages: embed+ctx+blocks, [blocks...], blocks+norm+head."""
+    counts = _block_counts(depth, n_stages)
+    stages = []
+    for i, cnt in enumerate(counts):
+        if i == 0:
+            stages.append(TrainEmbed(dim, heads, patch, cnt))
+        elif i == n_stages - 1:
+            stages.append(TrainHead(dim, heads, cnt, num_classes))
+        else:
+            stages.append(build_even_blocks(dim, heads, cnt))
+    return stages
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=60)
@@ -172,7 +211,8 @@ def main() -> int:
     ap.add_argument("--ctx-len", type=int, default=8, help="frozen-encoder pseudo-caption length")
     ap.add_argument("--schedule", default="staggered_1b1f",
                     choices=["gpipe", "staggered_1b1f", "1f1b"])
-    ap.add_argument("--devices", nargs=2, default=["cuda:1", "cuda:3"])
+    ap.add_argument("--devices", nargs="+", default=["cuda:1", "cuda:3"],
+                    help="one device per pipeline stage (any number)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--parallel-opt", action="store_true",
                     help="use PipelineOptimizer (per-stage parallel) instead of "
@@ -182,8 +222,11 @@ def main() -> int:
     ap.add_argument("--profile-steps", type=int, default=2)
     args = ap.parse_args()
 
-    if torch.cuda.device_count() < 2:
-        raise SystemExit("need 2 GPUs")
+    n_stages = len(args.devices)
+    if n_stages < 1:
+        raise SystemExit("need at least one device")
+    if n_stages > 1 and torch.cuda.device_count() < n_stages:
+        raise SystemExit(f"need {n_stages} GPUs, have {torch.cuda.device_count()}")
     torch.manual_seed(args.seed)
 
     tf = transforms.Compose(
@@ -195,16 +238,15 @@ def main() -> int:
     )
 
     # ── Frozen encoder pipeline (random init, inference only) ─────────────────
-    # Two stages: embed+blocks on device0, blocks+pool on device1.
-    enc0 = FrozenEncoderEmbed(vocab=10, dim=args.dim, heads=args.heads,
-                              n_blocks=args.depth // 2, ctx_len=args.ctx_len)
-    enc1 = FrozenEncoderHead(dim=args.dim, heads=args.heads,
-                             n_blocks=args.depth - args.depth // 2)
-    for p in itertools.chain(enc0.parameters(), enc1.parameters()):
+    enc_stages = build_encoder_stages(vocab=10, dim=args.dim, heads=args.heads,
+                                      ctx_len=args.ctx_len, depth=args.depth,
+                                      n_stages=n_stages)
+    for p in itertools.chain(*(st.parameters() for st in enc_stages)):
         p.requires_grad_(False)  # frozen
-    enc_pipe = Pipeline(stage_modules=[enc0, enc1], devices=args.devices)
-    n_frozen = sum(p.numel() for st in (enc0, enc1) for p in st.parameters())
-    print(f"frozen encoder: {n_frozen/1e6:.1f}M params (random init, INFERENCE only)")
+    enc_pipe = Pipeline(stage_modules=enc_stages, devices=args.devices)
+    n_frozen = sum(p.numel() for st in enc_stages for p in st.parameters())
+    print(f"frozen encoder: {n_frozen/1e6:.1f}M params (random init, INFERENCE only), "
+          f"{n_stages} stages")
 
     # ── Trained model factory (fresh init + optimizer per run, so the two modes
     #    start from IDENTICAL weights and the comparison is valid) ─────────────
@@ -212,20 +254,20 @@ def main() -> int:
 
     def build_trained():
         torch.manual_seed(args.seed)  # identical init every time
-        tr0 = TrainEmbed(dim=args.dim, heads=args.heads, patch=args.patch,
-                         n_blocks=args.depth // 2)
-        tr1 = TrainHead(dim=args.dim, heads=args.heads,
-                        n_blocks=args.depth - args.depth // 2, num_classes=10)
-        pipe = Pipeline(stage_modules=[tr0, tr1], devices=args.devices)
+        train_stages = build_train_stages(
+            dim=args.dim, heads=args.heads, patch=args.patch, depth=args.depth,
+            num_classes=10, n_stages=n_stages, n_microbatches=args.micro,
+        )
+        pipe = Pipeline(stage_modules=train_stages, devices=args.devices)
         if args.parallel_opt:
             opt = PipelineOptimizer(
                 pipe.stages, lambda p: torch.optim.Adam(p, lr=args.lr)
             )
         else:
             opt = torch.optim.Adam(
-                itertools.chain(*(st.parameters() for st in (tr0, tr1))), lr=args.lr
+                itertools.chain(*(st.parameters() for st in train_stages)), lr=args.lr
             )
-        return tr0, tr1, pipe, opt
+        return train_stages[0], train_stages[-1], pipe, opt
 
     n_train = sum(p.numel() for p in TrainEmbed(dim=args.dim, heads=args.heads,
                   patch=args.patch, n_blocks=1).parameters())
