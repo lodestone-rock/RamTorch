@@ -26,6 +26,7 @@ returns zeros of the correct shape (pure-logic CPU simulation).
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 from collections import defaultdict
@@ -147,6 +148,7 @@ class Stage:
         device: Union[torch.device, str] = "cpu",
         fake: Optional[_FakeCompute] = None,
         tracer: Optional["PerfettoTracer"] = None,
+        autocast_dtype: Optional[torch.dtype] = None,
     ):
         self.device = torch.device(device)
         self.module = module.to(self.device)
@@ -156,6 +158,12 @@ class Stage:
         self.is_last = stage_index == num_stages - 1
         self.fake = fake
         self.tracer = tracer
+        # Mixed precision: torch.autocast is THREAD-LOCAL, so a `with
+        # torch.autocast(...)` around Pipeline.step() in the caller thread has
+        # no effect on the per-stage worker threads. Instead each stage enters
+        # the context itself around its forward and loss computation (backward
+        # runs OUTSIDE autocast, per standard AMP practice).
+        self.autocast_dtype = autocast_dtype
         self.dev_idx = self.device.index if self.device.index is not None else 0
         self._track = f"stage {stage_index}"
         self.losses: Dict[int, torch.Tensor] = {}   # mb_index -> scalar loss (last stage)
@@ -168,6 +176,22 @@ class Stage:
 
         self._lock = threading.Lock()
         self._cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    # ------------------------------------------------------------------
+    def _autocast_ctx(self):
+        """Autocast context for this stage's forward/loss (nullcontext if off)."""
+        if self.autocast_dtype is None:
+            return contextlib.nullcontext()
+        return torch.autocast(self.device.type, dtype=self.autocast_dtype)
+
+    def compute_loss(self, out, loss_fn: Callable, target) -> torch.Tensor:
+        """Compute the loss under this stage's autocast context.
+
+        Centralized so every executor (relay worker, sequential debug, and the
+        last-stage backward fallback) applies mixed precision identically.
+        """
+        with self._autocast_ctx():
+            return loss_fn(out, target)
 
     # ------------------------------------------------------------------
     def _sleep(self, kind: str):
@@ -201,11 +225,26 @@ class Stage:
             out = self._fake_output(xs[0])
         else:
             self._sleep("fwd")
-            out = self.module(*xs) if is_tuple else self.module(xs[0])
+            with self._autocast_ctx():
+                out = self.module(*xs) if is_tuple else self.module(xs[0])
+
+        # ``out`` may be a single tensor or a tuple of tensors (multi-output
+        # stage). Normalize to a tuple and compute a per-arg ``needs_grad``
+        # mask: an output participates in backward only if it is floating-point
+        # AND not explicitly flagged no-grad via the module's ``out_no_grad``
+        # attribute (a tuple of output indices). Non-float outputs (e.g. bool
+        # attention masks) are auto forward-only.
+        outs = tuple(out) if isinstance(out, (tuple, list)) else (out,)
+        no_grad_idx = frozenset(getattr(self.module, "out_no_grad", ()) or ())
+        needs_grad = tuple(
+            (i not in no_grad_idx) and o.is_floating_point()
+            for i, o in enumerate(outs)
+        )
 
         with self._lock:
-            # Cache the (possibly multi-tensor) input for the backward pass.
-            self._cache[mb_index] = (xs if is_tuple else xs[0], out)
+            # Cache the (possibly multi-tensor) input, the output tuple, and the
+            # grad mask for the backward pass.
+            self._cache[mb_index] = (xs if is_tuple else xs[0], outs, needs_grad)
 
         if self.tracer:
             name = f"F mb{mb_index}"
@@ -241,7 +280,7 @@ class Stage:
         ``self.grad_acc``. Also stashes the scalar loss in ``self.losses[mb]``.
         """
         with self._lock:
-            inp, out = self._cache.pop(mb_index)
+            inp, outs, needs_grad = self._cache.pop(mb_index)
 
         t0 = self.tracer._ts() if self.tracer else 0.0
         ev0 = None
@@ -256,23 +295,64 @@ class Stage:
         # input-grads then come back as a matching tuple.
         inp_is_tuple = isinstance(inp, (tuple, list))
         inp_list = list(inp) if inp_is_tuple else [inp]
-        inputs = inp_list + self.params
         n_inp = len(inp_list)
+        # Only tensors that require grad may appear in the autograd inputs list.
+        # Non-float inputs (e.g. a bool mask) were prepped with
+        # requires_grad_(False); they must be excluded or autograd raises.
+        inp_req = [bool(t.requires_grad) for t in inp_list]
+        grad_inputs = [t for t in inp_list if t.requires_grad]
+        inputs = grad_inputs + self.params
 
         if self.is_last:
             if loss is None:
                 assert loss_fn is not None, "last stage needs loss_fn+target or loss"
-                loss = loss_fn(out, target)
+                # Reconstruct the module's original output form (single tensor
+                # or tuple) so the loss_fn sees what the module returned.
+                out = outs if len(outs) != 1 else outs[0]
+                loss = self.compute_loss(out, loss_fn, target)
             self.losses[mb_index] = loss.detach()
             grads = torch.autograd.grad(loss, inputs, allow_unused=True)
         else:
             assert grad_output is not None, "non-last stage needs grad_output"
-            grads = torch.autograd.grad(
-                out, inputs, grad_outputs=grad_output.to(self.device),
-                allow_unused=True,
+            # ``grad_output`` is a tuple aligned to this stage's outputs (None at
+            # no-grad / non-float slots). Only the grad-needing subset enters
+            # autograd; the rest are forward-only.
+            grad_list = (
+                list(grad_output)
+                if isinstance(grad_output, (tuple, list))
+                else [grad_output]
             )
+            gouts = [o for o, ng in zip(outs, needs_grad) if ng]
+            ggrads = [
+                g.to(self.device)
+                for g, ng in zip(grad_list, needs_grad)
+                if ng and g is not None
+            ]
+            assert len(gouts) == len(ggrads), (
+                f"stage {self.stage_index}: {len(gouts)} grad-needing outputs but "
+                f"received {len(ggrads)} grads (grad_output must be a tuple aligned "
+                f"to the module outputs, None at no-grad slots)"
+            )
+            if not gouts:
+                # No differentiable output flows downstream: nothing to backprop
+                # through this stage's outputs. Param grads are zero; input grads
+                # are None. Skip autograd entirely.
+                grads = tuple([None] * len(inputs))
+            else:
+                grads = torch.autograd.grad(
+                    gouts, inputs, grad_outputs=ggrads,
+                    allow_unused=True,
+                )
 
-        input_grads, param_grads = grads[:n_inp], grads[n_inp:]
+        # ``grads`` is aligned to ``inputs`` == grad_inputs + params. Split off
+        # the param grads, then scatter the input grads back to their original
+        # positional slots (None for inputs that never required grad).
+        n_grad_inp = len(grad_inputs)
+        grads_req, param_grads = grads[:n_grad_inp], grads[n_grad_inp:]
+        it = iter(grads_req)
+        input_grads = tuple(
+            next(it) if req else None for req in inp_req
+        )
         # Single-tensor input -> single grad; tuple input -> tuple of grads.
         input_grad = input_grads if inp_is_tuple else input_grads[0]
         with self._lock:

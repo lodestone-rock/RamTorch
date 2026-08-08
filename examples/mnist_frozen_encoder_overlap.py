@@ -113,6 +113,12 @@ class TrainEmbed(nn.Module):
     Takes TWO inputs as positional args — ``(ctx, x)`` — which the pipeline
     dices into microbatches automatically (flat-tuple input). ``ctx`` is the
     frozen encoder's context embedding (B, dim); ``x`` is the image (B,1,28,28).
+
+    Returns a TUPLE ``(tokens, pad_mask)`` where ``pad_mask`` is a BOOL tensor
+    marking which sequence positions are real tokens (vs padding). The mask is
+    forward-only: it is non-float, so the relay auto-excludes it from backward
+    (see "Tuple outputs & no-grad args" in docs/pipeline_parallel.md). This
+    demonstrates a mask crossing a stage boundary without any pack/unpack hack.
     """
 
     def __init__(self, dim: int, heads: int, patch: int, n_blocks: int):
@@ -136,11 +142,35 @@ class TrainEmbed(nn.Module):
         x = x + self.pos_embed
         for blk in self.blocks:
             x = blk(x)
-        return x
+        # All positions are valid here (cls + patches + ctx), but emit a real
+        # bool mask so the forward-only mask path is exercised end-to-end. A
+        # true padding mask would have some False entries.
+        pad_mask = torch.ones(B, x.size(1), dtype=torch.bool, device=x.device)
+        return x, pad_mask  # (tokens, bool mask) — mask is auto no-grad
+
+
+class MaskedBlocks(nn.Module):
+    """Middle-stage wrapper: run blocks on tokens, pass the bool mask through.
+
+    Middle stages receive ``(tokens, pad_mask)`` from the previous stage and
+    must return the same tuple so the mask keeps flowing to the head. The mask
+    is untouched (forward-only)."""
+
+    def __init__(self, dim: int, heads: int, n_blocks: int):
+        super().__init__()
+        self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(n_blocks)])
+
+    def forward(self, x, pad_mask):
+        for blk in self.blocks:
+            x = blk(x)
+        return x, pad_mask
 
 
 class TrainHead(nn.Module):
-    """Stage 1 of the trained model: remaining blocks + norm + classifier head."""
+    """Stage N of the trained model: remaining blocks + norm + classifier head.
+
+    Consumes ``(tokens, pad_mask)`` and uses the mask for masked mean pooling
+    over patch tokens (a realistic use of a forward-only mask)."""
 
     def __init__(self, dim: int, heads: int, n_blocks: int, num_classes: int):
         super().__init__()
@@ -148,15 +178,23 @@ class TrainHead(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, num_classes)
 
-    def forward(self, x):
+    def forward(self, x, pad_mask):
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-        return self.head(x[:, 0])
+        # Masked mean over the sequence (combine cls + masked-pooled patches).
+        w = pad_mask.unsqueeze(-1).to(x.dtype)         # (mb, seq, 1) float
+        pooled = (x * w).sum(dim=1) / w.sum(dim=1).clamp(min=1.0)
+        return self.head(pooled + x[:, 0])
 
 
 def build_even_blocks(dim, heads, n_blocks):
     return nn.Sequential(*[Block(dim, heads) for _ in range(n_blocks)])
+
+
+def build_train_middle(dim, heads, n_blocks):
+    """Mask-aware middle stage for the trained model (passes the bool mask on)."""
+    return MaskedBlocks(dim, heads, n_blocks)
 
 
 # ── Stage builders (scale to N GPUs) ──────────────────────────────────────────
@@ -185,7 +223,10 @@ def build_encoder_stages(vocab, dim, heads, ctx_len, depth, n_stages):
 
 
 def build_train_stages(dim, heads, patch, depth, num_classes, n_stages, n_microbatches):
-    """Trained model split into n_stages: embed+ctx+blocks, [blocks...], blocks+norm+head."""
+    """Trained model split into n_stages: embed+ctx+blocks, [blocks...], blocks+norm+head.
+
+    Every stage relays a ``(tokens, pad_mask)`` tuple; the bool mask is
+    forward-only (auto no-grad) and only consumed by the head's masked pooling."""
     counts = _block_counts(depth, n_stages)
     stages = []
     for i, cnt in enumerate(counts):
@@ -194,7 +235,7 @@ def build_train_stages(dim, heads, patch, depth, num_classes, n_stages, n_microb
         elif i == n_stages - 1:
             stages.append(TrainHead(dim, heads, cnt, num_classes))
         else:
-            stages.append(build_even_blocks(dim, heads, cnt))
+            stages.append(build_train_middle(dim, heads, cnt))
     return stages
 
 

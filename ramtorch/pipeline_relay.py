@@ -61,6 +61,32 @@ from .pipeline import (
 __all__ = ["run_pipeline_relay", "Pipeline"]
 
 
+def _normalize_autocast(autocast) -> Optional[torch.dtype]:
+    """Normalize the ``autocast`` option (None | dtype | 'bf16' | 'fp16')."""
+    if autocast is None:
+        return None
+    if isinstance(autocast, str):
+        aliases = {
+            "bf16": torch.bfloat16,
+            "bfloat16": torch.bfloat16,
+            "fp16": torch.float16,
+            "float16": torch.float16,
+        }
+        key = autocast.lower()
+        if key not in aliases:
+            raise ValueError(
+                f"unknown autocast dtype {autocast!r}; expected 'bf16', 'fp16', "
+                f"or a torch.dtype"
+            )
+        return aliases[key]
+    if isinstance(autocast, torch.dtype):
+        return autocast
+    raise ValueError(
+        f"autocast must be None, a torch.dtype, or 'bf16'/'fp16'; got "
+        f"{type(autocast).__name__}"
+    )
+
+
 # ── Mailbox ───────────────────────────────────────────────────────────────────
 
 class _Mailbox:
@@ -79,18 +105,27 @@ class _Mailbox:
     on that event before using the tensor. On CPU this is a no-op.
     """
 
-    __slots__ = ("_ready", "_value", "_cuda_event")
+    __slots__ = ("_ready", "_value", "_cuda_events")
 
     def __init__(self):
         self._ready = threading.Event()
-        self._value: Optional[torch.Tensor] = None
-        self._cuda_event: Optional[torch.cuda.Event] = None
+        self._value = None
+        self._cuda_events: List[torch.cuda.Event] = []
 
-    def put(self, value: Optional[torch.Tensor]):
-        if value is not None and value.is_cuda:
-            ev = torch.cuda.Event()
-            ev.record()  # on the producer's current stream
-            self._cuda_event = ev
+    def put(self, value):
+        # ``value`` may be a single tensor, a tuple/list of tensors (multi-arg
+        # stage output / grad), or None. Record one CUDA event per CUDA tensor
+        # so the consumer's stream waits for every element to finish writing.
+        tensors = (
+            [t for t in value if isinstance(t, torch.Tensor)]
+            if isinstance(value, (tuple, list))
+            else [value]
+        )
+        for t in tensors:
+            if t is not None and t.is_cuda:
+                ev = torch.cuda.Event()
+                ev.record()  # on the producer's current stream
+                self._cuda_events.append(ev)
         self._value = value
         self._ready.set()
 
@@ -99,11 +134,11 @@ class _Mailbox:
         self._value = None
         self._ready.set()
 
-    def get(self) -> Optional[torch.Tensor]:
+    def get(self):
         self._ready.wait()
-        if self._cuda_event is not None:
+        for ev in self._cuda_events:
             # Order the consumer's current stream after the producer's work.
-            torch.cuda.current_stream().wait_event(self._cuda_event)
+            torch.cuda.current_stream().wait_event(ev)
         return self._value
 
 
@@ -200,8 +235,11 @@ class _RelayWorker(threading.Thread):
         loss_fn = self.loss_fn
         target = self.targets[mb] if self.targets is not None else None
         with self.stage._lock:
-            inp, out = self.stage._cache[mb]
-        loss = loss_fn(out, target)
+            inp, outs, _needs_grad = self.stage._cache[mb]
+        # Reconstruct the module's original output form (single tensor or tuple)
+        # so the loss_fn sees exactly what the module returned.
+        out = outs if len(outs) != 1 else outs[0]
+        loss = self.stage.compute_loss(out, loss_fn, target)
         # Stash for the subsequent B op and for harvesting.
         self.stage.losses[mb] = loss.detach()
         self._pending_loss[mb] = loss
@@ -372,8 +410,9 @@ def _run_sequential(
                 elif kind == "W":
                     tgt = targets[mb] if targets is not None else None
                     with stages[s]._lock:
-                        _, out = stages[s]._cache[mb]
-                    loss = loss_fn(out, tgt)
+                        _, outs, _ng = stages[s]._cache[mb]
+                    out = outs if len(outs) != 1 else outs[0]
+                    loss = stages[s].compute_loss(out, loss_fn, tgt)
                     stages[s].losses[mb] = loss.detach()
                     losses[mb] = loss
                 else:  # B
@@ -431,10 +470,11 @@ class _InferWorker(threading.Thread):
                 t0 = self.tracer._ts() if self.tracer else 0.0
                 # ``x`` may be a single tensor or a tuple of tensors (multi-input
                 # stage). Move each to the device and unpack into the module call.
-                if isinstance(x, (tuple, list)):
-                    out = self.stage.module(*[t.to(dev) for t in x])
-                else:
-                    out = self.stage.module(x.to(dev))
+                with self.stage._autocast_ctx():
+                    if isinstance(x, (tuple, list)):
+                        out = self.stage.module(*[t.to(dev) for t in x])
+                    else:
+                        out = self.stage.module(x.to(dev))
                 if self.tracer:
                     self.tracer.record_cpu(
                         f"F mb{mb}", "fwd", f"stage {s}", t0, self.tracer._ts()
@@ -568,13 +608,27 @@ def _run_inference(
     if was_prediced:
         # Mirror the pre-diced input: return per-microbatch outputs as a nested
         # tuple (independent tensors), so downstream can start on mb0 eagerly.
+        # A stage returning a tuple output yields a per-microbatch tuple here.
         return tuple(last_outputs[i] for i in range(m))
-    # Tensor / flat-tuple input -> single concatenated tensor (dim 0). Slice off
-    # any padding rows added to make the batch divisible by n_microbatches.
-    out = torch.cat([last_outputs[i] for i in range(m)], dim=0)
-    if pad_rows > 0:
-        out = out[: out.shape[0] - pad_rows]
-    return out
+
+    def _concat_arg(vals):
+        # Concatenate one output position across microbatches (dim 0), then
+        # slice off any padding rows added for divisibility.
+        out = torch.cat(vals, dim=0)
+        if pad_rows > 0:
+            out = out[: out.shape[0] - pad_rows]
+        return out
+
+    first = last_outputs[0]
+    if isinstance(first, (tuple, list)):
+        # Multi-output stage: concatenate each output arg independently.
+        n_args = len(first)
+        return tuple(
+            _concat_arg([last_outputs[i][j] for i in range(m)])
+            for j in range(n_args)
+        )
+    # Single-tensor output: single concatenated tensor (dim 0).
+    return _concat_arg([last_outputs[i] for i in range(m)])
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -611,6 +665,14 @@ class Pipeline:
     devices        : one device per stage (default: cuda:i round-robin / CPU)
     fake_compute   : None | "replace" | {"fwd": s|[s...], "bwd": s|[s...]}
     overlap        : per-stage worker threads (True) or sequential debug (False)
+    autocast       : mixed precision: None (off, default), a ``torch.dtype``,
+                     or the strings ``"bf16"`` / ``"fp16"``. Each stage worker
+                     enters ``torch.autocast(device_type, dtype)`` around its
+                     forward and loss computation (autocast is thread-local, so
+                     wrapping ``step()`` in the caller does nothing). Backward
+                     runs outside autocast; params/grads stay fp32. fp16 is
+                     INFERENCE-ONLY: ``step()`` raises because fp16 training
+                     needs loss scaling (unsupported) — use bf16.
 
     After construction, ``self.stages`` holds the Stage objects (which own the
     gradient accumulators). With the traced path, the original model's parameters
@@ -630,9 +692,11 @@ class Pipeline:
         devices: Optional[Sequence[Union[str, torch.device]]] = None,
         fake_compute=None,
         overlap: bool = True,
+        autocast=None,
     ):
         self.model = model
         self.overlap = overlap
+        self.autocast_dtype = _normalize_autocast(autocast)
         # Tuple / nested-tuple inputs are only supported on the manual
         # (stage_modules) path; the traced torch.export path does not support them.
         self._manual = stage_modules is not None
@@ -651,7 +715,8 @@ class Pipeline:
             )
             self.stages = [
                 Stage(mod, i, self.num_stages, device=self.devices[i],
-                      fake=fake, tracer=None)
+                      fake=fake, tracer=None,
+                      autocast_dtype=self.autocast_dtype)
                 for i, mod in enumerate(stage_modules)
             ]
             return
@@ -678,7 +743,7 @@ class Pipeline:
 
         self.stages = [
             Stage(pipe.get_stage_module(i), i, self.num_stages, device=self.devices[i],
-                  fake=fake, tracer=None)
+                  fake=fake, tracer=None, autocast_dtype=self.autocast_dtype)
             for i in range(self.num_stages)
         ]
 
@@ -720,6 +785,13 @@ class Pipeline:
         args into the stage-0 module), or a nested pre-diced tuple of microbatches.
         Tuple forms require the manual ``stage_modules`` path.
         """
+        if self.autocast_dtype == torch.float16:
+            raise ValueError(
+                "fp16 autocast training is not supported: fp16 gradients "
+                "underflow without loss scaling (GradScaler), which the "
+                "pipeline does not integrate. Use autocast=torch.bfloat16 for "
+                "training; fp16 remains available for infer()."
+            )
         if isinstance(data, (tuple, list)) and not self._manual:
             raise ValueError(
                 "tuple / nested-tuple pipeline inputs are only supported on the "
@@ -1022,7 +1094,13 @@ def _run_and_capture(stages, m, overlap, rank_ops, mbs, tgts, loss_fn):
 
     def _capturing_forward(mb_index, x):
         out = orig_forward(mb_index, x)
-        captured[mb_index] = out.detach()
+        # The last stage may return a tuple of tensors (multi-output stage);
+        # detach each element so the captured snapshot carries no graph.
+        captured[mb_index] = (
+            tuple(t.detach() for t in out)
+            if isinstance(out, (tuple, list))
+            else out.detach()
+        )
         return out
 
     last.forward_one_chunk = _capturing_forward

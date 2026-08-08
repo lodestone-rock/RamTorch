@@ -160,6 +160,104 @@ inference into a training pipeline (see the frozen-encoder example).
 
 ---
 
+## Tuple outputs & no-grad args (masks, aux outputs)
+
+A stage can return a **tuple of tensors**, and you can mark some of them as
+**forward-only** so they are relayed to the next stage but excluded from the
+backward pass. This is the right tool for auxiliary outputs that carry no
+gradient — padding/attention masks, routing decisions, detached feature taps —
+and it removes the need to pack/unpack non-differentiable values into a single
+tensor.
+
+```python
+class Stage0(nn.Module):
+    # Output arg index 1 is forward-only (no backward through it).
+    out_no_grad = (1,)
+
+    def forward(self, x):
+        feat = self.blocks(x)          # differentiable
+        mask = feat.abs().mean(-1) > 0  # bool padding mask
+        return feat, mask              # (tensor, bool)
+
+class Stage1(nn.Module):
+    def forward(self, feat, mask):     # receives both as positional args
+        feat = feat * mask.unsqueeze(-1).to(feat.dtype)  # masked
+        return self.head(feat)
+```
+
+**How grad eligibility is decided** for each output arg `i`:
+
+```
+needs_grad[i] = (i not in module.out_no_grad) and output[i].is_floating_point()
+```
+
+- **Non-float outputs (bool/int/long) are always forward-only**, even without
+  `out_no_grad`. A bool mask is auto-skipped, so returning one no longer crashes
+  the backward (previously `torch.autograd.grad` would reject a bool grad
+  target). This alone fixes the common "pack the mask into a float tensor"
+  workaround.
+- **`out_no_grad`** (a tuple of output indices on the module) additionally marks
+  *floating-point* outputs as forward-only — e.g. a frozen auxiliary head or a
+  detached feature tap you don't want grads flowing through.
+
+**What happens under the hood:** the *whole* tuple is relayed forward to the
+next stage (one CUDA event per tensor). At the boundary, only the grad-needing
+args receive a backward gradient; no-grad args get `None`. The downstream stage
+receives every arg as a positional input (see the flat-tuple input form), and
+non-requiring inputs are simply excluded from its autograd graph. Everything is
+handled inside the relay — no changes to `Pipeline` calls.
+
+Works identically in `step` (training) and `infer` (forward-only). In `infer`,
+a tuple-output last stage returns a tuple of per-arg concatenated tensors.
+Verified in `examples/tuple_no_grad_check.py` (loss + grad parity vs a
+sequential masked baseline, all schedules) and exercised in
+`examples/mnist_frozen_encoder_overlap.py` (a bool padding mask crossing a stage
+boundary).
+
+---
+
+## Mixed precision (autocast)
+
+**A plain `with torch.autocast(...)` around `pipe.step(...)` does nothing.**
+`torch.autocast` state is *thread-local*, and each stage's forward runs in its
+own worker thread — the context you enter in the caller thread never reaches
+them. (Worse, `overlap=False` runs in the caller thread, so it *would* apply
+there — a silent numerics divergence between the two modes.)
+
+Mixed precision is therefore a pipeline option:
+
+```python
+pipe = Pipeline(stage_modules=[s0, s1], devices=devices,
+                autocast=torch.bfloat16)          # or "bf16"
+pipe = PipelineModel(model, example_input, devices=devices, autocast="bf16")
+```
+
+`autocast` accepts `None` (off, default), a `torch.dtype`, or `"bf16"` /
+`"fp16"`. Each stage then enters `torch.autocast(device_type, dtype)` itself,
+around exactly the right ops:
+
+- **Forward and loss computation** run under autocast (standard AMP practice).
+- **Backward (`torch.autograd.grad`) runs outside** — autograd replays with the
+  dtypes recorded during the forward, as PyTorch recommends.
+- **Parameters stay fp32 masters**; autocast casts weights per-op, so gradients
+  come back fp32 and the accumulators / `flush_grads()` / your optimizer are
+  unchanged. Boundary activations relayed between stages are simply bf16
+  tensors (the tuple/no-grad machinery handles them like any float tensor).
+
+Applies identically to `step()`, `infer()`, and `PipelineModel.forward()`.
+
+**fp16 is inference-only.** fp16 training requires gradient (loss) scaling,
+which the pipeline does not integrate — `step()` raises a `ValueError` when
+`autocast` is fp16. Use **bf16** for training (no scaler needed, and the
+recommended dtype on Ampere+ GPUs); fp16 remains available for `infer()`.
+
+Verified in `examples/amp_check.py`: bf16 pipeline training is **bit-identical
+(0.0)** to sequential microbatch grad-accum under the same autocast — losses,
+gradients, and final weights after multi-step SGD — for all schedules, and the
+fp32 (`autocast=None`) path is unchanged.
+
+---
+
 ## Schedules
 
 | Schedule | Bubble | Peak in-flight activations | Notes |
@@ -222,7 +320,9 @@ sequential grad-accum final weights to **0.0** (bit-exact).
 |---|---|
 | `mnist_pipeline_example.py` | `PipelineModel` quickstart (auto-split MLP) |
 | `mnist_pipeline_big_transformer_manual.py` | Manual pre-partitioned transformer (the robust path) |
-| `mnist_frozen_encoder_overlap.py` | Frozen "text encoder" inference feeding a trained model (tuple + pre-diced inputs) |
+| `mnist_frozen_encoder_overlap.py` | Frozen "text encoder" inference feeding a trained model (tuple + pre-diced inputs + a bool padding mask crossing a stage boundary) |
+| `tuple_no_grad_check.py` | Tuple outputs + per-arg no-grad flags — parity vs sequential masked baseline |
+| `amp_check.py` | Mixed precision (`autocast=`) — bf16 bit-identity vs sequential accum, fp16 guard |
 | `mnist_pipeline_vs_single.py` | Pipeline vs single-GPU loss/grad/weight parity |
 | `mnist_seq_vs_gradaccum.py` | Pipeline vs sequential grad-accum (liability check) |
 | `pipeline_easy_demo.py` | `PipelineModel` forward + train + eval |

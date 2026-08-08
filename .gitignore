@@ -13,3 +13,5 @@ __pycache__
 *.zip
 *.ipynb
 /scraped
+/agents_notepad
+/explore_pipeline_split.py

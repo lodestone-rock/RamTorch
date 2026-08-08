@@ -178,6 +178,11 @@ class PipelineModel(nn.Module):
     fake_compute  : None | "replace" | {"fwd": s|[s...], "bwd": s|[s...]}.
     warn_on_padding : if True (default), emit a PipelinePaddingWarning when
                     forward() pads a partial microbatch. Set False to silence.
+    autocast      : mixed precision: None (off, default), a ``torch.dtype``, or
+                    ``"bf16"`` / ``"fp16"``. Entered per-stage around forward +
+                    loss (autocast is thread-local, so wrapping the call site
+                    does nothing). fp16 is inference-only — ``step()`` raises;
+                    use bf16 for training.
     """
 
     def __init__(
@@ -193,6 +198,7 @@ class PipelineModel(nn.Module):
         overlap: bool = True,
         fake_compute=None,
         warn_on_padding: bool = True,
+        autocast=None,
     ):
         super().__init__()
         self._model = model
@@ -226,6 +232,7 @@ class PipelineModel(nn.Module):
             devices=devices,
             fake_compute=fake_compute,
             overlap=overlap,
+            autocast=autocast,
         )
         self.devices = self._pipe.devices
         self.num_stages = self._pipe.num_stages
@@ -306,7 +313,10 @@ class PipelineModel(nn.Module):
         """Single example-sized batch through the stage relay."""
         for st in self._pipe.stages:
             x = x.to(st.device)
-            x = st.module(x)
+            # Runs in the caller thread, so the stage's autocast context must
+            # be entered here too (matching infer()'s worker-thread numerics).
+            with st._autocast_ctx():
+                x = st.module(x)
         return x
 
     # ── Training ──────────────────────────────────────────────────────────────
