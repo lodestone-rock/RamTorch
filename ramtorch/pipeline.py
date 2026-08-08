@@ -303,7 +303,10 @@ class Stage:
         grad_inputs = [t for t in inp_list if t.requires_grad]
         inputs = grad_inputs + self.params
 
-        if self.is_last:
+        if grad_output is None and self.is_last:
+            # Standard training path: the last stage computes a scalar loss and
+            # backprops it. (A non-last stage always gets grad_output, so it never
+            # lands here.)
             if loss is None:
                 assert loss_fn is not None, "last stage needs loss_fn+target or loss"
                 # Reconstruct the module's original output form (single tensor
@@ -313,6 +316,11 @@ class Stage:
             self.losses[mb_index] = loss.detach()
             grads = torch.autograd.grad(loss, inputs, allow_unused=True)
         else:
+            # grad_output path: backprop a supplied dL/dOutput directly through
+            # the cached outputs. Used by non-last stages (grad from the stage
+            # above) AND by the last stage under the grad-bypass escape hatch
+            # (user-supplied grad instead of loss_fn). No scalar loss exists in
+            # the bypass case, so losses[mb] is left unset and .loss raises.
             assert grad_output is not None, "non-last stage needs grad_output"
             # ``grad_output`` is a tuple aligned to this stage's outputs (None at
             # no-grad / non-float slots). Only the grad-needing subset enters
@@ -809,11 +817,23 @@ class PipelineResult:
 
     @property
     def loss(self) -> torch.Tensor:
+        if not self.losses:
+            raise RuntimeError(
+                "no scalar loss available: this step ran with grad_outputs "
+                "(loss bypass), which backprops a user-supplied gradient "
+                "instead of computing loss_fn. There is no loss to report."
+            )
         return torch.stack([l.detach() for l in self.losses]).mean()
 
     def flush_grads(self, scale: Optional[float] = None):
-        """Write accumulated grads into ``.grad`` (default: scaled by 1/n_microbatches)."""
-        s = scale if scale is not None else 1.0 / len(self.losses)
+        """Write accumulated grads into ``.grad`` (default: scaled by 1/n_microbatches).
+
+        The microbatch count is inferred from ``outputs`` (one per microbatch),
+        so this still scales correctly under the grad_outputs bypass where no
+        losses are recorded.
+        """
+        n = len(self.losses) if self.losses else len(self.outputs)
+        s = scale if scale is not None else 1.0 / n
         for st in self.stages:
             st.flush_grads(scale=s)
 

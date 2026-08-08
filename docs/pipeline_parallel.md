@@ -258,6 +258,45 @@ fp32 (`autocast=None`) path is unchanged.
 
 ---
 
+## Bypassing `loss_fn`: backprop a gradient directly (`grad_outputs=`)
+
+Normally the last stage computes a scalar loss via `loss_fn(output, target)` and
+backprops it. The `grad_outputs` escape hatch lets you **skip the loss entirely**
+and feed a precomputed `dL/dOutput` straight into the last stage's backward.
+This is useful when the gradient comes from somewhere the pipeline can't see —
+a downstream model, a custom differentiator, RL advantages, or a loss the last
+stage doesn't own.
+
+```python
+# Callable form: resolved per-microbatch on the last-stage worker (mirrors
+# loss_fn). Receives the live output so the grad can depend on it.
+res = pipe.step(x, targets=y, n_microbatches=4,
+                grad_outputs=lambda out, tgt: 2.0 * (out - tgt))
+
+# Tensor form: a full-batch gradient, chunked along dim 0 exactly like
+# `targets`. Use this when you already have dL/dOut computed elsewhere.
+res = pipe.step(x, targets=y, n_microbatches=4, grad_outputs=full_batch_grad)
+
+res.flush_grads(); opt.step(); opt.zero_grad()
+```
+
+- **Mutually exclusive with `loss_fn`** — passing both raises `ValueError`.
+- **No loss is reported**: bypassing means no scalar loss is ever computed, so
+  `result.loss` raises a clear `RuntimeError` and `result.losses` is empty.
+  `flush_grads()` still mean-scales correctly (it infers the microbatch count
+  from the outputs, not the losses).
+- For a **tuple-output last stage**, pass a tuple of grads aligned to the module
+  outputs (`None` at no-grad slots), matching the `out_no_grad` mask — only the
+  grad-needing outputs enter autograd.
+- Works with every schedule and `overlap` on/off.
+
+Verified in `examples/grad_bypass_check.py`: pipeline bypass training is
+**bit-identical (0.0)** to a sequential manual `out.backward(grad)` baseline —
+final weights after multi-step SGD — for both the callable and tensor forms,
+across all schedules and overlap modes.
+
+---
+
 ## Schedules
 
 | Schedule | Bubble | Peak in-flight activations | Notes |
@@ -323,6 +362,7 @@ sequential grad-accum final weights to **0.0** (bit-exact).
 | `mnist_frozen_encoder_overlap.py` | Frozen "text encoder" inference feeding a trained model (tuple + pre-diced inputs + a bool padding mask crossing a stage boundary) |
 | `tuple_no_grad_check.py` | Tuple outputs + per-arg no-grad flags — parity vs sequential masked baseline |
 | `amp_check.py` | Mixed precision (`autocast=`) — bf16 bit-identity vs sequential accum, fp16 guard |
+| `grad_bypass_check.py` | Grad-bypass (`grad_outputs=`) — backprop a supplied dL/dOutput; bit-identity vs sequential manual backward |
 | `mnist_pipeline_vs_single.py` | Pipeline vs single-GPU loss/grad/weight parity |
 | `mnist_seq_vs_gradaccum.py` | Pipeline vs sequential grad-accum (liability check) |
 | `pipeline_easy_demo.py` | `PipelineModel` forward + train + eval |

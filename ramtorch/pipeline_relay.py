@@ -170,6 +170,7 @@ class _RelayWorker(threading.Thread):
         bwd_out: List[List[_Mailbox]],  # bwd_out[s][mb]: grad OUT of stage s for mb
         abort: threading.Event,          # set by any failing worker to stop the rest
         on_error,                        # callback(worker) invoked on failure
+        grad_outputs: Optional[List] = None,  # per-mb bypass grad (tensor/tuple/callable)
     ):
         super().__init__(daemon=True, name=f"relay-stage-{stage.stage_index}")
         self.stage = stage
@@ -185,6 +186,12 @@ class _RelayWorker(threading.Thread):
         self._on_error = on_error
         self.error: Optional[BaseException] = None
         self._pending_loss: Dict[int, torch.Tensor] = {}  # mb -> loss (last stage)
+        # Grad-bypass escape hatch: per-microbatch dL/dOutput for the last
+        # stage, supplied directly instead of a scalar loss. Each entry is a
+        # tensor/tuple (pre-sharded) or a callable (out, target)->grad resolved
+        # at the W op once the forward output is cached.
+        self.grad_outputs = grad_outputs
+        self._pending_grad: Dict[int, object] = {}  # mb -> resolved grad (last stage)
 
     def _check_abort(self):
         if self.abort.is_set():
@@ -228,17 +235,26 @@ class _RelayWorker(threading.Thread):
             self.fwd_out[s][mb].put(out)  # relay: hand activation to (s+1, mb)
 
     def _do_loss_wait(self, s: int, mb: int):
-        # Last stage computes the loss from its own cached forward. The forward
-        # for this mb already ran earlier in this stage's list (the list order
-        # guarantees it), so the cache is populated. We compute the loss here so
-        # the backward can run as a separate op later in the list.
-        loss_fn = self.loss_fn
+        # Last stage resolves its backward seed from its own cached forward. The
+        # forward for this mb already ran earlier in this stage's list (the list
+        # order guarantees it), so the cache is populated. We resolve here so the
+        # backward can run as a separate op later in the list.
         target = self.targets[mb] if self.targets is not None else None
         with self.stage._lock:
             inp, outs, _needs_grad = self.stage._cache[mb]
         # Reconstruct the module's original output form (single tensor or tuple)
-        # so the loss_fn sees exactly what the module returned.
+        # so loss_fn / a grad callable sees exactly what the module returned.
         out = outs if len(outs) != 1 else outs[0]
+        if self.grad_outputs is not None:
+            # Grad-bypass: no scalar loss. Resolve the per-mb gradient (a
+            # callable is invoked here, on the worker, with the live output;
+            # a pre-sharded tensor/tuple is used as-is) and stash it for B.
+            g = self.grad_outputs[mb]
+            if callable(g):
+                g = g(out, target)
+            self._pending_grad[mb] = g
+            return
+        loss_fn = self.loss_fn
         loss = self.stage.compute_loss(out, loss_fn, target)
         # Stash for the subsequent B op and for harvesting.
         self.stage.losses[mb] = loss.detach()
@@ -246,8 +262,13 @@ class _RelayWorker(threading.Thread):
 
     def _do_backward(self, s: int, mb: int):
         if self.stage.is_last:
-            loss = self._pending_loss.pop(mb)
-            grad_in = self.stage.backward_one_chunk(mb, loss=loss)
+            if self.grad_outputs is not None:
+                # Grad-bypass: backprop the user-supplied dL/dOutput directly.
+                g = self._pending_grad.pop(mb)
+                grad_in = self.stage.backward_one_chunk(mb, grad_output=g)
+            else:
+                loss = self._pending_loss.pop(mb)
+                grad_in = self.stage.backward_one_chunk(mb, loss=loss)
         else:
             grad_output = self.bwd_in[s][mb].get()  # relay: wait for grad (s+1, mb)
             self._check_abort()                   # released mailbox (abort)
@@ -273,6 +294,7 @@ class _RelayEngine:
         micro_batches: List[torch.Tensor],
         targets: Optional[List[torch.Tensor]],
         loss_fn: Callable,
+        grad_outputs: Optional[List] = None,
     ):
         self.stages = stages
         self.p = len(stages)
@@ -322,6 +344,7 @@ class _RelayEngine:
                 bwd_out=bwd_out,
                 abort=self.abort,
                 on_error=_on_error,
+                grad_outputs=grad_outputs,
             )
             for s in range(self.p)
         ]
@@ -362,6 +385,7 @@ def _run_sequential(
     micro_batches: List[torch.Tensor],
     targets: Optional[List[torch.Tensor]],
     loss_fn: Callable,
+    grad_outputs: Optional[List] = None,
 ):
     """
     Execute the same per-stage op lists without threads. Ops are interleaved in
@@ -374,6 +398,7 @@ def _run_sequential(
     fwd_done: Dict[Tuple[int, int], torch.Tensor] = {}
     bwd_done: Dict[Tuple[int, int], Optional[torch.Tensor]] = {}
     losses: Dict[int, torch.Tensor] = {}
+    bwd_seeds: Dict[int, object] = {}  # mb -> loss OR bypass grad (last stage)
 
     cursors = [0] * p
 
@@ -388,9 +413,9 @@ def _run_sequential(
                 return mb in stages[s]._cache
         # B: every backward records its input-grad into bwd_done[(s, mb)] so the
         # stage below (s-1) can consume it. The last stage's grad signal is its
-        # locally-computed loss (keyed by mb), not a cross-stage tensor.
+        # locally-resolved backward seed (loss OR bypass grad, keyed by mb).
         if s == p - 1:
-            return mb in losses
+            return mb in bwd_seeds
         return (s + 1, mb) in bwd_done
 
     remaining = sum(len(ops) for ops in rank_ops)
@@ -412,12 +437,24 @@ def _run_sequential(
                     with stages[s]._lock:
                         _, outs, _ng = stages[s]._cache[mb]
                     out = outs if len(outs) != 1 else outs[0]
-                    loss = stages[s].compute_loss(out, loss_fn, tgt)
-                    stages[s].losses[mb] = loss.detach()
-                    losses[mb] = loss
+                    if grad_outputs is not None:
+                        # Grad-bypass: resolve the per-mb gradient (callable is
+                        # invoked with the live output; tensor/tuple used as-is).
+                        g = grad_outputs[mb]
+                        bwd_seeds[mb] = g(out, tgt) if callable(g) else g
+                    else:
+                        loss = stages[s].compute_loss(out, loss_fn, tgt)
+                        stages[s].losses[mb] = loss.detach()
+                        losses[mb] = loss
+                        bwd_seeds[mb] = loss
                 else:  # B
                     if s == p - 1:
-                        g = stages[s].backward_one_chunk(mb, loss=losses[mb])
+                        if grad_outputs is not None:
+                            g = stages[s].backward_one_chunk(
+                                mb, grad_output=bwd_seeds[mb]
+                            )
+                        else:
+                            g = stages[s].backward_one_chunk(mb, loss=bwd_seeds[mb])
                     else:
                         g = stages[s].backward_one_chunk(
                             mb, grad_output=bwd_done[(s + 1, mb)]
@@ -773,6 +810,7 @@ class Pipeline:
         loss_fn: Optional[Callable] = None,
         trace_path: Optional[str] = None,
         profile_path: Optional[str] = None,
+        grad_outputs=None,
     ) -> PipelineResult:
         """
         Run one pipeline-parallel step on ``data`` (dim 0 split into microbatches).
@@ -784,6 +822,10 @@ class Pipeline:
         ``data`` may be a tensor, a flat tuple of tensors (unpacked as positional
         args into the stage-0 module), or a nested pre-diced tuple of microbatches.
         Tuple forms require the manual ``stage_modules`` path.
+
+        ``grad_outputs`` bypasses ``loss_fn``: backprop a user-supplied
+        ``dL/dOutput`` directly into the last stage (mutually exclusive with
+        ``loss_fn``; no loss is reported). See :func:`run_pipeline_relay`.
         """
         if self.autocast_dtype == torch.float16:
             raise ValueError(
@@ -808,6 +850,7 @@ class Pipeline:
             overlap=self.overlap,
             trace_path=trace_path,
             profile_path=profile_path,
+            grad_outputs=grad_outputs,
         )
 
     def flush_grads(self, scale: Optional[float] = None, n_microbatches: int = 1):
@@ -938,6 +981,7 @@ def _run_step(
     overlap: bool,
     trace_path: Optional[str],
     profile_path: Optional[str],
+    grad_outputs=None,
 ) -> PipelineResult:
     """Run one pipeline step on pre-built stages (no re-split). Shared by
     ``Pipeline.step`` and the one-shot ``run_pipeline_relay``.
@@ -946,22 +990,57 @@ def _run_step(
     args into the stage-0 module), or a nested pre-diced tuple of microbatches.
     See :func:`_shard_input`. Tuple forms require the manual ``stage_modules``
     path (not the traced ``PipelineModel`` path).
+
+    ``grad_outputs`` is an escape hatch that BYPASSES ``loss_fn``: the last
+    stage backprops a user-supplied ``dL/dOutput`` directly instead of
+    computing a scalar loss. Mutually exclusive with ``loss_fn``. Accepts a
+    callable ``(output, target) -> grad`` (resolved per-microbatch on the last
+    stage worker, mirroring ``loss_fn``) or a full-batch tensor / flat tuple of
+    tensors (chunked along dim 0 like ``targets``; a tuple is aligned to the
+    last-stage module outputs, ``None`` at no-grad slots). No loss is reported.
     """
     if schedule not in ("gpipe", "1f1b", "staggered_1b1f"):
         raise ValueError(
             f"supported schedules: 'gpipe', '1f1b', 'staggered_1b1f'; got {schedule!r}"
+        )
+    if grad_outputs is not None and loss_fn is not None:
+        raise ValueError(
+            "grad_outputs and loss_fn are mutually exclusive: pass grad_outputs "
+            "to bypass the loss and backprop a gradient directly, OR loss_fn to "
+            "compute a scalar loss — not both."
         )
     loss_fn = loss_fn or (lambda out, _: out.sum())
     num_stages = len(stages)
 
     # Microbatch sharding (handles tensor / flat tuple / nested pre-diced tuple).
     mbs, is_tuple_input = _shard_input(data, n_microbatches, stages[0].device)
+    last_dev = stages[-1].device
     tgts = (
-        [t.to(stages[-1].device) for t in targets.chunk(n_microbatches, dim=0)]
+        [t.to(last_dev) for t in targets.chunk(n_microbatches, dim=0)]
         if targets is not None
         else None
     )
     m = len(mbs)
+
+    # Shard the bypass gradient per-microbatch (tensor / flat-tuple form). A
+    # callable is replicated per microbatch and resolved lazily on the worker.
+    grads = None
+    if grad_outputs is not None:
+        if callable(grad_outputs):
+            grads = [grad_outputs] * m
+        elif isinstance(grad_outputs, torch.Tensor):
+            grads = [g.to(last_dev) for g in grad_outputs.chunk(m, dim=0)]
+        elif isinstance(grad_outputs, (tuple, list)):
+            per_elem = [e.chunk(m, dim=0) for e in grad_outputs]
+            grads = [
+                tuple(per_elem[k][mb].to(last_dev) for k in range(len(grad_outputs)))
+                for mb in range(m)
+            ]
+        else:
+            raise TypeError(
+                f"grad_outputs must be a callable, a tensor, or a flat tuple of "
+                f"tensors; got {type(grad_outputs).__name__}"
+            )
 
     tracer = PerfettoTracer() if trace_path else None
     # Attach the tracer to stages for this step (stages are built with tracer=None
@@ -987,7 +1066,8 @@ def _run_step(
             with_stack=False,
         ) as _prof:
             outputs, losses = _run_and_capture(stages, m, overlap, rank_ops,
-                                               mbs, tgts, loss_fn)
+                                               mbs, tgts, loss_fn,
+                                               grad_outputs=grads)
             # Drain all device work BEFORE the profiler stops so the full kernel
             # timeline is captured.
             for d in {st.device for st in stages if st.device.type == "cuda"}:
@@ -995,7 +1075,8 @@ def _run_step(
         _prof.export_chrome_trace(profile_path)
     else:
         outputs, losses = _run_and_capture(stages, m, overlap, rank_ops,
-                                           mbs, tgts, loss_fn)
+                                           mbs, tgts, loss_fn,
+                                           grad_outputs=grads)
 
     # Make sure all device work is done before reporting/exporting timings.
     for d in {st.device for st in stages if st.device.type == "cuda"}:
@@ -1024,6 +1105,7 @@ def run_pipeline_relay(
     overlap: bool = True,
     trace_path: Optional[str] = None,
     profile_path: Optional[str] = None,
+    grad_outputs=None,
 ) -> PipelineResult:
     """
     Split ``model`` and run one pipeline-parallel step using the relay executor.
@@ -1047,6 +1129,15 @@ def run_pipeline_relay(
     overlap        : per-stage worker threads (True) or sequential debug (False)
     trace_path     : if set, write a Chrome-trace JSON of op-level spans
     profile_path   : if set, capture a torch.profiler (kineto) trace of the step
+    grad_outputs   : escape hatch that BYPASSES ``loss_fn``: the last stage
+                     backprops a user-supplied ``dL/dOutput`` directly instead of
+                     computing a scalar loss. Mutually exclusive with ``loss_fn``.
+                     Accepts a callable ``(output, target) -> grad`` (resolved
+                     per-microbatch on the last-stage worker) or a full-batch
+                     tensor / flat tuple of tensors (chunked along dim 0 like
+                     ``targets``; a tuple is aligned to the last-stage module
+                     outputs, ``None`` at no-grad slots). No loss is reported
+                     (``result.loss`` raises).
 
     Returns
     -------
@@ -1076,10 +1167,12 @@ def run_pipeline_relay(
         loss_fn=loss_fn,
         trace_path=trace_path,
         profile_path=profile_path,
+        grad_outputs=grad_outputs,
     )
 
 
-def _run_and_capture(stages, m, overlap, rank_ops, mbs, tgts, loss_fn):
+def _run_and_capture(stages, m, overlap, rank_ops, mbs, tgts, loss_fn,
+                     grad_outputs=None):
     """
     Run the step and capture last-stage forward outputs.
 
@@ -1106,13 +1199,18 @@ def _run_and_capture(stages, m, overlap, rank_ops, mbs, tgts, loss_fn):
     last.forward_one_chunk = _capturing_forward
     try:
         if overlap:
-            engine = _RelayEngine(stages, rank_ops, mbs, tgts, loss_fn)
+            engine = _RelayEngine(stages, rank_ops, mbs, tgts, loss_fn,
+                                  grad_outputs=grad_outputs)
             engine.run()
         else:
-            _run_sequential(stages, rank_ops, mbs, tgts, loss_fn)
+            _run_sequential(stages, rank_ops, mbs, tgts, loss_fn,
+                            grad_outputs=grad_outputs)
     finally:
         last.forward_one_chunk = orig_forward
 
     outputs = [captured[i] for i in range(m)]
-    losses = [last.losses[i] for i in range(m)]
+    # Under the grad-bypass escape hatch (grad_outputs), no scalar loss is ever
+    # computed, so last.losses is empty; report an empty losses list (the
+    # PipelineResult.loss property raises a clear error in that case).
+    losses = [last.losses[i] for i in range(m)] if last.losses else []
     return outputs, losses

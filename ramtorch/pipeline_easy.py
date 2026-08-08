@@ -330,6 +330,7 @@ class PipelineModel(nn.Module):
         loss_fn: Optional[Callable] = None,
         trace_path: Optional[str] = None,
         profile_path: Optional[str] = None,
+        grad_outputs=None,
     ) -> PipelineResult:
         """
         One pipeline forward+backward training step. Returns a PipelineResult;
@@ -339,6 +340,10 @@ class PipelineModel(nn.Module):
         schedule: "staggered_1b1f" (default, recommended) or "gpipe" (baseline).
         "1f1b" (textbook forward-first) is accepted but is educational-only —
         see the README for why execution order matters.
+
+        ``grad_outputs`` bypasses ``loss_fn``: backprop a user-supplied
+        ``dL/dOutput`` directly into the last stage (mutually exclusive with
+        ``loss_fn``; no loss is reported). See :func:`run_pipeline_relay`.
         """
         return self._pipe.step(
             data,
@@ -348,6 +353,7 @@ class PipelineModel(nn.Module):
             loss_fn=loss_fn,
             trace_path=trace_path,
             profile_path=profile_path,
+            grad_outputs=grad_outputs,
         )
 
     def flush_grads(self, scale: Optional[float] = None, n_microbatches: int = 1):
