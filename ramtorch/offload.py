@@ -67,7 +67,10 @@ Usage::
 
 Notes
 -----
-* Chunks exchange a single tensor (like ``PipelineModel._relay``).
+* Chunks exchange a single tensor by default; a chunk may also return a
+  TUPLE of tensors, whose elements become the next chunk's positional args
+  (like the pipeline's tuple outputs). Non-float / no-grad elements (masks,
+  position ids) pass through without gradients.
 * Buffer mutations inside chunks (e.g. BatchNorm running stats) happen on the
   streamed GPU copy and are NOT written back; use eval-mode/buffer-free norms.
 * The optimizer sees mixed devices: streamed params (and their grads) on CPU,
@@ -141,9 +144,12 @@ def offload_checkpoint(module: nn.Module, *args, **kwargs):
 
 
 class OffloadStepResult:
-    """Output + loss of one :meth:`OffloadModel.step`."""
+    """Output + loss of one :meth:`OffloadModel.step`.
 
-    def __init__(self, output: torch.Tensor, loss: torch.Tensor):
+    ``output`` mirrors the last chunk's return value (tensor or tuple).
+    """
+
+    def __init__(self, output, loss: torch.Tensor):
         self.output = output
         self.loss = loss
 
@@ -215,7 +221,9 @@ class OffloadModel(nn.Module):
     ----------
     chunks     : ordered chunk modules (same dicing convention as
                  ``Pipeline(stage_modules=...)``); chunk ``i+1`` consumes
-                 chunk ``i``'s output (single tensor).
+                 chunk ``i``'s output — a single tensor, or a tuple whose
+                 elements become the next chunk's positional args (non-float
+                 elements pass through without grads).
     device     : the compute device (default: first CUDA device, else CPU;
                  CPU is supported for tests — copies degrade to clones).
     window     : streaming slots on the GPU (>= 1; >= 2 to overlap load with
@@ -562,21 +570,49 @@ class OffloadModel(nn.Module):
             self._future.extend(itinerary)
             self._cv.notify_all()
 
-    def _call_chunk(self, layer: int, tensors: Dict[str, torch.Tensor], x):
-        return torch.func.functional_call(self.chunks[layer], tensors, (x,))
+    def _call_chunk(self, layer: int, tensors: Dict[str, torch.Tensor],
+                    args: tuple):
+        return torch.func.functional_call(self.chunks[layer], tensors, args)
+
+    # ── tuple intermediates ─────────────────────────────────────────────────
+    # A chunk may return a single tensor OR a tuple of tensors; a tuple's
+    # elements become the next chunk's positional args. Internally everything
+    # is normalized to tuples; the raw (un-normalized) output is preserved
+    # for the final result and the loss_fn.
+    def _to_device_args(self, x) -> tuple:
+        if isinstance(x, (tuple, list)):
+            return tuple(t.to(self.device) for t in x)
+        return (x.to(self.device),)
+
+    @staticmethod
+    def _as_tuple(out) -> tuple:
+        return out if isinstance(out, tuple) else (out,)
+
+    @staticmethod
+    def _detach_like(raw):
+        """Detach preserving the chunk's raw output structure."""
+        if isinstance(raw, tuple):
+            return tuple(t.detach() for t in raw)
+        return raw.detach()
 
     # ── inference ──────────────────────────────────────────────────────────
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Streamed forward pass (the simulator's inference "ring")."""
+    def forward(self, x) -> torch.Tensor:
+        """Streamed forward pass (the simulator's inference "ring").
+
+        ``x`` may be a single tensor or a tuple; a chunk returning a tuple
+        feeds its elements as positional args to the next chunk.
+        """
         self._announce(list(range(self.n)))
-        x = x.to(self.device)
+        hs = self._to_device_args(x)
+        raw = hs[0]
         for i in range(self.n):
             with record_function(f"F{i} infer"):
                 tensors = self._acquire(i)
-                x = self._call_chunk(i, tensors, x)
+                raw = self._call_chunk(i, tensors, hs)
+                hs = self._as_tuple(raw)
             self._release()
-        return x
+        return raw
 
     # ── training ───────────────────────────────────────────────────────────
     def step(
@@ -684,39 +720,55 @@ class OffloadModel(nn.Module):
             json.dump(trace, f)
 
     def _grads_for(self, i: int, tensors: Dict[str, torch.Tensor],
-                   out, inp, grad_out, loss_fn, target, is_last: bool):
+                   outs: tuple, inps: tuple, grad_outs, loss_fn, target,
+                   is_last: bool, raw_out):
         """autograd.grad for chunk ``i`` + the loss on the last chunk.
 
-        Returns ``(loss_or_none, input_grad_or_none, named_param_grads)``.
+        ``outs``/``inps`` are the normalized output/input tuples;
+        ``grad_outs`` is a tuple aligned with ``outs`` (``None`` entries =
+        no gradient flowed into that element); ``raw_out`` is the chunk's
+        raw (un-normalized) output for the ``loss_fn`` call.
+
+        Returns ``(loss_or_none, input_grads_tuple, named_param_grads)``
+        where the input-grads tuple is aligned with ``inps`` (``None`` for
+        elements that need no grad — non-float passthroughs etc.).
         """
         state = self._state[i]
         param_names = [nme for nme in tensors if nme in state.param_names]
         params = [tensors[nme] for nme in param_names]
-        need_input_grad = i > 0 and inp.is_floating_point()
+        need_in = [t.requires_grad for t in inps]
+        diff_inputs = [t for t, nd in zip(inps, need_in) if nd]
         loss = None
         with torch.enable_grad():
             if is_last:
-                loss = loss_fn(out, target)
+                loss = loss_fn(raw_out, target)
                 grads = torch.autograd.grad(
-                    loss,
-                    ([inp] if need_input_grad else []) + params,
-                    allow_unused=True,
+                    loss, diff_inputs + params, allow_unused=True,
                 )
             else:
+                # differentiate only the outputs a gradient actually flowed
+                # into (int passthroughs and dead branches contribute None)
+                douts, dgrads = [], []
+                for o, g in zip(outs, grad_outs):
+                    if g is not None and o.requires_grad:
+                        douts.append(o)
+                        dgrads.append(g)
+                if not douts:
+                    return None, tuple(None for _ in inps), {}
                 grads = torch.autograd.grad(
-                    out,
-                    ([inp] if need_input_grad else []) + params,
-                    grad_outputs=grad_out,
-                    allow_unused=True,
+                    douts, diff_inputs + params,
+                    grad_outputs=dgrads, allow_unused=True,
                 )
-        if need_input_grad:
-            input_grad, param_grads = grads[0], grads[1:]
-        else:
-            input_grad, param_grads = None, grads
+        in_grads = iter(grads[: len(diff_inputs)])
+        input_grads = tuple(
+            next(in_grads) if nd else None for nd in need_in
+        )
         named_grads = {
-            nme: g for nme, g in zip(param_names, param_grads) if g is not None
+            nme: g
+            for nme, g in zip(param_names, grads[len(diff_inputs):])
+            if g is not None
         }
-        return loss, input_grad, named_grads
+        return loss, input_grads, named_grads
 
     def _accumulate(self, state: _ChunkState,
                     named_grads: Dict[str, torch.Tensor]):
@@ -741,19 +793,21 @@ class OffloadModel(nn.Module):
     def _step_recompute(self, x, target, loss_fn) -> OffloadStepResult:
         """no_grad forward caching boundaries; backward recomputes per chunk."""
         n = self.n
-        boundary: List[Optional[torch.Tensor]] = []
-        h = x.to(self.device)
+        boundary: List[Optional[tuple]] = []
+        hs = self._to_device_args(x)
+        raw = hs[0]
         with torch.no_grad():
             for i in range(n):
-                boundary.append(h)
+                boundary.append(hs)
                 with record_function(f"F{i}"):
                     tensors = self._acquire(i)
-                    h = self._call_chunk(i, tensors, h)
+                    raw = self._call_chunk(i, tensors, hs)
+                    hs = self._as_tuple(raw)
                 self._release()
-        output = h
+        output = raw
 
         loss_out: Optional[torch.Tensor] = None
-        grad_out: Optional[torch.Tensor] = None
+        grad_outs: Optional[tuple] = None
         for i in range(n - 1, -1, -1):
             with record_function(f"B{i} recompute+grad"):
                 tensors = self._acquire(i)
@@ -762,20 +816,22 @@ class OffloadModel(nn.Module):
                 for p in params:
                     p.requires_grad_(True)
 
-                inp = boundary[i].detach()
-                inp.requires_grad_(i > 0 and inp.is_floating_point())
+                inps = tuple(t.detach() for t in boundary[i])
+                for t in inps:
+                    t.requires_grad_(i > 0 and t.is_floating_point())
                 with torch.enable_grad():
-                    out = self._call_chunk(i, tensors, inp)
-                loss, grad_out, named_grads = self._grads_for(
-                    i, tensors, out, inp, grad_out, loss_fn, target,
-                    is_last=(i == n - 1),
+                    raw_out = self._call_chunk(i, tensors, inps)
+                outs = self._as_tuple(raw_out)
+                loss, grad_outs, named_grads = self._grads_for(
+                    i, tensors, outs, inps, grad_outs, loss_fn, target,
+                    is_last=(i == n - 1), raw_out=raw_out,
                 )
                 if loss is not None:
                     loss_out = loss.detach()
                 self._accumulate(state, named_grads)
                 for p in params:
                     p.requires_grad_(False)
-                boundary[i] = None  # free the boundary activation
+                boundary[i] = None  # free the boundary activations
             self._release()
         return OffloadStepResult(output, loss_out)
 
@@ -798,36 +854,40 @@ class OffloadModel(nn.Module):
         dropout masks — unlike ``_step_recompute``.
         """
         n = self.n
-        cache: List[Optional[tuple]] = [None] * n  # (inp_leaf, out, tensors)
-        h = x.to(self.device)
+        # per-chunk (input_leaves, outs, raw_out, tensors)
+        cache: List[Optional[tuple]] = [None] * n
+        hs = self._to_device_args(x)
+        raw_out = hs[0]
         for i in range(n):
             with record_function(f"F{i}"):
                 tensors = self._acquire(i)
-                inp = h.detach()
-                inp.requires_grad_(i > 0 and inp.is_floating_point())
+                inps = tuple(t.detach() for t in hs)
+                for t in inps:
+                    t.requires_grad_(i > 0 and t.is_floating_point())
                 with torch.enable_grad():
                     if use_checkpoint:
-                        out = torch.utils.checkpoint.checkpoint(
-                            lambda t, _i=i, _ts=tensors:
-                                self._call_chunk(_i, _ts, t),
-                            inp, use_reentrant=False,
+                        raw_out = torch.utils.checkpoint.checkpoint(
+                            lambda *a, _i=i, _ts=tensors:
+                                self._call_chunk(_i, _ts, a),
+                            *inps, use_reentrant=False,
                         )
                     else:
-                        out = self._call_chunk(i, tensors, inp)
-                cache[i] = (inp, out, tensors)
-                h = out.detach()
+                        raw_out = self._call_chunk(i, tensors, inps)
+                outs = self._as_tuple(raw_out)
+                cache[i] = (inps, outs, raw_out, tensors)
+                hs = tuple(t.detach() for t in outs)
             self._release()
-        output = h
+        output = self._detach_like(raw_out)
 
         loss_out: Optional[torch.Tensor] = None
-        grad_out: Optional[torch.Tensor] = None
+        grad_outs: Optional[tuple] = None
         for i in range(n - 1, -1, -1):
             with record_function(f"B{i} grad"):
                 self._acquire(i)  # refills evicted weights before backward
-                inp, out, tensors = cache[i]
-                loss, grad_out, named_grads = self._grads_for(
-                    i, tensors, out, inp, grad_out, loss_fn, target,
-                    is_last=(i == n - 1),
+                inps, outs, raw_out, tensors = cache[i]
+                loss, grad_outs, named_grads = self._grads_for(
+                    i, tensors, outs, inps, grad_outs, loss_fn, target,
+                    is_last=(i == n - 1), raw_out=raw_out,
                 )
                 if loss is not None:
                     loss_out = loss.detach()

@@ -118,7 +118,7 @@ Guide: **[docs/pipeline_parallel.md](docs/pipeline_parallel.md)** · Examples: `
 
 > **Full guide: [docs/offload.md](docs/offload.md)** — knobs, backward strategies, transfer- vs compute-bound regimes, the design simulator, and profiling.
 
-Weights live in CPU **pinned** memory. A **loader thread** prefetches upcoming chunks into a GPU window of `window` slots over a dedicated H2D stream, so the copy for chunk `i+1` overlaps the compute of chunk `i`. `pin` evenly-spaced chunks stay on the GPU permanently (never loaded, never evicted), easing PCIe traffic at the cost of their memory. Eviction is farthest-next-use (Belady — optimal, since the itinerary is known). Backward gradient writebacks return to pinned CPU accumulators over a D2H stream via a separate **writeback thread**.
+Weights live in CPU **pinned** memory. A **loader thread** prefetches upcoming chunks into a GPU window of `window` slots over a dedicated H2D stream, so the copy for chunk `i+1` overlaps the compute of chunk `i`. `pin` evenly-spaced chunks stay on the GPU permanently (never loaded, never evicted), easing PCIe traffic at the cost of their memory. Eviction is farthest-next-use (Belady — optimal, since the itinerary is known). Backward gradient writebacks return to pinned CPU accumulators over a D2H stream via a separate **writeback thread**. Chunks exchange a single tensor or a **tuple** (elements become the next chunk's positional args; non-float extras like masks pass through grad-free).
 
 ### The three knobs
 

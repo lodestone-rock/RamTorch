@@ -10,6 +10,8 @@ Checks (on CPU always, and on CUDA when available):
      window/pin configurations including W=1, W=n, all-pinned.
   3. Gradient accumulation: two step() calls + flush_grads(1/2) == mean grads.
   4. Load accounting: with window >= n, step 2 issues zero new loads.
+  5. Tuple intermediates: chunks exchanging (a, b, int-passthrough) tuples —
+     forward + loss + grad parity in all three backward modes.
 
 On CUDA, also reports peak GPU memory of a streamed step vs the full-resident
 reference (the point of the whole exercise).
@@ -138,6 +140,100 @@ def check_dropout_keep(device: str) -> list:
     return errs
 
 
+class _SplitHead(nn.Module):
+    """x -> (a, b, k): two float streams + an int passthrough (no grad)."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.la = nn.Linear(dim, dim)
+        self.lb = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        k = torch.arange(x.size(0), device=x.device)
+        return self.la(x), self.lb(x), k
+
+
+class _TwoStream(nn.Module):
+    """(a, b, k) -> (a', b', k): streams interact, k threads through."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.la = nn.Linear(dim, dim)
+        self.lb = nn.Linear(dim, dim)
+
+    def forward(self, a, b, k):
+        return (nn.functional.gelu(self.la(a)) + 0.1 * b,
+                nn.functional.gelu(self.lb(b)),
+                k)
+
+
+class _MergeTail(nn.Module):
+    """(a, b, k) -> y: merges the streams, consumes k grad-free."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.lo = nn.Linear(dim, dim)
+
+    def forward(self, a, b, k):
+        return self.lo(a + b) + 0.01 * k.float().unsqueeze(1)
+
+
+class _RefMulti(nn.Module):
+    """Full-resident reference that relays tuples exactly like OffloadModel."""
+
+    def __init__(self, chunks):
+        super().__init__()
+        self.chunks = nn.ModuleList(chunks)
+
+    def forward(self, x):
+        out = x
+        for c in self.chunks:
+            out = c(*out) if isinstance(out, tuple) else c(out)
+        return out
+
+
+def check_multi_arg(device: str) -> list:
+    """Tuple intermediates: parity vs reference in all three backward modes."""
+    errs: list = []
+    torch.manual_seed(5)
+    dim, n_mid = 32, 4
+    chunks = ([_SplitHead(dim)] + [_TwoStream(dim) for _ in range(n_mid)]
+              + [_MergeTail(dim)])
+    ref = _RefMulti(copy.deepcopy(chunks)).to(device)
+    torch.manual_seed(1)
+    x = torch.randn(8, dim)
+    y = torch.randn(8, dim)
+    loss_fn = nn.functional.mse_loss
+
+    with torch.no_grad():
+        want = ref(x.to(device))
+    ref.zero_grad()
+    ref_loss = loss_fn(ref(x.to(device)), y.to(device))
+    ref_loss.backward()
+
+    for mode in (False, True, "checkpoint"):
+        n_before = len(errs)
+        model = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
+                             keep_activations=mode)
+        got = model(x)
+        check_close(f"multiarg[{mode}] forward", got, want, errs)
+        res = model.step(x, targets=y, loss_fn=loss_fn)
+        check_close(f"multiarg[{mode}] loss", res.loss, ref_loss, errs)
+        check_close(f"multiarg[{mode}] output", res.output, want, errs)
+        model.flush_grads()
+        for (nme, p), (rnme, rp) in zip(model.chunks.named_parameters(),
+                                        ref.chunks.named_parameters()):
+            if p.grad is None:
+                errs.append(f"multiarg[{mode}] {nme}: no grad")
+                continue
+            check_close(f"multiarg[{mode}] {nme}.grad", p.grad, rp.grad, errs)
+        model.close()
+        status = "OK" if len(errs) == n_before else "MISMATCH"
+        label = {False: "recompute", True: "keep", "checkpoint": "checkpoint"}
+        print(f"[{device} multi-arg {label[mode]}] {status}")
+    return errs
+
+
 def check_load_accounting(device: str) -> list:
     errs: list = []
     n, dim = 6, 32
@@ -218,7 +314,8 @@ def main() -> int:
                 for e in errs[:5]:
                     print(f"    {e}")
                 ok &= not errs
-        errs = check_load_accounting(device) + check_dropout_keep(device)
+        errs = (check_load_accounting(device) + check_dropout_keep(device)
+                + check_multi_arg(device))
         for e in errs:
             print(f"    {e}")
         ok &= not errs

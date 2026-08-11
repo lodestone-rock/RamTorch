@@ -36,7 +36,8 @@ chunks the model has.
 
 You dice the model yourself into an ordered list of chunk modules — the same
 convention as `Pipeline(stage_modules=...)`. Chunk `i+1` consumes chunk `i`'s
-output (a single tensor). No tracing, no module surgery.
+output — a single tensor, or a tuple whose elements become the next chunk's
+positional args (see "Notes & gotchas"). No tracing, no module surgery.
 
 ```python
 import torch
@@ -260,8 +261,12 @@ total stall time is the single best signal of whether you're transfer-bound.
 
 ## Notes & gotchas
 
-* **Chunks exchange a single tensor** (like `PipelineModel._relay`). Multi-arg
-  chunks are not supported.
+* **Tuple intermediates are supported.** A chunk may return a single tensor or
+  a *tuple* of tensors; a tuple's elements become the next chunk's positional
+  args (`def forward(self, a, b, mask): ...`). Non-float / no-grad elements
+  (attention masks, position ids) thread through without gradients. The first
+  chunk's input and the last chunk's output can be tuples too (`step()`'s
+  `loss_fn` receives the raw output).
 * **Buffer mutations don't write back.** Buffer edits inside a chunk (e.g.
   BatchNorm running stats) happen on the streamed GPU copy and are discarded.
   Use eval-mode / buffer-free norms (LayerNorm is fine).
