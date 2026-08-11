@@ -213,6 +213,55 @@ unnoticed; with Adam-sized steps it breaks parity immediately.)
 
 ---
 
+## Mixed precision — just wrap `step()` in autocast
+
+Unlike the pipeline (whose stages run on worker threads, needing the
+`autocast=` parameter because autocast state is thread-local), **all offload
+compute runs on the calling thread** — the loader/writeback threads only do
+copies. So the ambient context applies to the whole step (forward, backward
+recompute, loss) and no engine support is needed:
+
+```python
+for x, y in loader:
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        res = model.step(x, targets=y, loss_fn=F.cross_entropy)
+    model.flush_grads()   # grads are fp32 as usual
+    opt.step()
+    model.zero_grad_acc()
+```
+
+Verified in `offload_streaming_check.py`: bf16-autocast training is
+**bit-identical** to a full-resident model trained with the same recipe, in
+all three backward modes (the recompute modes re-run forward ops *inside*
+`step()`, i.e. still under your autocast; `"checkpoint"` additionally stashes
+and restores the autocast state itself). Params and grads stay fp32, so the
+fused-AdamW recommendation is unchanged.
+
+---
+
+## Bypassing `loss_fn`: backprop a gradient directly (`grad_outputs=`)
+
+The same escape hatch as the pipeline's: skip the loss entirely and feed a
+precomputed `dL/dOutput` into the last chunk's backward — useful when the
+gradient comes from somewhere the model can't see (a downstream model, a
+custom differentiator, RL advantages).
+
+```python
+# Callable form: resolved with the live output (mirrors loss_fn).
+res = model.step(x, targets=y,
+                 grad_outputs=lambda out, tgt: 2.0 * (out - tgt))
+
+# Tensor form: dL/dOut you computed elsewhere (tuple for tuple outputs).
+res = model.step(x, grad_outputs=dl_dout)
+```
+
+- **Mutually exclusive with `loss_fn`** — passing both raises `ValueError`.
+- **No loss is reported** — `res.loss` raises a clear `RuntimeError`.
+- Works in all three backward modes; parity vs a reference loss-backward is
+  checked in `offload_streaming_check.py`.
+
+---
+
 ## When offload helps (and when it doesn't)
 
 Offload trades **PCIe bandwidth** for **GPU memory**. It wins when there's
@@ -297,7 +346,7 @@ and wrapping them in `OffloadModel`.
 | `offload_quickstart.py` | Minimal train + inference walkthrough (the snippet above, runnable) |
 | `mnist_offload_example.py` | Canonical end-to-end training run: dice an MLP into chunks, train on MNIST with `step()` + `flush_grads()` + `AdamW(fused=True)`, streamed eval, checkpoint, peak-memory + stall report. `--backward {recompute,keep,checkpoint}` picks the strategy; `--selective` marks each block's FF with `offload_checkpoint` |
 | `offload_vs_plain_demo.py` | Side-by-side vs a full-resident model: 100-step SGD **bit-identity**, wall-time + peak-memory table, Perfetto traces, transfer- vs compute-bound regimes |
-| `offload_streaming_check.py` | Streaming executor vs full-resident reference: inference + training loss/grad parity across all three backward modes (CPU always, CUDA when available) |
+| `offload_streaming_check.py` | Streaming executor vs full-resident reference: inference + training loss/grad parity across all three backward modes, tuple intermediates, bf16-autocast bit-identity, grad bypass (CPU always, CUDA when available) |
 | `offload_checkpoint_study.py` | The three backward strategies head to head: bit-parity (incl. dropout, where recompute's drift is shown) + the memory/time table above + selective `offload_checkpoint` marks |
 | `offload_optimizer_check.py` | The private/educational streamed `OffloadAdamW` vs `torch.optim.AdamW`: trajectory bit-identity + the optimizer-step benchmark showing why `fused=True` CPU AdamW is the recommendation |
 | `offload_pinning_study.py` | `pin` vs bigger `window` at equal memory — which reduces stalls more |

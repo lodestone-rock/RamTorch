@@ -12,6 +12,12 @@ Checks (on CPU always, and on CUDA when available):
   4. Load accounting: with window >= n, step 2 issues zero new loads.
   5. Tuple intermediates: chunks exchanging (a, b, int-passthrough) tuples —
      forward + loss + grad parity in all three backward modes.
+  6. Mixed precision: step() wrapped in torch.autocast(bf16) vs a plain model
+     trained with the same recipe. Needs NO engine support — offload compute
+     runs on the calling thread (autocast is thread-local), unlike pipeline
+     stage workers.
+  7. Grad bypass (grad_outputs=): callable + tensor forms vs a reference
+     loss backward; .loss raises; loss_fn+grad_outputs raises ValueError.
 
 On CUDA, also reports peak GPU memory of a streamed step vs the full-resident
 reference (the point of the whole exercise).
@@ -234,6 +240,118 @@ def check_multi_arg(device: str) -> list:
     return errs
 
 
+_MODE_LABEL = {False: "recompute", True: "keep", "checkpoint": "checkpoint"}
+
+
+def check_autocast(device: str) -> list:
+    """step() under ambient torch.autocast(bf16) == plain model, same recipe.
+
+    The whole step (forward, backward recompute, loss) runs on the calling
+    thread, so the user's autocast context simply applies — verifying the
+    engine needs no autocast plumbing of its own.
+    """
+    errs: list = []
+    ac_dev = "cuda" if device.startswith("cuda") else "cpu"
+    n, dim, steps, lr = 6, 64, 3, 1e-2
+    chunks = make_chunks(n, dim, seed=11)
+    torch.manual_seed(2)
+    x, y = torch.randn(8, dim), torch.randn(8, dim)
+    loss_fn = nn.functional.mse_loss
+
+    ref = nn.Sequential(*copy.deepcopy(chunks)).to(device)
+    ropt = torch.optim.SGD(ref.parameters(), lr=lr)
+    ref_losses = []
+    for _ in range(steps):
+        with torch.autocast(ac_dev, dtype=torch.bfloat16):
+            loss = loss_fn(ref(x.to(device)), y.to(device))
+        ropt.zero_grad(set_to_none=True)
+        loss.backward()
+        ropt.step()
+        ref_losses.append(loss.detach())
+
+    for mode in (False, True, "checkpoint"):
+        n_before = len(errs)
+        model = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
+                             keep_activations=mode)
+        opt = torch.optim.SGD(model.parameters(), lr=lr)
+        for s in range(steps):
+            with torch.autocast(ac_dev, dtype=torch.bfloat16):
+                res = model.step(x, targets=y, loss_fn=loss_fn)
+            model.flush_grads()
+            opt.step()
+            check_close(f"autocast[{mode}] loss step{s}", res.loss,
+                        ref_losses[s], errs)
+        for (nme, p), (_, rp) in zip(model.chunks.named_parameters(),
+                                     ref.named_parameters()):
+            check_close(f"autocast[{mode}] weight {nme}", p, rp, errs)
+        model.close()
+        status = "OK" if len(errs) == n_before else "MISMATCH"
+        print(f"[{device} autocast-bf16 {_MODE_LABEL[mode]}] {status}")
+    return errs
+
+
+def check_grad_bypass(device: str) -> list:
+    """grad_outputs=: seeded backward == reference loss backward."""
+    errs: list = []
+    n, dim = 6, 32
+    chunks = make_chunks(n, dim, seed=13)
+    torch.manual_seed(4)
+    x, y = torch.randn(8, dim), torch.randn(8, dim)
+    loss_fn = nn.functional.mse_loss
+
+    ref = nn.Sequential(*copy.deepcopy(chunks)).to(device)
+    ref.zero_grad()
+    ref_loss = loss_fn(ref(x.to(device)), y.to(device))
+    ref_loss.backward()
+
+    def compare_grads(mode, tag):
+        model.flush_grads()
+        for (nme, p), (_, rp) in zip(model.chunks.named_parameters(),
+                                     ref.named_parameters()):
+            if p.grad is None:
+                errs.append(f"bypass[{mode}] {tag} {nme}: no grad")
+                continue
+            check_close(f"bypass[{mode}] {tag} {nme}.grad", p.grad,
+                        rp.grad, errs)
+
+    for mode in (False, True, "checkpoint"):
+        n_before = len(errs)
+        model = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
+                             keep_activations=mode)
+
+        # callable form: dL/dOut of mean-MSE, resolved with the live output
+        res = model.step(
+            x, targets=y,
+            grad_outputs=lambda out, tgt: 2.0 * (out - tgt) / out.numel(),
+        )
+        try:
+            _ = res.loss
+            errs.append(f"bypass[{mode}]: .loss did not raise")
+        except RuntimeError:
+            pass
+        compare_grads(mode, "callable")
+
+        # tensor form: dL/dOut precomputed from a no_grad forward
+        model.zero_grad_acc()
+        with torch.no_grad():
+            out0 = model(x)
+        go = 2.0 * (out0 - y.to(model.device)) / out0.numel()
+        model.step(x, grad_outputs=go)
+        compare_grads(mode, "tensor")
+
+        # loss_fn + grad_outputs must refuse loudly
+        try:
+            model.step(x, loss_fn=loss_fn, grad_outputs=go)
+            errs.append(f"bypass[{mode}]: loss_fn+grad_outputs did not raise")
+        except ValueError:
+            pass
+
+        model.close()
+        status = "OK" if len(errs) == n_before else "MISMATCH"
+        print(f"[{device} grad-bypass {_MODE_LABEL[mode]}] {status}")
+    return errs
+
+
 def check_load_accounting(device: str) -> list:
     errs: list = []
     n, dim = 6, 32
@@ -315,7 +433,8 @@ def main() -> int:
                     print(f"    {e}")
                 ok &= not errs
         errs = (check_load_accounting(device) + check_dropout_keep(device)
-                + check_multi_arg(device))
+                + check_multi_arg(device) + check_autocast(device)
+                + check_grad_bypass(device))
         for e in errs:
             print(f"    {e}")
         ok &= not errs

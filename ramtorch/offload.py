@@ -147,11 +147,23 @@ class OffloadStepResult:
     """Output + loss of one :meth:`OffloadModel.step`.
 
     ``output`` mirrors the last chunk's return value (tensor or tuple).
+    With ``grad_outputs=`` (grad bypass) no loss is ever computed, so
+    accessing ``.loss`` raises instead of silently returning ``None``.
     """
 
-    def __init__(self, output, loss: torch.Tensor):
+    def __init__(self, output, loss, *, grad_bypassed: bool = False):
         self.output = output
-        self.loss = loss
+        self._loss = loss
+        self._grad_bypassed = grad_bypassed
+
+    @property
+    def loss(self):
+        if self._grad_bypassed:
+            raise RuntimeError(
+                "step() ran with grad_outputs= (grad bypass): the loss is "
+                "never computed. Compute your loss outside the model."
+            )
+        return self._loss
 
 
 class _ChunkState:
@@ -621,6 +633,7 @@ class OffloadModel(nn.Module):
         *,
         targets: Optional[torch.Tensor] = None,
         loss_fn: Optional[Callable] = None,
+        grad_outputs=None,
         profile_path: Optional[str] = None,
     ) -> OffloadStepResult:
         """
@@ -635,12 +648,29 @@ class OffloadModel(nn.Module):
         optimizer step. Repeated ``step()`` calls accumulate (microbatch
         gradient accumulation).
 
+        ``grad_outputs``: grad-bypass escape hatch (mirrors the pipeline's).
+        Skip the loss entirely and feed a precomputed ``dL/dOutput`` into
+        the last chunk's backward — either a tensor (or tuple aligned with
+        a tuple output), or a callable ``(output, targets) -> grad`` that is
+        resolved with the live output. Mutually exclusive with ``loss_fn``;
+        the result's ``.loss`` raises since no loss is computed.
+
+        Mixed precision: wrap the call in ``torch.autocast`` — everything
+        (forward, backward recompute, loss) runs on the calling thread, so
+        the ambient context applies; no engine support needed (unlike the
+        pipeline, whose stage workers are separate threads).
+
         ``profile_path``: if set, capture a torch.profiler (kineto) trace of
         the whole step — compute ops (``F3`` / ``B3``), H2D loads (``L3 h2d
         load``), D2H grad writebacks, stall waits (``wait L3``), every CUDA
         kernel and memcpy — and write Chrome-trace JSON to this path. Drop
         the file into https://ui.perfetto.dev to inspect the overlap.
         """
+        if grad_outputs is not None and loss_fn is not None:
+            raise ValueError(
+                "grad_outputs and loss_fn are mutually exclusive: grad "
+                "bypass skips the loss computation entirely"
+            )
         loss_fn = loss_fn or (lambda out, _: out.sum())
         target = targets.to(self.device) if targets is not None else None
 
@@ -650,11 +680,14 @@ class OffloadModel(nn.Module):
             )
             if self.keep_activations == "checkpoint":
                 result = self._step_keep(x, target, loss_fn,
-                                         use_checkpoint=True)
+                                         use_checkpoint=True,
+                                         grad_outputs=grad_outputs)
             elif self.keep_activations:
-                result = self._step_keep(x, target, loss_fn)
+                result = self._step_keep(x, target, loss_fn,
+                                         grad_outputs=grad_outputs)
             else:
-                result = self._step_recompute(x, target, loss_fn)
+                result = self._step_recompute(x, target, loss_fn,
+                                              grad_outputs=grad_outputs)
             # ensure all writebacks landed before the caller touches grad_acc
             self._wb_q.join()
             self._check_error()
@@ -718,6 +751,29 @@ class OffloadModel(nn.Module):
             })
         with open(path, "w") as f:
             json.dump(trace, f)
+
+    def _resolve_grad_outputs(self, grad_outputs, raw_out, target,
+                              outs: tuple) -> tuple:
+        """Normalize a grad-bypass ``grad_outputs`` for the last chunk.
+
+        Callable form is resolved with the (detached) live output and the
+        targets, mirroring ``loss_fn``; the values are gradients, not graph
+        nodes, so resolution runs under ``no_grad``.
+        """
+        if callable(grad_outputs):
+            with torch.no_grad():
+                go = grad_outputs(self._detach_like(raw_out), target)
+        else:
+            go = grad_outputs
+        gos = self._as_tuple(go)
+        if len(gos) != len(outs):
+            raise ValueError(
+                f"grad_outputs has {len(gos)} element(s) but the last chunk "
+                f"returned {len(outs)}"
+            )
+        return tuple(
+            g.to(self.device) if g is not None else None for g in gos
+        )
 
     def _grads_for(self, i: int, tensors: Dict[str, torch.Tensor],
                    outs: tuple, inps: tuple, grad_outs, loss_fn, target,
@@ -790,7 +846,8 @@ class OffloadModel(nn.Module):
                 (state, {nme: g.detach() for nme, g in named_grads.items()}, ev)
             )
 
-    def _step_recompute(self, x, target, loss_fn) -> OffloadStepResult:
+    def _step_recompute(self, x, target, loss_fn,
+                        grad_outputs=None) -> OffloadStepResult:
         """no_grad forward caching boundaries; backward recomputes per chunk."""
         n = self.n
         boundary: List[Optional[tuple]] = []
@@ -822,9 +879,14 @@ class OffloadModel(nn.Module):
                 with torch.enable_grad():
                     raw_out = self._call_chunk(i, tensors, inps)
                 outs = self._as_tuple(raw_out)
+                is_last = i == n - 1
+                if is_last and grad_outputs is not None:
+                    grad_outs = self._resolve_grad_outputs(
+                        grad_outputs, raw_out, target, outs)
+                    is_last = False  # seeded like a middle chunk
                 loss, grad_outs, named_grads = self._grads_for(
                     i, tensors, outs, inps, grad_outs, loss_fn, target,
-                    is_last=(i == n - 1), raw_out=raw_out,
+                    is_last=is_last, raw_out=raw_out,
                 )
                 if loss is not None:
                     loss_out = loss.detach()
@@ -833,10 +895,11 @@ class OffloadModel(nn.Module):
                     p.requires_grad_(False)
                 boundary[i] = None  # free the boundary activations
             self._release()
-        return OffloadStepResult(output, loss_out)
+        return OffloadStepResult(output, loss_out,
+                                 grad_bypassed=grad_outputs is not None)
 
-    def _step_keep(self, x, target, loss_fn,
-                   use_checkpoint: bool = False) -> OffloadStepResult:
+    def _step_keep(self, x, target, loss_fn, use_checkpoint: bool = False,
+                   grad_outputs=None) -> OffloadStepResult:
         """Grad-enabled forward keeping per-chunk graphs; no recompute.
 
         The graphs reference each chunk's stable ``graph_tensors``; the loader
@@ -885,16 +948,22 @@ class OffloadModel(nn.Module):
             with record_function(f"B{i} grad"):
                 self._acquire(i)  # refills evicted weights before backward
                 inps, outs, raw_out, tensors = cache[i]
+                is_last = i == n - 1
+                if is_last and grad_outputs is not None:
+                    grad_outs = self._resolve_grad_outputs(
+                        grad_outputs, raw_out, target, outs)
+                    is_last = False  # seeded like a middle chunk
                 loss, grad_outs, named_grads = self._grads_for(
                     i, tensors, outs, inps, grad_outs, loss_fn, target,
-                    is_last=(i == n - 1), raw_out=raw_out,
+                    is_last=is_last, raw_out=raw_out,
                 )
                 if loss is not None:
                     loss_out = loss.detach()
                 self._accumulate(self._state[i], named_grads)
                 cache[i] = None  # release the chunk's graph + activations
             self._release()
-        return OffloadStepResult(output, loss_out)
+        return OffloadStepResult(output, loss_out,
+                                 grad_bypassed=grad_outputs is not None)
 
     # ── grads / optimizer interop ──────────────────────────────────────────
     def flush_grads(self, scale: float = 1.0):

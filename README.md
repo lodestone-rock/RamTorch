@@ -134,6 +134,11 @@ Weights live in CPU **pinned** memory. A **loader thread** prefetches upcoming c
 
 The optimizer sees mixed devices (streamed masters on CPU, pinned chunks on the GPU). One `torch.optim.AdamW(model.parameters(), fused=True)` handles both: torch groups params by device, so the CPU masters get the **fused CPU kernel** — one multithreaded pass at DDR bandwidth, ~5x faster than the default eager CPU path, and faster than any PCIe-streaming scheme (we built one to check; it lives on as the private, educational `ramtorch.offload_optimizer.OffloadAdamW` — see [docs/offload.md](docs/offload.md) and the benchmark in `examples/offload_optimizer_check.py`).
 
+### Mixed precision & grad bypass
+
+- **Autocast needs no engine support** (unlike the pipeline's `autocast=` param): offload compute runs on the calling thread, so just wrap the step — `with torch.autocast("cuda", dtype=torch.bfloat16): model.step(...)`. Verified bit-identical to a full-resident model on the same recipe, in all three backward modes.
+- **`step(x, grad_outputs=...)`** mirrors the pipeline's escape hatch: skip the loss and backprop a precomputed `dL/dOutput` (tensor, or callable resolved with the live output). Mutually exclusive with `loss_fn`; `res.loss` raises.
+
 ### Will it actually be faster? (the simulator)
 
 Offload trades **PCIe bandwidth for GPU memory**. It wins when there's enough per-chunk compute to hide the H2D copy (the *compute-bound* regime) and loses when chunks are tiny/fast (*transfer-bound*). Predict which regime you're in *before* building anything:
