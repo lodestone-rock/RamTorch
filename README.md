@@ -1,21 +1,27 @@
 # RamTorch
 
-**RAM is All You Need** - A PyTorch library for memory-efficient deep learning that enables training and inference of large models that don't fit in GPU memory.
+**RAM is All You Need** — train big models on a single node. No datacenter, no NVLink, no `torchrun`.
 
-## Overview
+RamTorch is a PyTorch library for people who have **a workstation with a GPU or two and a lot of RAM**, not a cluster. It lets you train and run models that don't fit in GPU memory by using the RAM you already have — on **one GPU** by streaming weights from RAM, and on **multiple plain PCIe GPUs** by pipelining across them in a single process.
 
-RamTorch provides CPU-GPU hybrid implementations of neural network components that keep parameters in CPU memory and transfer them to GPU on-demand. This approach dramatically reduces GPU memory usage while maintaining computational efficiency through asynchronous CUDA streams and intelligent batching.
+If you've ever thought *"this model is almost small enough for my GPU"*, RamTorch is for you. The corporate-scale solutions (FSDP, DeepSpeed, Megatron) already exist and target NVLink/InfiniBand clusters; RamTorch targets the rest of us.
+
+## The two ways RamTorch helps
+
+| Your hardware | RamTorch feature | Idea |
+|---|---|---|
+| **One GPU** (+ lots of RAM) | **Weight streaming** (`OffloadModel`) | Keep weights in pinned RAM, stream them through a small sliding GPU window. Peak GPU weight memory ≈ `window + pin` chunks, no matter how big the model is. |
+| **A few PCIe GPUs** (one node, no NVLink) | **Pipeline parallelism** (`PipelineModel` / `Pipeline`) | Split the model across GPUs and train/infer in a single process — no process groups, no NCCL, no launcher. One worker thread per GPU; activations/gradients relay between stages. |
+
+Both are built for **PCIe bandwidth**, not NVLink — which is exactly what a single-node enthusiast box has.
 
 ## Key Features
 
-- **Memory-Efficient Linear Layers**: Parameters stored on CPU with on-demand GPU transfer
-- **Asynchronous CUDA Streams**: Overlaps computation with data transfer for minimal latency
-- **ZeRO-Style Distributed Training**: 
-  - **ZeRO-1**: Optimizer state sharding across multiple GPUs
-  - **ZeRO-2**: Gradient sharding with automatic reduction
-- **Pipeline Parallelism**: Single-process pipeline-parallel training & inference across GPUs — no `torchrun`, no process groups — with GPipe / 1F1B / staggered-1B1F schedules
-- **Shared CPU Memory**: Multi-GPU workers share the same CPU tensor storage
-- **Drop-in Replacement**: Compatible with existing PyTorch code
+- **Single-GPU Weight Streaming (`OffloadModel`)**: weights live in CPU pinned memory and stream through a sliding GPU window (with optional pinned layers). Train/infer models too big for one GPU.
+- **Single-Process Pipeline Parallelism**: split a model across GPUs with GPipe / 1F1B / staggered-1B1F schedules — no `torchrun`, no process groups, no NCCL.
+- **Mixed precision (`autocast=`)**, **tuple stage outputs**, and a **grad-bypass escape hatch** for custom losses.
+- **Design simulators**: predict makespan / GPU-utilization / memory *before* you run — `ramtorch.schedule_simulator` (pipeline) and `ramtorch.offload_simulator` (streaming).
+- **ZeRO-1 / ZeRO-2 sharding** and the original per-layer `ramtorch.Linear` are kept for backward compatibility (see [Legacy](#legacy-zero-12--per-layer-ramtorchlinear)).
 
 ## Installation
 
@@ -23,7 +29,7 @@ RamTorch provides CPU-GPU hybrid implementations of neural network components th
 pip install ramtorch
 ```
 
-Or install from source:
+Or from source:
 
 ```bash
 git clone https://github.com/lodestone-rock/RamTorch.git
@@ -33,341 +39,240 @@ pip install -e .
 
 ## Quick Start
 
-### Basic Usage
+### One GPU — stream weights from RAM
 
-Replace `torch.nn.Linear` with `ramtorch.Linear` for automatic memory optimization:
-
-```python
-import torch
-from ramtorch import Linear
-
-# Standard PyTorch approach (high GPU memory usage)
-# linear = torch.nn.Linear(1000, 1000)
-
-# RamTorch approach (low GPU memory usage)
-linear = Linear(1000, 1000, device="cuda")
-
-# Use exactly like a normal PyTorch layer
-x = torch.randn(32, 1000, device="cuda")
-output = linear(x)  # Parameters automatically transferred from CPU to GPU
-```
-
-### Building Models
+Dice your model into chunk modules (you choose the granularity — the same convention as `Pipeline(stage_modules=...)`), then let `OffloadModel` stream them through the GPU:
 
 ```python
-import torch.nn as nn
-from ramtorch import Linear
+import torch, torch.nn as nn, torch.nn.functional as F
+from ramtorch import OffloadModel
 
-class MemoryEfficientModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.layers = nn.Sequential(
-            Linear(1000, 2000),
-            nn.ReLU(),
-            Linear(2000, 2000),
-            nn.ReLU(),
-            Linear(2000, 100)
-        )
-    
-    def forward(self, x):
-        return self.layers(x)
+# 1. Dice your model into chunks.
+chunks = [nn.Sequential(nn.Linear(1024, 4096), nn.GELU(), nn.Linear(4096, 1024))
+          for _ in range(24)]
 
-model = MemoryEfficientModel()
+# 2. Wrap: stream through a 2-slot GPU window, keep 4 chunks pinned resident.
+model = OffloadModel(chunks, device="cuda:0", window=2, pin=4,
+                     keep_activations=True)
+
+# 3. Inference / training.
+out = model(x)                                                  # streamed forward
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)  # fused CPU+GPU kernels
+for x, y in loader:
+    res = model.step(x, targets=y, loss_fn=F.cross_entropy)     # fwd+bwd
+    model.flush_grads()                                         # acc -> .grad
+    opt.step(); opt.zero_grad()
+model.close()
 ```
 
-### Converting Existing Models
+**Peak GPU weight memory ≈ `(window + pin)` chunks.** A loader thread prefetches the next chunk over a dedicated H2D stream so the copy overlaps compute. Guide: **[docs/offload.md](docs/offload.md)** · Quickstart: `examples/offload_quickstart.py` · MNIST end-to-end: `examples/mnist_offload_example.py` · full study: `examples/offload_vs_plain_demo.py`.
 
-Use the helper function to automatically replace all Linear layers:
+### A few PCIe GPUs — pipeline across them
 
-```python
-from ramtorch.helpers import replace_linear_with_ramtorch
-
-# Your existing PyTorch model
-model = YourExistingModel()
-
-# Replace all nn.Linear layers with RamTorch Linear layers
-model = replace_linear_with_ramtorch(model, rank=0)
-model = model.to("cuda:0")
-```
-
-### Multi-GPU Training with ZeRO-1 and ZeRO-2
-
-RamTorch implements ZeRO-style optimizations where multiple GPU workers share the same CPU parameter storage, dramatically reducing memory usage:
-
-```python
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.utils.data import DataLoader, DistributedSampler
-
-from ramtorch import AdamW
-from ramtorch.helpers import replace_linear_with_ramtorch
-from ramtorch.zero1 import create_zero_param_groups, broadcast_zero_params
-from ramtorch.zero2 import setup_grad_sharding_hooks
-
-def train(rank, world_size, model):
-    # Setup distributed process group
-    dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-    
-    # Replace Linear layers with RamTorch (shares CPU memory across workers)
-    model = replace_linear_with_ramtorch(model, rank)
-    model.to(rank)
-    
-    # Setup ZeRO-1: Shard optimizer states across workers
-    # Each worker only maintains optimizer states for a subset of parameters
-    all_params = list(model.parameters())
-    param_groups = [{'params': all_params, 'lr': 1e-3, 'weight_decay': 0.01}]
-    rank_param_groups = create_zero_param_groups(param_groups, world_size)
-    
-    # Setup ZeRO-2: Shard gradients across workers
-    # Gradients are partitioned and only linked on the worker responsible for them
-    setup_grad_sharding_hooks(rank_param_groups, rank)
-    
-    # Each worker's optimizer only handles its shard
-    optimizer = AdamW(rank_param_groups[rank])
-    
-    # Scheduler works normally
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-    
-    # Setup distributed data loading
-    dataset = YourDataset()
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
-    loader = DataLoader(dataset, batch_size=32, sampler=sampler)
-    
-    # Training loop
-    for epoch in range(num_epochs):
-        sampler.set_epoch(epoch)  # Important for proper shuffling
-        
-        for batch in loader:
-            inputs, targets = batch
-            inputs = inputs.to(rank)
-            targets = targets.to(rank)
-            
-            # Forward and backward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, targets) / world_size  # Scale loss
-            
-            # Synchronize before backward to ensure all workers are ready
-            torch.cuda.synchronize()
-            loss.backward()
-            torch.cuda.synchronize()
-            
-            # Update parameters (each worker updates only its shard)
-            optimizer.step()
-            
-            # Broadcast updated parameters to all workers
-            # RamTorch parameters are already shared via CPU memory,
-            # but standard PyTorch parameters need explicit broadcasting
-            broadcast_zero_params(rank_param_groups)
-            
-            scheduler.step()
-            
-            # IMPORTANT: Use model.zero_grad(), not optimizer.zero_grad()
-            # Each worker handles partial gradients, so we need to zero
-            # gradients at the model level to properly clear all workers' buffers
-            model.zero_grad()
-            
-            torch.cuda.synchronize()
-    
-    dist.destroy_process_group()
-
-if __name__ == "__main__":
-    world_size = torch.cuda.device_count()
-    
-    # Model must be instantiated BEFORE spawning GPU workers
-    # RamTorch shares CPU tensors across workers, so the model needs to exist
-    # in the parent process before forking to enable proper memory sharing
-    model = YourModel()
-    
-    mp.spawn(train, args=(world_size, model), nprocs=world_size)
-```
-
-## Pipeline Parallelism
-
-> **Full guide: [docs/pipeline_parallel.md](docs/pipeline_parallel.md)** — torch.export gotchas, manual model splitting, tuple/pre-diced inputs, schedules, profiling, and numerics.
-
-RamTorch also provides **single-process pipeline parallelism**: split a model across multiple GPUs and train/infer pipeline-parallel **without `torchrun`, without process groups, without NCCL**. Each stage runs on its own GPU driven by one worker thread; activations and gradients are relayed between stages through lightweight thread-safe handoffs.
-
-### Why
-
-Pipeline parallelism splits a model *vertically* (by layers) so each GPU holds only a slice — complementary to RamTorch's CPU-offload (which reduces per-GPU memory) and ZeRO (which shards optimizer/gradients). Use it when the model is too big for one GPU but you want a simple single-process program instead of a distributed launcher.
-
-### The `PipelineModel` API (single-GPU feel)
-
-The easiest way in. Auto-splits your model into balanced stages and gives you a normal-looking `nn.Module`:
+`PipelineModel` auto-splits your model and gives you a normal-looking `nn.Module`:
 
 ```python
 import torch
 from ramtorch import PipelineModel
 
-# Your ordinary model (any nn.Module with top-level children to split on)
-model = MyModel()
+model = MyModel()                                   # any nn.Module
+example = torch.randn(16, *input_shape)             # one microbatch (tracer)
 
-# One example microbatch for the tracer (same device as the model)
-example = torch.randn(16, *input_shape)
-
-# Auto-split across your GPUs (balanced by parameter count)
 pipe = PipelineModel(model, example, devices=["cuda:0", "cuda:1"])
 
-# Inference — one call, returns logits (arbitrary batch size OK)
-logits = pipe.forward(images)
+logits = pipe.forward(images)                       # inference (any batch size)
 
-# Training — step + flush + a single optimizer over the wrapper
-opt = torch.optim.Adam(pipe.parameters(), lr=1e-3)
+opt = torch.optim.Adam(pipe.parameters(), lr=1e-3)  # training
 for x, y in train_loader:
     result = pipe.step(x, targets=y,
                        schedule="staggered_1b1f",   # or "gpipe" / "1f1b"
                        n_microbatches=4,
                        loss_fn=torch.nn.CrossEntropyLoss())
-    result.flush_grads()   # write mean-scaled microbatch grads into .grad
-    opt.step()
-    opt.zero_grad()
+    result.flush_grads()
+    opt.step(); opt.zero_grad()
 ```
 
-### Schedules
-
-Two schedules are recommended for everyday use:
-
-| Schedule | Bubble | Peak in-flight activations | Notes |
-|---|---|---|---|
-| `staggered_1b1f` (default) | **lowest** | ~`num_stages` | Backward-eager + staggered warmup; GPipe-level throughput at 1F1B-class memory. **Recommended.** |
-| `gpipe` | fill + drain | all `n_microbatches` | Simple, highest memory; useful as a correctness baseline |
-
-A third schedule, `1f1b` (textbook forward-first one-forward-one-backward), is kept **for education and comparison only** — it is *not* recommended for real runs. It exists to make the importance of execution order concrete: `1f1b` and `staggered_1b1f` compute the *same* math, but `1f1b` forwards before backwarding, which leaves a large steady-state bubble. On a 10.9 GB model `1f1b` reached only ~50% GPU utilization vs ~92-98% for `staggered_1b1f` — identical work, very different wall-clock, purely from op ordering. Compare them with the schedule simulator (`python -m ramtorch.schedule_simulator`) or `examples/benchmark_schedules.py`.
-
-### Auto-split & heterogeneous GPUs
-
-By default stages are balanced by parameter count. For machines with GPUs of different speed, weight the split so faster GPUs take more layers:
-
-```python
-pipe = PipelineModel(model, example,
-                     devices=["cuda:0", "cuda:1"],
-                     device_weights=[2.0, 1.0])   # cuda:0 is ~2x faster
-```
-
-Or pass an explicit `split_spec` for full manual control over where the model is cut.
-
-### Complex models: pre-partition the stages yourself (recommended)
-
-`PipelineModel`'s auto-split relies on `torch.export` to trace your model. That works well for simple models (linear stacks, basic CNNs), but **complex architectures break the tracer** — `nn.MultiheadAttention`, dynamic reshapes, data-dependent control flow, or custom ops can cause `torch.export` to fail or to emit a subtly-wrong graph.
-
-For anything non-trivial, **partition the model yourself** into a list of stage modules and bypass the tracer entirely with `Pipeline(stage_modules=[...])`. Each stage is a plain `nn.Module` whose forward consumes the previous stage's output — a trivial change to make in your own model class, and the robust choice for real architectures:
+For **complex architectures** (attention, dynamic reshapes, control flow), `torch.export` (which `PipelineModel` uses) can fail — so partition the stages yourself and bypass the tracer with `Pipeline(stage_modules=[...])`:
 
 ```python
 import itertools, torch
 from ramtorch import Pipeline
 
-# You define the split in your model code — no torch.export involved.
-stage0 = EmbedAndFirstBlocks(...)    # nn.Module: image -> tokens
-stage1 = RemainingBlocksAndHead(...) # nn.Module: tokens -> logits
+stage0 = EmbedAndFirstBlocks(...)     # nn.Module: image -> tokens
+stage1 = RemainingBlocksAndHead(...)  # nn.Module: tokens -> logits
 
-pipe = Pipeline(stage_modules=[stage0, stage1],
-                devices=["cuda:0", "cuda:1"])
-
-# Optimize over the stages' own parameters (they're separate modules).
+pipe = Pipeline(stage_modules=[stage0, stage1], devices=["cuda:0", "cuda:1"])
 opt = torch.optim.Adam(itertools.chain(*(s.parameters() for s in (stage0, stage1))), lr=1e-3)
 
 for x, y in train_loader:
     result = pipe.step(x, targets=y, schedule="staggered_1b1f",
                        n_microbatches=4, loss_fn=loss_fn)
-    result.flush_grads()
-    opt.step()
-    opt.zero_grad()
+    result.flush_grads(); opt.step(); opt.zero_grad()
 ```
 
-**Guidance:** `PipelineModel` is the convenient API for simple models; `Pipeline(stage_modules=...)` is the recommended API for real/complex architectures. See `examples/mnist_pipeline_big_transformer_manual.py` for a full ~85M-param ViT-style transformer trained this way (the auto-traced equivalent fails on its attention reshapes).
+Guide: **[docs/pipeline_parallel.md](docs/pipeline_parallel.md)** · Examples: `examples/mnist_pipeline_example.py` (auto-split MLP), `examples/mnist_pipeline_big_transformer_manual.py` (manual ~85M transformer).
+
+---
+
+## Single-GPU Weight Streaming (`OffloadModel`)
+
+> **Full guide: [docs/offload.md](docs/offload.md)** — knobs, backward strategies, transfer- vs compute-bound regimes, the design simulator, and profiling.
+
+Weights live in CPU **pinned** memory. A **loader thread** prefetches upcoming chunks into a GPU window of `window` slots over a dedicated H2D stream, so the copy for chunk `i+1` overlaps the compute of chunk `i`. `pin` evenly-spaced chunks stay on the GPU permanently (never loaded, never evicted), easing PCIe traffic at the cost of their memory. Eviction is farthest-next-use (Belady — optimal, since the itinerary is known). Backward gradient writebacks return to pinned CPU accumulators over a D2H stream via a separate **writeback thread**.
+
+### The three knobs
+
+- **`window`** (default `2`): streaming slots on the GPU. `window=1` never overlaps a load with compute; `window≥2` lets the loader run ahead. Total weight memory ≈ `window + pin` chunks.
+- **`pin`** (default `0`): evenly-spaced chunks pinned resident. `pin_layers=[...]` overrides with explicit indices.
+- **`keep_activations`**: backward strategy —
+  - `False` (*recompute*, default): forward runs under `no_grad` caching only chunk-boundary activations; backward reloads each chunk and recomputes its forward (per-chunk gradient checkpointing). Cheapest memory, but forward runs twice and **dropout would resample**.
+  - `True` (*keep*): forward builds each chunk's graph and keeps its activations, so backward skips the recompute. Weights still stream (their storage is freed on eviction and refilled before backward — the FSDP resharding trick). Fastest, works with dropout, costs activation memory for all chunks.
+  - `"checkpoint"`: keep-mode plumbing but each chunk runs under non-reentrant `torch.utils.checkpoint` — recompute-level memory that is **also dropout-safe** (checkpoint stashes/restores RNG), and it measured *faster* than the engine's own recompute. Head-to-head numbers: `examples/offload_checkpoint_study.py` and [docs/offload.md](docs/offload.md).
+  - Selective: mark regions inside your own `forward` with `ramtorch.offload_checkpoint(self.heavy, x)` (+ `keep_activations=True`) — unmarked parts keep activations, marked parts recompute. A bare `torch.utils.checkpoint` breaks under the streaming engine; the helper re-applies the streamed weights for the recompute (see [docs/offload.md](docs/offload.md)).
+
+### The optimizer step: use `fused=True`
+
+The optimizer sees mixed devices (streamed masters on CPU, pinned chunks on the GPU). One `torch.optim.AdamW(model.parameters(), fused=True)` handles both: torch groups params by device, so the CPU masters get the **fused CPU kernel** — one multithreaded pass at DDR bandwidth, ~5x faster than the default eager CPU path, and faster than any PCIe-streaming scheme (we built one to check; it lives on as the private, educational `ramtorch.offload_optimizer.OffloadAdamW` — see [docs/offload.md](docs/offload.md) and the benchmark in `examples/offload_optimizer_check.py`).
+
+### Will it actually be faster? (the simulator)
+
+Offload trades **PCIe bandwidth for GPU memory**. It wins when there's enough per-chunk compute to hide the H2D copy (the *compute-bound* regime) and loses when chunks are tiny/fast (*transfer-bound*). Predict which regime you're in *before* building anything:
+
+```bash
+# sweep window 1..N, print makespan / GPU% / stall / peak-resident table
+python -m ramtorch.offload_simulator --layers 24 --tf 1.0 --tb 2.0 --th2d 0.5
+# one window, Gantt chart
+python -m ramtorch.offload_simulator --layers 24 --window 2 --pin 4 --plot gantt.png
+```
+
+Profile a real step with `model.step(..., profile_path="offload.trace.json")` and open it at <https://ui.perfetto.dev> — you get compute spans, H2D loads, D2H writebacks, and stall waits.
+
+---
+
+## Pipeline Parallelism
+
+> **Full guide: [docs/pipeline_parallel.md](docs/pipeline_parallel.md)** — torch.export gotchas, manual splitting, tuple/pre-diced inputs, mixed precision, grad-bypass, schedules, profiling, and numerics.
+
+Single-process pipeline parallelism for a single node of plain PCIe GPUs. Each stage runs on its own GPU driven by one worker thread; activations and gradients are relayed between stages through lightweight thread-safe handoffs (one mailbox per pipeline edge × microbatch, with a CUDA-event handshake).
+
+### Schedules
+
+| Schedule | Bubble | Peak in-flight activations | Notes |
+|---|---|---|---|
+| `staggered_1b1f` (default) | **lowest** | ~`num_stages` | Backward-eager + staggered warmup; GPipe-level throughput at 1F1B-class memory. **Recommended.** |
+| `gpipe` | fill + drain | all `n_microbatches` | Simple, highest memory; correctness baseline |
+| `1f1b` | steady-state | ~`num_stages` | Textbook forward-first. **Educational only.** |
+
+`staggered_1b1f` and `1f1b` compute the *same* math, but `1f1b` forwards before backwarding, leaving a large steady-state bubble — on a 10.9 GB model ~50% GPU utilization vs ~92-98% for `staggered_1b1f`. Execution order matters. Compare them with `python -m ramtorch.schedule_simulator`.
+
+### Auto-split & heterogeneous GPUs
+
+Stages are balanced by parameter count by default. For GPUs of different speed, weight the split so faster GPUs take more layers:
+
+```python
+pipe = PipelineModel(model, example, devices=["cuda:0", "cuda:1"],
+                     device_weights=[2.0, 1.0])   # cuda:0 is ~2x faster
+```
+
+Or pass an explicit `split_spec` for full manual control over where the model is cut.
+
+### Mixed precision, tuple outputs, grad-bypass
+
+- **Mixed precision**: `PipelineModel(..., autocast="bf16")` (or `Pipeline(..., autocast=torch.bfloat16)`). Each stage worker enters autocast around forward+loss; params/grads stay fp32. bf16 training is bit-identical to a sequential autocast baseline; fp16 is inference-only.
+- **Tuple stage outputs & no-grad args**: a stage can return a tuple; non-float outputs (e.g. bool masks) are auto forward-only, and a module `out_no_grad=(i,...)` attribute marks float outputs forward-only. Backward flows only through grad-needing args.
+- **Grad-bypass**: `pipe.step(..., grad_outputs=...)` backprops a supplied `dL/dOutput` directly into the last stage, skipping `loss_fn` — for downstream-model gradients, RL advantages, custom differentiators.
 
 ### Notes & gotchas
 
-- **Batch size for inference**: the traced stages are specialized to the example microbatch's batch size. `forward()` automatically chunks larger/smaller batches and pads the final partial chunk (emitting a silence-able `PipelinePaddingWarning` when padding is used).
-- **Numerics**: microbatch gradient accumulation is *mean-of-microbatch-means*, bit-identical to sequential gradient accumulation. It differs from a single full-batch backward only by normal fp32 reduction-order noise (same as any gradient-accumulation setup).
-- **Example references**: `examples/mnist_pipeline_example.py` (simple MLP, auto-split via `PipelineModel`) and `examples/mnist_pipeline_big_transformer_manual.py` (complex transformer, manual pre-partitioned stages via `Pipeline`).
+- **Inference batch size**: traced stages specialize to the example microbatch's batch size; `forward()` chunks and pads arbitrary batches (emitting a silence-able `PipelinePaddingWarning`).
+- **Numerics**: microbatch grad accumulation is *mean-of-microbatch-means*, bit-identical to sequential grad accumulation (differs from a single full-batch backward only by normal fp32 reduction-order noise).
+- **`PipelineModel` vs `Pipeline`**: `PipelineModel` (traced auto-split) is convenient for simple models; `Pipeline(stage_modules=...)` is the recommended, robust path for real architectures.
+
+---
+
+## Which feature should I reach for?
+
+- **Model fits on one GPU but barely / OOMs** → `OffloadModel`, tune `window`/`pin` with the simulator.
+- **Model too big for one GPU, you have 2+ PCIe GPUs on one node** → `PipelineModel` (simple) or `Pipeline(stage_modules=...)` (complex). Per-GPU memory drops by ~`1/num_gpus`; combine with `OffloadModel` inside a stage if a single stage still doesn't fit.
+- **Multi-node cluster with fast interconnect** → you probably want FSDP/DeepSpeed/Megatron instead; RamTorch targets single-node PCIe.
 
 ## Performance Considerations
 
-### When to Use RamTorch
-
 **Best suited for:**
-- Large models that don't fit in GPU memory
-- Multi-GPU training where memory is the bottleneck
-- Inference scenarios with memory constraints
-- Training with limited GPU memory but abundant CPU memory and bandwidth
-- Distributed training with many parameters
+- Models that don't fit in GPU memory but fit in (or stream from) CPU RAM
+- Single-node, multi-GPU PCIe machines without NVLink
+- Training/inference with limited GPU memory but abundant CPU memory and PCIe bandwidth
 
 **Less suitable for:**
-- Small models that fit comfortably in GPU memory
-- Scenarios where CPU-GPU bandwidth is the bottleneck
-- Real-time applications requiring minimal latency
-- Single-batch inference where transfer overhead dominates
+- Small models that fit comfortably in GPU memory (offload/streaming overhead dominates)
+- Tiny/fast layers where PCIe can't keep up with compute (transfer-bound — check with the simulator)
+- Latency-critical single-batch inference
+- Multi-node clusters (use FSDP/DeepSpeed/Megatron)
 
-### Optimization Tips
-
-1. **Use Larger Batch Sizes**: Helps amortize transfer costs across more computation
-2. **Mixed Precision Training**: Combine with `torch.cuda.amp` for additional memory savings
-3. **Strategic Placement**: Use RamTorch layers for the largest components only
-4. **Gradient Checkpointing**: Combine with activation checkpointing to further reduce memory
-5. **Multi-GPU Setup**: RamTorch's shared CPU memory makes multi-GPU training particularly efficient
+**Tips:**
+1. Larger batch sizes amortize transfer costs.
+2. Use bf16 autocast for extra memory savings.
+3. For offload, tune `window`/`pin` and prefer the *compute-bound* regime (the simulator tells you).
+4. Combine activation checkpointing with offload for the deepest memory cuts.
 
 ## Architecture
 
-### CPU-Offloaded Linear Layer
-
-The core innovation of RamTorch:
-
-1. Stores parameters on CPU memory with `share_memory_()` for zero-copy sharing across processes
-2. Asynchronously transfers weights to GPU during forward pass using dedicated CUDA streams
-3. Uses CUDA events for proper stream synchronization
-4. Automatically cleans up GPU memory after computation
-
-### Memory Flow
+### Single-GPU weight streaming
 
 ```
-                    ┌─────────────────────────┐
-                    │   CPU Memory (Shared)   │
-                    │  Parameters stored once │
-                    └────────────┬────────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │                         │
-            ┌───────▼────────┐       ┌────────▼────────┐
-            │  GPU Worker 0  │       │  GPU Worker 1   │
-            │ (Async Stream) │       │ (Async Stream)  │
-            └───────┬────────┘       └────────┬────────┘
-                    │                         │
-                    │   Compute on GPU        │
-                    │                         │
-            ┌───────▼────────┐       ┌───────▼─────────┐
-            │    Result 0    │       │    Result 1     │
-            └────────────────┘       └─────────────────┘
-                    │                         │
-                    └────────────┬────────────┘
-                                 │
+                 ┌──────────────────────────────────┐
+                 │   CPU pinned memory (weights)    │
+                 └───────────────┬──────────────────┘
+                                 │ H2D (loader thread, prefetch)
                     ┌────────────▼────────────┐
-                    │   Cleanup GPU Memory    │
+                    │  GPU window (W slots)   │◄──── pinned chunks (resident)
+                    │  F0 F1 ... B(n-1) ... B0│
+                    └────────────┬────────────┘
+                                 │ D2H (writeback thread, grads)
+                    ┌────────────▼────────────┐
+                    │  CPU grad accumulators  │
                     └─────────────────────────┘
 ```
 
-### ZeRO-Style Sharding
+### Pipeline parallelism
 
 ```
-┌─────────────────────────────────────────────────────┐
-│              Model Parameters (CPU Shared)          │
-│  [P₀, P₁, P₂, P₃, P₄, P₅, P₆, P₇, P₈, P₉, ...]      │
-└─────────────────────────────────────────────────────┘
-                         │
-        ┌────────────────┼────────────────┐
-        │                │                │
-┌───────▼────────┐ ┌─────▼────────┐ ┌─────▼────────┐
-│ GPU Worker 0   │ │ GPU Worker 1 │ │ GPU Worker 2 │
-│ (CPU mem map)  │ │(CPU mem map) │ │(CPU mem map) │
-│ Optimizer for: │ │ Optimizer for│ │ Optimizer for│
-│  P₀, P₁, P₂    │ │  P₃, P₄, P₅  │ │  P₆, P₇, P₈  │
-│                │ │              │ │              │
-│ Gradients for: │ │ Gradients for│ │ Gradients for│
-│  P₀, P₁, P₂    │ │  P₃, P₄, P₅  │ │  P₆, P₇, P₈  │
-└────────────────┘ └──────────────┘ └──────────────┘
+ GPU 0        GPU 1        GPU 2        GPU 3
+┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐
+│ stage0 │─►│ stage1 │─►│ stage2 │─►│ stage3 │   activations relay ──►
+│  F B   │◄─│  F B   │◄─│  F B   │◄─│  F B   │   gradients  ◄── relay
+└────────┘  └────────┘  └────────┘  └────────┘
+ one worker thread per stage; one mailbox per (edge, microbatch)
 ```
+
+---
+
+## Legacy: ZeRO-1/2 & per-layer `ramtorch.Linear`
+
+These are kept for backward compatibility but are **no longer the focus** — for a single-node PCIe box, prefer `OffloadModel` (one GPU) and pipeline parallelism (several GPUs).
+
+### ZeRO-1 / ZeRO-2 (multi-process sharding)
+
+ZeRO-1 shards optimizer state and ZeRO-2 shards gradients across multiple **process** workers that share the same CPU parameter storage. This is a `torch.distributed` (NCCL) multi-process design — powerful, but heavier than the single-process pipeline above and really aimed at many-GPU/multi-node setups. The full example lives in `examples/`; the short version:
+
+```python
+from ramtorch import AdamW
+from ramtorch.helpers import replace_linear_with_ramtorch
+from ramtorch.zero1 import create_zero_param_groups, broadcast_zero_params
+from ramtorch.zero2 import setup_grad_sharding_hooks
+
+model = replace_linear_with_ramtorch(model, rank).to(rank)   # shared CPU storage
+param_groups = [{'params': list(model.parameters()), 'lr': 1e-3}]
+rank_groups = create_zero_param_groups(param_groups, world_size)  # ZeRO-1
+setup_grad_sharding_hooks(rank_groups, rank)                      # ZeRO-2
+optimizer = AdamW(rank_groups[rank])
+# ... train, then broadcast_zero_params(rank_groups) each step
+```
+
+### Per-layer `ramtorch.Linear` (deprecated)
+
+`ramtorch.Linear` / `CPUBouncingLinear` bounced *individual* linear layers between CPU and GPU on CUDA streams. It's **deprecated** (`DeprecationWarning` on construction): `OffloadModel` supersedes it by streaming *user-diced chunks* (you control the granularity) with a proper loader/writeback overlap engine and pinned layers. Migrate by dicing your model into chunk modules and wrapping them in `OffloadModel`.
+
 ## Contributing
 
 We welcome contributions! Please see our contributing guidelines for details.

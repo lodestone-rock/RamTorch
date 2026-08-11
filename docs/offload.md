@@ -1,0 +1,302 @@
+# Single-GPU CPU→GPU weight streaming (`OffloadModel`)
+
+Run a model that is **too big for one GPU** by keeping its weights in CPU
+pinned memory and streaming them through a small sliding GPU window — with a
+few chunks optionally pinned resident. One GPU, one process, no `torchrun`.
+
+This supersedes the per-layer stream-bouncing `ramtorch.Linear` /
+`CPUBouncingLinear`, which is **deprecated**. `OffloadModel` dices by *chunk*
+(you decide the granularity) instead of by individual `nn.Linear`, and adds a
+real loader/writeback overlap engine.
+
+> **Quickstart:** [`examples/offload_quickstart.py`](../examples/offload_quickstart.py)
+> **End-to-end training:** [`examples/mnist_offload_example.py`](../examples/mnist_offload_example.py)
+> **Full study:** [`examples/offload_vs_plain_demo.py`](../examples/offload_vs_plain_demo.py)
+> **Design simulator:** `python -m ramtorch.offload_simulator --help`
+
+---
+
+## The idea in one paragraph
+
+Weights live in CPU **pinned** memory. A **loader thread** prefetches upcoming
+chunks into a GPU window of `window` slots over a dedicated H2D stream, so the
+copy for chunk `i+1` overlaps the compute of chunk `i`. `pin` evenly-spaced
+chunks stay on the GPU permanently (they never load, never evict, easing PCIe
+traffic at the cost of their memory). Eviction is **farthest-next-use**
+(Belady — optimal, because the chunk itinerary is known in advance). Backward
+gradient writebacks return to pinned CPU accumulators over a D2H stream via a
+separate **writeback thread**.
+
+**Peak GPU weight memory ≈ `(window + pin)` chunks** — independent of how many
+chunks the model has.
+
+---
+
+## Quickstart
+
+You dice the model yourself into an ordered list of chunk modules — the same
+convention as `Pipeline(stage_modules=...)`. Chunk `i+1` consumes chunk `i`'s
+output (a single tensor). No tracing, no module surgery.
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from ramtorch import OffloadModel
+
+# 1. Dice your model into chunks (you choose the granularity).
+def make_block(d):
+    return nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+
+chunks = [make_block(1024) for _ in range(24)]   # 24 transformer-ish blocks
+
+# 2. Wrap them. Weights stream through a 2-slot GPU window; 4 stay pinned.
+model = OffloadModel(chunks, device="cuda:0",
+                     window=2,        # streaming slots (>=2 overlaps load/compute)
+                     pin=4,           # chunks pinned resident on the GPU
+                     keep_activations=True)
+
+# 3. Inference: one streamed forward.
+out = model(x)
+
+# 4. Training: step + flush + your own optimizer.
+opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+for x, y in loader:
+    res = model.step(x, targets=y, loss_fn=F.cross_entropy)
+    model.flush_grads()      # accumulated grads -> .grad
+    opt.step()
+    opt.zero_grad()
+    # (or model.zero_grad_acc() to drop the accumulators)
+
+model.close()                # stop the loader/writeback threads
+```
+
+`OffloadModel` is an `nn.Module`, so `.parameters()` / `.state_dict()` /
+`.train()` / `.eval()` work as usual.
+
+---
+
+## The three knobs
+
+| Knob | Default | What it does |
+|---|---|---|
+| `window` | `2` | Streaming slots on the GPU. `window=1` never overlaps a load with compute; `window≥2` lets the loader run ahead. Total weight memory ≈ `window + pin` chunks. |
+| `pin` | `0` | Number of **evenly-spaced** chunks pinned resident (never loaded/evicted). Eases PCIe pressure and steadies the schedule at the cost of their memory. `pin_layers=[...]` overrides with explicit indices. |
+| `keep_activations` | `False` | Backward strategy: `False` (recompute), `True` (keep), or `"checkpoint"` (see below). |
+
+### `keep_activations` — the three backward strategies
+
+* **`False` — "recompute" (default).** The training forward runs under
+  `no_grad`, caching only chunk-*boundary* activations. Backward reloads each
+  chunk and **recomputes its forward** (engine-managed per-chunk gradient
+  checkpointing). Cheapest activation memory, but every chunk's forward runs
+  twice — and stochastic chunks (dropout) would **resample** on recompute, so
+  don't use it with dropout.
+
+* **`True` — "keep".** The forward builds each chunk's autograd graph and keeps
+  its internal activations, so backward skips the recompute. **Weights still
+  stream**: the graph references stable per-chunk weight tensors whose *storage*
+  is freed on eviction (`untyped_storage().resize_(0)`, the FSDP resharding
+  trick) and refilled by the loader before that chunk's backward. Costs
+  activation memory for all chunks at once, and works with stochastic chunks.
+
+* **`"checkpoint"`.** Keep-mode plumbing, but each chunk runs under
+  non-reentrant `torch.utils.checkpoint`: internal activations are dropped at
+  forward and recomputed by *autograd* during that chunk's backward — by which
+  point the loader has refilled the weight storages. Because checkpoint
+  stashes/restores the RNG state, the recompute replays the **same** dropout
+  masks: recompute-level memory that is also dropout-safe.
+
+Measured (101M params, 12 chunks, batch 4096, window=2, RTX PRO 6000 — see
+`examples/offload_checkpoint_study.py`):
+
+| mode | step | peak GPU | dropout-safe |
+|---|---|---|---|
+| recompute | 206 ms | 674 MiB | no (resamples) |
+| keep | 139 ms | 2018 MiB | yes |
+| `"checkpoint"` | 166 ms | 674 MiB | **yes** |
+
+All three are bit-identical to a full-resident reference on deterministic
+models; with dropout, keep and `"checkpoint"` stay bit-identical while
+recompute drifts. Rule of thumb: **keep** when activations fit (fastest —
+one forward); **`"checkpoint"`** when they don't (it beat the engine's own
+recompute in the study, so it is the better tight-memory default);
+**recompute** remains the zero-graph-overhead baseline.
+
+### Selective checkpointing — mark regions in your own forward
+
+`keep_activations="checkpoint"` is all-or-nothing. To choose *which parts* of
+a chunk recompute, mark them in your forward with **`offload_checkpoint`** and
+run with `keep_activations=True` — unmarked parts keep their activations,
+marked parts are recomputed by autograd at backward:
+
+```python
+from ramtorch import OffloadModel, offload_checkpoint
+
+class Block(nn.Module):
+    def forward(self, x):
+        x = self.light(x)                         # activations kept
+        return offload_checkpoint(self.heavy, x)  # recomputed at backward
+
+model = OffloadModel(blocks, device="cuda:0", keep_activations=True)
+```
+
+Do **not** use a bare `torch.utils.checkpoint` for this — it fails with a
+device mismatch. The engine invokes chunks through `functional_call`, which
+reverts the module's params to the CPU masters when it exits, so torch
+checkpoint's backward-time recompute would read the wrong (CPU) weights.
+`offload_checkpoint` snapshots the module's *effective* tensors at forward
+time (the streamed GPU tensors, refilled by the loader before backward) and
+re-applies them for the recompute. It stashes/restores RNG like torch
+checkpoint (dropout-safe), works unchanged in a plain non-offload model, and
+is a no-op under `no_grad`.
+
+Measured on the same study config (light `d×d` kept + heavy 4x expansion
+marked): keep with no marks 2222 MiB → keep with marks **814 MiB** →
+`"checkpoint"` (everything) 702 MiB — and the marked run stays bit-identical
+to an ordinary unmarked full-resident model, dropout included.
+
+---
+
+## The optimizer sees mixed devices — use `fused=True`
+
+Streamed chunks keep their master weights (and grads) **on CPU**; pinned chunks
+keep theirs **on the GPU**. After `flush_grads()`, `.grad` lives on the same
+device as each param (in a persistent **pinned** buffer for the CPU ones).
+One `torch.optim.AdamW(fused=True)` covers both: torch groups params by
+device, so the CPU masters get the **fused CPU kernel** — a single
+multithreaded pass over host RAM at DDR bandwidth — and the pinned chunks get
+the fused CUDA kernel.
+
+```python
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
+for x, y in loader:
+    res = model.step(x, targets=y, loss_fn=F.cross_entropy)
+    model.flush_grads()   # pinned .grad buffers + residency invalidation
+    opt.step()            # fused CPU kernel for masters, fused CUDA for pinned
+    model.zero_grad_acc()
+```
+
+Why fused specifically: the default (non-fused) CPU path makes ~7 eager
+passes over params/grads/state and is ~5x slower. The fused kernel touches
+everything once (~28 B/param), so it runs at your DDR bandwidth — which also
+means **no PCIe-streaming scheme can beat it** (PCIe is 20–50 GB/s vs 100+
+GB/s DDR on workstation boards). We built and benchmarked exactly that
+scheme — a windowed GPU-streaming AdamW mirroring the OffloadModel design —
+and the fused CPU kernel won ~4x (33 ms vs 104–141 ms at 128M params). It
+survives as the **private, educational**
+`ramtorch.offload_optimizer.OffloadAdamW` (not exported): bit-identical to
+`torch.optim.AdamW`, a clean worked example of the window/stream/event
+pattern, and still the best option only in narrow cases (very low DDR
+bandwidth, CPU saturated by dataloading, or bf16 optimizer state to halve
+state RAM). `examples/offload_optimizer_check.py` runs its parity check and
+the full benchmark (streamed vs CPU foreach/fused vs legacy vs GPU-resident).
+
+Numerics footnote: the fused CPU and fused CUDA kernels round differently
+(~1e-7/step), so a streamed model and a full-resident reference updated by
+"the same" `AdamW(fused=True)` drift apart slowly — not a bug, just two
+different kernels. `offload_quickstart.py` shows how to compare bit-exactly
+anyway (mirror the per-layer optimizer device placement in the reference).
+
+With `k` accumulated `step()` calls between flushes, pass `model.flush_grads(scale=1/k)`
+for the mean (gradient accumulation).
+
+**In-place updates and residency.** Resident GPU weight copies are a cache
+over the CPU masters; they do **not** see master updates. `flush_grads()`
+invalidates the streamed chunks' residency automatically (an optimizer step
+usually follows). If you update params in place *without* going through
+`flush_grads()`, call `model.invalidate_residency()` yourself — otherwise the
+next step computes with stale weights for whichever chunks stayed resident.
+(With SGD-sized deltas this hides below fp32 noise, which is why it can go
+unnoticed; with Adam-sized steps it breaks parity immediately.)
+
+---
+
+## When offload helps (and when it doesn't)
+
+Offload trades **PCIe bandwidth** for **GPU memory**. It wins when there's
+enough per-chunk compute to hide the H2D copy behind.
+
+* **Transfer-bound regime** (tiny/fast chunks): PCIe can't keep up, compute
+  stalls on `wait L*`, and offload is *slower* than full-resident. Not worth it.
+* **Compute-bound regime** (enough FLOPs per chunk): loads hide behind compute
+  and a streamed step approaches full-resident speed **at a fraction of the
+  memory**. This is the target regime.
+
+The **`offload_simulator`** predicts which regime you're in *before* you build
+anything. Give it per-chunk costs (`tf` forward, `tb` backward, `th2d` load,
+`td2h` writeback) and sweep the window:
+
+```bash
+# sweep window 1..N, print makespan / GPU% / stall / peak-resident table
+python -m ramtorch.offload_simulator --layers 24 --tf 1.0 --tb 2.0 --th2d 0.5
+
+# one window, ASCII Gantt
+python -m ramtorch.offload_simulator --layers 24 --window 2 --pin 4 --plot gantt.png
+```
+
+`gpu%` near 100 with small `peak` means the window is hiding the loads — good.
+Large `stall` / low `gpu%` means you're transfer-bound.
+
+---
+
+## Profiling a real step
+
+`step(profile_path=...)` writes a Chrome-trace (Perfetto) JSON with compute
+spans (`F3`/`B3`), H2D loads (`L3 h2d load`), D2H writebacks, and stall waits
+(`wait L3`) — including the loader/writeback *worker-thread* spans, which stock
+kineto can't see on its own:
+
+```python
+model.step(x, targets=y, loss_fn=F.cross_entropy,
+           profile_path="offload.trace.json")
+# open at https://ui.perfetto.dev
+```
+
+`model.stats` also accumulates `{"loads": int, "acquire_wait_s": float}` — the
+total stall time is the single best signal of whether you're transfer-bound.
+
+---
+
+## Notes & gotchas
+
+* **Chunks exchange a single tensor** (like `PipelineModel._relay`). Multi-arg
+  chunks are not supported.
+* **Buffer mutations don't write back.** Buffer edits inside a chunk (e.g.
+  BatchNorm running stats) happen on the streamed GPU copy and are discarded.
+  Use eval-mode / buffer-free norms (LayerNorm is fine).
+* **Dropout**: use `keep_activations=True` or `"checkpoint"` (engine recompute
+  would resample the mask).
+* **CPU is supported** (`device="cpu"`) for tests — copies degrade to clones,
+  so it's slow but correct.
+* **`close()`** when done to join the loader/writeback threads (also called from
+  `__del__`).
+
+---
+
+## Deprecation
+
+`ramtorch.Linear` / `CPUBouncingLinear` is deprecated (`DeprecationWarning` on
+construction). It bounced *individual* linear layers on CUDA streams; the
+windowed chunk-streaming model here is strictly more general (you control the
+chunk granularity), overlaps better (dedicated H2D/D2H streams + loader/writeback
+threads), and pins hot chunks. Migrate by dicing your model into chunk modules
+and wrapping them in `OffloadModel`.
+
+---
+
+## Examples
+
+| File | What it shows |
+|---|---|
+| `offload_quickstart.py` | Minimal train + inference walkthrough (the snippet above, runnable) |
+| `mnist_offload_example.py` | Canonical end-to-end training run: dice an MLP into chunks, train on MNIST with `step()` + `flush_grads()` + `AdamW(fused=True)`, streamed eval, checkpoint, peak-memory + stall report. `--backward {recompute,keep,checkpoint}` picks the strategy; `--selective` marks each block's FF with `offload_checkpoint` |
+| `offload_vs_plain_demo.py` | Side-by-side vs a full-resident model: 100-step SGD **bit-identity**, wall-time + peak-memory table, Perfetto traces, transfer- vs compute-bound regimes |
+| `offload_streaming_check.py` | Streaming executor vs full-resident reference: inference + training loss/grad parity across all three backward modes (CPU always, CUDA when available) |
+| `offload_checkpoint_study.py` | The three backward strategies head to head: bit-parity (incl. dropout, where recompute's drift is shown) + the memory/time table above + selective `offload_checkpoint` marks |
+| `offload_optimizer_check.py` | The private/educational streamed `OffloadAdamW` vs `torch.optim.AdamW`: trajectory bit-identity + the optimizer-step benchmark showing why `fused=True` CPU AdamW is the recommendation |
+| `offload_pinning_study.py` | `pin` vs bigger `window` at equal memory — which reduces stalls more |
+| `offload_warmup_study.py` | Preload ("warmup") phase vs greedy start across load/compute ratios |
+| `offload_sim_check.py` | `offload_simulator` invariants + agreement with the real executor |
+
+(`vshape_schedule_check.py` belongs to the *pipeline* schedules, not offload — see `docs/pipeline_parallel.md`.)

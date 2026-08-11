@@ -1,6 +1,14 @@
 """
 CPU Linear Module
 
+.. deprecated::
+    ``CPUBouncingLinear`` / ``ramtorch.Linear`` is deprecated. Use
+    :class:`ramtorch.offload.OffloadModel` instead: dice your model into
+    chunk modules (the same convention as ``Pipeline(stage_modules=...)``)
+    and stream them through a sliding GPU window with optional pinned
+    layers. The per-layer CUDA-stream bouncing pattern below is kept only
+    for backward compatibility and should not be used as a reference.
+
 A memory-efficient linear layer implementation that keeps parameters on CPU
 and transfers them to GPU on-demand using asynchronous CUDA streams.
 
@@ -8,6 +16,8 @@ This approach interleave compute and data transfer, making it useful for:
 - Very large models that don't fit in GPU memory
 - Scenarios where GPU memory is limited but CPU memory is abundant
 """
+
+import warnings
 
 import torch
 import torch.nn as nn
@@ -488,6 +498,14 @@ class CPUBouncingLinear(nn.Module):
             share_memory_() enables efficient sharing in multiprocessing contexts.
         """
         super().__init__()
+        warnings.warn(
+            "CPUBouncingLinear (ramtorch.Linear) is deprecated: use "
+            "ramtorch.offload.OffloadModel, which streams user-diced model "
+            "chunks through a sliding GPU window (with optional pinned "
+            "layers) instead of bouncing individual linear layers.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.in_features = in_features
         self.out_features = out_features
         self.device = device

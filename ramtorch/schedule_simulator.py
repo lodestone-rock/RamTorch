@@ -30,9 +30,11 @@ Usage:
     python -m ramtorch.schedule_simulator                 # built-in comparisons
     python -m ramtorch.schedule_simulator --p 4 --m 8 --tf 1 --tb 2
     python -m ramtorch.schedule_simulator --p 4 --m 8 --v 4 --comm 0.1  # interleaved
+    python -m ramtorch.schedule_simulator --p 4 --m 8 --vshape           # V-shape echo
     # importable:
     from ramtorch.schedule_simulator import simulate, gpipe_ops, onef1b_ops, \
-        staggered_1f1b_ops, interleaved_1b1f_ops, fwd_grouped_ops, plot_gantt
+        staggered_1f1b_ops, interleaved_1b1f_ops, vshape_1f1b_ops, \
+        fwd_grouped_ops, plot_gantt
 """
 
 from __future__ import annotations
@@ -256,6 +258,91 @@ def interleaved_1b1f_ops(p: int, m: int, v: int, group: Optional[int] = None) ->
     return ops
 
 
+def vshape_1f1b_ops(p: int, m: int) -> RankOps:
+    """
+    V-shape ("echo" / wave) interleaved 1F1B with v=2 chunks per stage.
+
+    Chunk 0 descends the pipeline (vr = s) and the echo chunk folds back UP
+    (vr = 2p-1-s), so stage 0 hosts both the first and the LAST virtual rank:
+    the loss is computed on stage 0 and its backward departs immediately,
+    instead of first draining to stage p-1. The two turnaround hops
+    (vr p-1 -> p on the last stage, and forward -> backward on stage 0) are
+    same-device, so they pay no comm — simulate with ``placement="vshape"``.
+
+    Reading of the four op streams per stage:
+
+        F(mb, 0)  "f"   forward, descending s0 -> s(p-1)
+        F(mb, 1)  "fi"  forward echoing back up s(p-1) -> s0
+        B(mb, 1)  "b"   backward of the echo chunk, descending s0 -> s(p-1)
+        B(mb, 0)  "bi"  backward of chunk 0, echoing back up s(p-1) -> s0
+
+    The list is built by a deterministic unit-cost greedy that reproduces the
+    hand-scheduled wave pattern: each slot, a stage runs a backward unless its
+    previous op was a backward (1F1B alternation), falls back to the other
+    direction when the preferred one has nothing ready, and takes the oldest
+    ready microbatch first. This yields warmups of 2(p-1-s)+1 chunk-0 forwards
+    on stage s and a steady state cycling b, f, bi, fi.
+    """
+    if p < 1 or m < 1:
+        raise ValueError("p and m must be positive")
+
+    def vr_of(s: int, chunk: int) -> int:
+        return chunk * p + (s if chunk == 0 else p - 1 - s)
+
+    last_vr = 2 * p - 1
+    done: Dict[Tuple[str, int, int], int] = {}  # (kind, vr, mb) -> finish slot
+    rem_f = [{(mb, c) for mb in range(m) for c in (0, 1)} for _ in range(p)]
+    rem_b = [{(mb, c) for mb in range(m) for c in (0, 1)} for _ in range(p)]
+    ops: RankOps = [[] for _ in range(p)]
+    last_was_bwd = [False] * p
+
+    def f_ready(s: int, mb: int, c: int, t: int) -> bool:
+        vr = vr_of(s, c)
+        return vr == 0 or done.get(("F", vr - 1, mb), t) < t
+
+    def b_ready(s: int, mb: int, c: int, t: int) -> bool:
+        vr = vr_of(s, c)
+        dep = ("F", vr, mb) if vr == last_vr else ("B", vr + 1, mb)
+        return done.get(dep, t) < t
+
+    t = 0
+    remaining = 4 * p * m
+    while remaining:
+        finished: List[Tuple[str, int, int]] = []
+        for s in range(p):
+            fwd = sorted((mb, c) for (mb, c) in rem_f[s] if f_ready(s, mb, c, t))
+            bwd = sorted(
+                ((mb, c) for (mb, c) in rem_b[s] if b_ready(s, mb, c, t)),
+                key=lambda x: (x[0], -x[1]),  # oldest mb; echo chunk drains first
+            )
+            if bwd and not last_was_bwd[s]:
+                kind, (mb, c) = "B", bwd[0]
+            elif fwd:
+                kind, (mb, c) = "F", fwd[0]
+            elif bwd:
+                kind, (mb, c) = "B", bwd[0]
+            else:
+                continue  # idle slot on this stage
+            if kind == "F":
+                rem_f[s].remove((mb, c))
+            else:
+                rem_b[s].remove((mb, c))
+                if s == 0 and c == 1:
+                    ops[s].append(("W", mb, c))  # loss marker on the last vr
+            ops[s].append((kind, mb, c))
+            finished.append((kind, vr_of(s, c), mb))
+            last_was_bwd[s] = kind == "B"
+        if not finished:
+            raise RuntimeError(
+                f"vshape_1f1b_ops deadlocked at slot {t} (p={p}, m={m}) — bug"
+            )
+        for key in finished:
+            done[key] = t  # visible from slot t+1
+        remaining -= len(finished)
+        t += 1
+    return ops
+
+
 # ── Simulator ─────────────────────────────────────────────────────────────────
 
 class Result:
@@ -317,13 +404,22 @@ def simulate(
     tf: float = 1.0,
     tb: float = 1.0,
     comm: float = 0.0,
+    placement: str = "roundrobin",
 ) -> Result:
     """
     Compute the ideal (start, end) span of every op via fixed-point iteration.
 
     Each op may be ("F"|"B"|"W", mb) or ("F"|"B"|"W", mb, chunk). The virtual
-    rank of an op is vr = chunk*p + s; the logical pipeline is a chain of
-    virtual ranks 0..p*v-1 (v = number of chunks). Deps flow along vr:
+    rank of an op depends on ``placement``:
+
+      * ``"roundrobin"`` (Megatron-style): vr = chunk*p + s. Chunk c of every
+        stage forms a contiguous band of virtual ranks.
+      * ``"vshape"`` (wave/echo): even chunks descend the pipeline
+        (vr = chunk*p + s), odd chunks fold back UP (vr = chunk*p + (p-1-s)).
+        With v=2 this puts the last virtual rank — and the loss — on stage 0.
+
+    The logical pipeline is a chain of virtual ranks 0..p*v-1 (v = number of
+    chunks). Deps flow along vr:
 
     start(s, i) = max(end of op i-1 on stage s, deps_ready)
       deps_ready(F) = end(F at vr-1)            (0 for vr 0)
@@ -331,12 +427,20 @@ def simulate(
       deps_ready(W) = end(F at vr)
     end = start + (tf if F else tb if B else 0)
 
-    A dep crossing between two virtual ranks always crosses a physical device
-    boundary (consecutive virtual ranks live on different devices), so `comm`
-    is added to dep_ready for every cross-vr hop. This models the extra
-    communication interleaving pays for its smaller bubble.
+    ``comm`` is added to dep_ready only when the dependency lives on a
+    *different physical stage*. Under round-robin every cross-vr hop crosses a
+    device; under vshape the turnaround hops (vr p-1 -> p on the last stage,
+    and the forward->backward turn on stage 0) are same-device and free.
     """
     p = len(rank_ops)
+    if placement not in ("roundrobin", "vshape"):
+        raise ValueError(f"placement must be 'roundrobin' or 'vshape', got {placement!r}")
+
+    def vr_of(s: int, chunk: int) -> int:
+        if placement == "roundrobin" or chunk % 2 == 0:
+            return chunk * p + s
+        return chunk * p + (p - 1 - s)  # odd chunk echoes back up
+
     # normalize every op to (kind, mb, chunk) up front
     norm_ops: List[List[Tuple[str, int, int]]] = [
         [_norm_op(op) for op in ops] for ops in rank_ops
@@ -345,7 +449,7 @@ def simulate(
     max_vr = -1
     for s, ops in enumerate(norm_ops):
         for _, _, chunk in ops:
-            max_vr = max(max_vr, chunk * p + s)
+            max_vr = max(max_vr, vr_of(s, chunk))
     v = (max_vr + p) // p if max_vr >= 0 else 1  # chunks (>=1)
 
     # index of each (kind, vr, mb) within its physical stage's list
@@ -353,7 +457,7 @@ def simulate(
     for s, ops in enumerate(norm_ops):
         d = {}
         for i, (k, mb, chunk) in enumerate(ops):
-            d[(k, chunk * p + s, mb)] = i
+            d[(k, vr_of(s, chunk), mb)] = i
         pos.append(d)
 
     # locate an op on any stage by (kind, vr, mb) -> (stage, index)
@@ -372,30 +476,37 @@ def simulate(
             return None
         return end[loc[0]][loc[1]]
 
+    def _dep_end(kind: str, vr: int, mb: int, s: int) -> Optional[float]:
+        """End time of a dependency; pays ``comm`` only across physical stages."""
+        loc = owner.get((kind, vr, mb))
+        if loc is None:
+            return None
+        e = end[loc[0]][loc[1]]
+        if e is None:
+            return None
+        return e if loc[0] == s else e + comm
+
     def dep_ready(s: int, i: int) -> float:
         kind, mb, chunk = norm_ops[s][i]
-        vr = chunk * p + s
+        vr = vr_of(s, chunk)
         if kind == "F":
             if vr == 0:
                 return 0.0
-            e = _end_of("F", vr - 1, mb)
-            return (e + comm) if e is not None else 0.0
-        if kind == "W":
-            e = _end_of("F", vr, mb)
-            return e if e is not None else 0.0
-        # B
-        if vr == last_vr:
-            e = _end_of("F", vr, mb)
-            return e if e is not None else 0.0
-        e = _end_of("B", vr + 1, mb)
-        return (e + comm) if e is not None else 0.0
+            e = _dep_end("F", vr - 1, mb, s)
+        elif kind == "W":
+            e = _dep_end("F", vr, mb, s)
+        elif vr == last_vr:  # B on the last virtual rank waits on its own F (loss)
+            e = _dep_end("F", vr, mb, s)
+        else:
+            e = _dep_end("B", vr + 1, mb, s)
+        return e if e is not None else 0.0
 
     dur = {"F": tf / v, "B": tb / v, "W": 0.0}
 
     # Fixed-point: an op is "computable" when all the end-times it reads are set.
     def computable(s: int, i: int) -> bool:
         kind, mb, chunk = norm_ops[s][i]
-        vr = chunk * p + s
+        vr = vr_of(s, chunk)
         if i > 0 and end[s][i - 1] is None:
             return False
         if kind == "F":
@@ -583,6 +694,8 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=100, help="gantt width (cols)")
     ap.add_argument("--v", type=int, default=1,
                     help="virtual chunks per stage for interleaved_1b1f (>1 enables it)")
+    ap.add_argument("--vshape", action="store_true",
+                    help="also simulate the V-shape (echo) interleaved 1F1B (v=2)")
     ap.add_argument("--comm", type=float, default=0.0,
                     help="per-hop comm cost added to every cross-virtual-rank dependency")
     ap.add_argument("--group", type=int, default=0,
@@ -597,19 +710,21 @@ def main() -> int:
     serial = m * p * (tf + tb)
     print(f"p={p} stages, m={m} microbatches, tf={tf}, tb={tb}  (serial={serial:.0f})\n")
 
-    schedules: List[Tuple[str, RankOps]] = [
-        ("gpipe", gpipe_ops(p, m)),
-        ("1b1f", staggered_1f1b_ops(p, m)),
+    schedules: List[Tuple[str, RankOps, str]] = [
+        ("gpipe", gpipe_ops(p, m), "roundrobin"),
+        ("1b1f", staggered_1f1b_ops(p, m), "roundrobin"),
     ]
     if args.v > 1:
-        schedules.append((f"ilv{args.v}", interleaved_1b1f_ops(p, m, args.v)))
+        schedules.append((f"ilv{args.v}", interleaved_1b1f_ops(p, m, args.v), "roundrobin"))
+    if args.vshape:
+        schedules.append(("vshape2", vshape_1f1b_ops(p, m), "vshape"))
     if args.group > 0:
         w = args.warmup if args.warmup > 0 else p - 1
-        schedules.append((f"grp{args.group}/w{w}", fwd_grouped_ops(p, m, w, args.group)))
+        schedules.append((f"grp{args.group}/w{w}", fwd_grouped_ops(p, m, w, args.group), "roundrobin"))
 
     results: List[Tuple[str, Result]] = []
-    for name, ops in schedules:
-        res = simulate(ops, tf=tf, tb=tb, comm=args.comm)
+    for name, ops, placement in schedules:
+        res = simulate(ops, tf=tf, tb=tb, comm=args.comm, placement=placement)
         results.append((name, res))
 
     # gpipe is always the first schedule; use it as the relative-speedup baseline
