@@ -138,6 +138,15 @@ _NVME_WARNING = f"""
 !!    enough to wear out a consumer SSD (rated only a few hundred TBW)
 !!    in months, days, or less.
 !!
+!!  THIS TIER IS A LAST RESORT. Be wise — it is almost certainly not
+!!  worth it. Go back before it's too late. Before you burn write
+!!  cycles, try EVERY alternative first:
+!!    * buy/borrow more RAM (it is cheaper than the drive you'll kill),
+!!    * shrink the model, quantize, or reduce the pinned/window sizes,
+!!    * rent a bigger machine for the training run.
+!!  If none of those are possible and you still proceed, you are
+!!  knowingly trading an SSD's lifespan for this run.
+!!
 !!  By running this as a sudoer with {_NVME_ACK_ENV}=1 you
 !!  acknowledged that YOU are responsible for any drive wear or
 !!  failure this causes.
