@@ -115,13 +115,16 @@ __all__ = ["OffloadModel", "OffloadStepResult", "offload_checkpoint"]
 
 _INF = float("inf")
 
-# The NVMe tier is gated behind an explicit opt-in because TRAINING with it
+# TRAINING with the NVMe tier is gated behind an explicit opt-in because it
 # rewrites the on-disk masters every optimizer step and can wear out a
-# consumer SSD (see docs/offload.md, "Drive-endurance caution"). Unlocking
-# requires BOTH: (1) the user is a sudoer (root, or a member of the
-# sudo/wheel group — the machine's owner class, who can replace the drive),
-# and (2) RAMTORCH_NVME_ACKNOWLEDGE=1 is set. The obnoxious warning prints
-# on every use unless RAMTORCH_NVME_QUIET=1 is also set.
+# consumer SSD (see docs/offload.md, "Drive-endurance caution"). The gate
+# fires on the first step() of a model with nvme chunks — NOT at
+# construction, and never for inference-only use (forward() writes the
+# scratch file once and only reads afterwards, which is harmless).
+# Unlocking requires BOTH: (1) the user is a sudoer (root, or a member of
+# the sudo/wheel group — the machine's owner class, who can replace the
+# drive), and (2) RAMTORCH_NVME_ACKNOWLEDGE=1 is set. The obnoxious warning
+# prints unless RAMTORCH_NVME_QUIET=1 is also set.
 _NVME_ACK_ENV = "RAMTORCH_NVME_ACKNOWLEDGE"
 _NVME_QUIET_ENV = "RAMTORCH_NVME_QUIET"
 
@@ -129,9 +132,11 @@ _NVME_WARNING = f"""
 {'!' * 78}
 !!  RamTorch NVMe weight tier — SSD WEAR WARNING
 !!
-!!  You are storing model master weights on an NVMe scratch file.
+!!  You are about to TRAIN with model master weights on an NVMe
+!!  scratch file.
 !!
-!!  * INFERENCE is fine: the file is written once, then only read.
+!!  * INFERENCE is fine (and never shows this warning): the file is
+!!    written once, then only read.
 !!  * TRAINING REWRITES EVERY NVMe-RESIDENT MASTER ON EVERY OPTIMIZER
 !!    STEP. Sustained training can write TERABYTES PER DAY — a big model
 !!    (FLUX-scale, tens of GB on disk) can reach PETABYTES PER DAY —
@@ -154,8 +159,8 @@ _NVME_WARNING = f"""
 !!  Mitigations: keep the tier small and cold-only, use a high-endurance
 !!  (enterprise/DWPD-rated) or sacrificial drive, monitor SMART counters.
 !!
-!!  This warning prints on every run. Set {_NVME_QUIET_ENV}=1 to silence
-!!  it (the tier stays unlocked while {_NVME_ACK_ENV}=1).
+!!  This warning prints on every training run. Set {_NVME_QUIET_ENV}=1
+!!  to silence it (the tier stays unlocked while {_NVME_ACK_ENV}=1).
 {'!' * 78}
 """
 
@@ -185,24 +190,31 @@ def _is_sudoer() -> bool:
 
 
 def _check_nvme_unlocked() -> None:
-    """Gate the NVMe tier: sudoer-only, behind an env-var acknowledgment."""
+    """Gate TRAINING on the NVMe tier: sudoer-only, env-var acknowledgment.
+
+    Called from the first ``step()`` of a model with nvme chunks. Inference
+    (``forward()``) never triggers it — the scratch file is written once at
+    construction and only read afterwards, which doesn't wear the drive.
+    """
     if not _is_sudoer():
         raise RuntimeError(
-            "The OffloadModel NVMe tier is restricted to sudoers (root or "
-            "sudo/wheel group members). Training with on-disk master weights "
-            "rewrites them every optimizer step and can physically wear out "
-            "the SSD — the decision to risk a drive belongs to whoever owns "
-            "the machine. Ask a sudoer to run it. See docs/offload.md, "
-            "'Drive-endurance caution'."
+            "TRAINING with the OffloadModel NVMe tier is restricted to "
+            "sudoers (root or sudo/wheel group members). It rewrites the "
+            "on-disk master weights every optimizer step and can physically "
+            "wear out the SSD — the decision to risk a drive belongs to "
+            "whoever owns the machine. Ask a sudoer to run it, or use the "
+            "model for inference only (forward() is not gated). See "
+            "docs/offload.md, 'Drive-endurance caution'."
         )
     if os.environ.get(_NVME_ACK_ENV) != "1":
         raise RuntimeError(
-            "The OffloadModel NVMe tier is LOCKED. Training with on-disk "
-            "master weights rewrites them every optimizer step and can wear "
+            "TRAINING with the OffloadModel NVMe tier is LOCKED. It rewrites "
+            "the on-disk master weights every optimizer step and can wear "
             "out an SSD (consumer drives are rated for only a few hundred "
-            "TBW; a FLUX-scale model can write PETABYTES per day). If you "
-            "understand this and accept responsibility for any drive wear, "
-            f"set the environment variable {_NVME_ACK_ENV}=1 and retry. See "
+            "TBW; a FLUX-scale model can write PETABYTES per day). "
+            "Inference (forward()) is not gated. If you must train this way "
+            "and accept responsibility for any drive wear, set the "
+            f"environment variable {_NVME_ACK_ENV}=1 and retry. See "
             "docs/offload.md, 'Drive-endurance caution'."
         )
     if os.environ.get(_NVME_QUIET_ENV) != "1":
@@ -367,6 +379,10 @@ class OffloadModel(nn.Module):
                  on the loader thread ("slower H2D"). Saves CPU RAM at the
                  cost of load latency for those chunks. Optimizer steps
                  update the mapped masters in place (page-cache write-back).
+                 Inference is ungated; TRAINING (the first :meth:`step`)
+                 requires the sudoer + RAMTORCH_NVME_ACKNOWLEDGE=1 consent
+                 gate because it rewrites the on-disk masters every
+                 optimizer step (SSD wear — see docs/offload.md).
     nvme_layers: explicit chunk indices for the NVMe tier (overrides
                  ``nvme``).
     nvme_path  : path of the scratch weights file, REQUIRED when the NVMe
@@ -454,8 +470,9 @@ class OffloadModel(nn.Module):
                 "nvme_path is required when nvme chunks are requested; give "
                 "a file path on the actual drive (NOT /tmp — often tmpfs)"
             )
-        if nvme_idx:
-            _check_nvme_unlocked()
+        # training-only consent gate: checked at the first step(), not here —
+        # inference with nvme masters is read-only after the initial write
+        self._nvme_gate_passed = False
         self.nvme_layers = nvme_idx
 
         # register chunks so .parameters()/.state_dict() work
@@ -885,6 +902,9 @@ class OffloadModel(nn.Module):
                 "grad_outputs and loss_fn are mutually exclusive: grad "
                 "bypass skips the loss computation entirely"
             )
+        if self.nvme_layers and not self._nvme_gate_passed:
+            _check_nvme_unlocked()  # training-only; forward() never gates
+            self._nvme_gate_passed = True
         loss_fn = loss_fn or (lambda out, _: out.sum())
         target = targets.to(self.device) if targets is not None else None
 
