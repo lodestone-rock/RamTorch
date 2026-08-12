@@ -155,6 +155,14 @@ def main() -> int:
         )
         print(f"--nvme without --nvme-path: using {default}")
         args.nvme_path = default
+    if args.nvme > 0 and os.environ.get("RAMTORCH_NVME_ACKNOWLEDGE") != "1":
+        ap.error(
+            "--nvme is locked: training with on-disk masters rewrites them "
+            "every optimizer step and can wear out an SSD. If you accept "
+            "responsibility for drive wear, re-run with "
+            "RAMTORCH_NVME_ACKNOWLEDGE=1 (see docs/offload.md, "
+            "'Drive-endurance caution')."
+        )
 
     torch.manual_seed(args.seed)
     dev = torch.device(args.device)

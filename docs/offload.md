@@ -210,6 +210,13 @@ model = OffloadModel(chunks, device="cuda:0", window=2, pin=4,
                      nvme_path="/mnt/nvme/scratch/weights.bin")
 ```
 
+> **🔒 This tier is locked behind an environment variable.** Requesting NVMe
+> chunks raises `RuntimeError` unless you first set
+> `RAMTORCH_NVME_ACKNOWLEDGE=1` — an explicit consent that you understand the
+> drive-wear risk described below. Unlocked, it also prints a loud wear
+> warning on every construction; set `RAMTORCH_NVME_QUIET=1` as well to
+> silence it. (Yes, two variables — that's deliberate.)
+
 * **Pure PyTorch, no GDS.** The selected chunks' weights move into one
   page-aligned scratch file, held as **mmap-backed tensors**
   (`torch.UntypedStorage.from_file`, exposed via `ramtorch.NvmeTensorStore`).
@@ -239,6 +246,7 @@ model = OffloadModel(chunks, device="cuda:0", window=2, pin=4,
 
 ### ⚠️ Drive-endurance caution: prefer this tier for inference, not training
 
+**This is why the tier requires `RAMTORCH_NVME_ACKNOWLEDGE=1` (see above).**
 NAND flash wears out — consumer NVMe drives are typically rated for only a
 few hundred TB written (TBW). How the two workloads differ:
 
@@ -248,9 +256,11 @@ few hundred TB written (TBW). How the two workloads differ:
 * **Training can trash a drive.** Every optimizer step rewrites every NVMe
   master in place, and the kernel's page-cache writeback turns that into real
   device writes. A 10 GiB NVMe tier at 2 steps/s is ~70 GB written per hour,
-  **~1.7 TB/day** — enough to burn through a consumer drive's TBW rating in
-  months, and sustained write pressure also hurts the drive's read latency
-  (which your loads depend on).
+  **~1.7 TB/day**; a big model (FLUX-scale, tens of GB on the tier) at
+  training throughput reaches **petabytes per day** — enough to burn through
+  a consumer drive's TBW rating in months, days, or less, and sustained
+  write pressure also hurts the drive's read latency (which your loads
+  depend on).
 
 If you do train with the NVMe tier:
 

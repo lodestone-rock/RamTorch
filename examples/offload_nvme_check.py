@@ -23,6 +23,11 @@ import copy
 import os
 import sys
 
+# Test harness: unlock the NVMe tier and silence the wear warning (the
+# tensors here are tiny; the warning targets real training runs).
+os.environ.setdefault("RAMTORCH_NVME_ACKNOWLEDGE", "1")
+os.environ.setdefault("RAMTORCH_NVME_QUIET", "1")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

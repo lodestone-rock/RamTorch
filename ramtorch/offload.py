@@ -95,6 +95,7 @@ Notes
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -111,6 +112,54 @@ from .offload_simulator import evenly_pinned, interleaved_nvme
 __all__ = ["OffloadModel", "OffloadStepResult", "offload_checkpoint"]
 
 _INF = float("inf")
+
+# The NVMe tier is gated behind an explicit opt-in because TRAINING with it
+# rewrites the on-disk masters every optimizer step and can wear out a
+# consumer SSD (see docs/offload.md, "Drive-endurance caution"). Set
+# RAMTORCH_NVME_ACKNOWLEDGE=1 to unlock; the obnoxious warning prints on
+# every use unless RAMTORCH_NVME_QUIET=1 is also set.
+_NVME_ACK_ENV = "RAMTORCH_NVME_ACKNOWLEDGE"
+_NVME_QUIET_ENV = "RAMTORCH_NVME_QUIET"
+
+_NVME_WARNING = f"""
+{'!' * 78}
+!!  RamTorch NVMe weight tier — SSD WEAR WARNING
+!!
+!!  You are storing model master weights on an NVMe scratch file.
+!!
+!!  * INFERENCE is fine: the file is written once, then only read.
+!!  * TRAINING REWRITES EVERY NVMe-RESIDENT MASTER ON EVERY OPTIMIZER
+!!    STEP. Sustained training can write TERABYTES PER DAY — a big model
+!!    (FLUX-scale, tens of GB on disk) can reach PETABYTES PER DAY —
+!!    enough to wear out a consumer SSD (rated only a few hundred TBW)
+!!    in months, days, or less.
+!!
+!!  By setting {_NVME_ACK_ENV}=1 you acknowledged that YOU are
+!!  responsible for any drive wear or failure this causes.
+!!
+!!  Mitigations: keep the tier small and cold-only, use a high-endurance
+!!  (enterprise/DWPD-rated) or sacrificial drive, monitor SMART counters.
+!!
+!!  This warning prints on every run. Set {_NVME_QUIET_ENV}=1 to silence
+!!  it (the tier stays unlocked while {_NVME_ACK_ENV}=1).
+{'!' * 78}
+"""
+
+
+def _check_nvme_unlocked() -> None:
+    """Gate the NVMe tier behind an explicit env-var acknowledgment."""
+    if os.environ.get(_NVME_ACK_ENV) != "1":
+        raise RuntimeError(
+            "The OffloadModel NVMe tier is LOCKED. Training with on-disk "
+            "master weights rewrites them every optimizer step and can wear "
+            "out an SSD (consumer drives are rated for only a few hundred "
+            "TBW). If you understand this and accept responsibility for any "
+            "drive wear, set the environment variable "
+            f"{_NVME_ACK_ENV}=1 and retry. See docs/offload.md, "
+            "'Drive-endurance caution'."
+        )
+    if os.environ.get(_NVME_QUIET_ENV) != "1":
+        print(_NVME_WARNING, flush=True)
 
 
 def offload_checkpoint(module: nn.Module, *args, **kwargs):
@@ -358,6 +407,8 @@ class OffloadModel(nn.Module):
                 "nvme_path is required when nvme chunks are requested; give "
                 "a file path on the actual drive (NOT /tmp — often tmpfs)"
             )
+        if nvme_idx:
+            _check_nvme_unlocked()
         self.nvme_layers = nvme_idx
 
         # register chunks so .parameters()/.state_dict() work
