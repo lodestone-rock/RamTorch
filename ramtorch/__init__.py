@@ -1,4 +1,4 @@
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 from .modules.linear import Linear
 from .stochastic_optimizers.adamw import AdamW

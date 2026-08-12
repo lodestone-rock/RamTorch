@@ -158,10 +158,10 @@ def main() -> int:
     if args.nvme > 0 and os.environ.get("RAMTORCH_NVME_ACKNOWLEDGE") != "1":
         ap.error(
             "--nvme is locked: training with on-disk masters rewrites them "
-            "every optimizer step and can wear out an SSD. If you accept "
-            "responsibility for drive wear, re-run with "
-            "RAMTORCH_NVME_ACKNOWLEDGE=1 (see docs/offload.md, "
-            "'Drive-endurance caution')."
+            "every optimizer step and can wear out an SSD. The tier is "
+            "sudoer-only; if you are a sudoer and accept responsibility for "
+            "drive wear, re-run with RAMTORCH_NVME_ACKNOWLEDGE=1 (see "
+            "docs/offload.md, 'Drive-endurance caution')."
         )
 
     torch.manual_seed(args.seed)

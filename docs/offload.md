@@ -210,12 +210,14 @@ model = OffloadModel(chunks, device="cuda:0", window=2, pin=4,
                      nvme_path="/mnt/nvme/scratch/weights.bin")
 ```
 
-> **🔒 This tier is locked behind an environment variable.** Requesting NVMe
-> chunks raises `RuntimeError` unless you first set
-> `RAMTORCH_NVME_ACKNOWLEDGE=1` — an explicit consent that you understand the
-> drive-wear risk described below. Unlocked, it also prints a loud wear
-> warning on every construction; set `RAMTORCH_NVME_QUIET=1` as well to
-> silence it. (Yes, two variables — that's deliberate.)
+> **🔒 This tier is locked behind a consent gate.** Requesting NVMe chunks
+> raises `RuntimeError` unless **both** hold: (1) you are a **sudoer** (root,
+> or in the `sudo`/`wheel` group — the decision to risk a drive belongs to
+> whoever owns the machine), and (2) `RAMTORCH_NVME_ACKNOWLEDGE=1` is set —
+> an explicit consent that you understand the drive-wear risk described
+> below. Unlocked, it also prints a loud wear warning on every construction;
+> set `RAMTORCH_NVME_QUIET=1` as well to silence it. (Yes, sudo + two
+> variables — that's deliberate.)
 
 * **Pure PyTorch, no GDS.** The selected chunks' weights move into one
   page-aligned scratch file, held as **mmap-backed tensors**
@@ -246,7 +248,8 @@ model = OffloadModel(chunks, device="cuda:0", window=2, pin=4,
 
 ### ⚠️ Drive-endurance caution: prefer this tier for inference, not training
 
-**This is why the tier requires `RAMTORCH_NVME_ACKNOWLEDGE=1` (see above).**
+**This is why the tier is sudoer-only and requires
+`RAMTORCH_NVME_ACKNOWLEDGE=1` (see above).**
 NAND flash wears out — consumer NVMe drives are typically rated for only a
 few hundred TB written (TBW). How the two workloads differ:
 

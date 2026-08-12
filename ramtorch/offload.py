@@ -94,8 +94,10 @@ Notes
 
 from __future__ import annotations
 
+import grp
 import json
 import os
+import pwd
 import queue
 import threading
 import time
@@ -115,9 +117,11 @@ _INF = float("inf")
 
 # The NVMe tier is gated behind an explicit opt-in because TRAINING with it
 # rewrites the on-disk masters every optimizer step and can wear out a
-# consumer SSD (see docs/offload.md, "Drive-endurance caution"). Set
-# RAMTORCH_NVME_ACKNOWLEDGE=1 to unlock; the obnoxious warning prints on
-# every use unless RAMTORCH_NVME_QUIET=1 is also set.
+# consumer SSD (see docs/offload.md, "Drive-endurance caution"). Unlocking
+# requires BOTH: (1) the user is a sudoer (root, or a member of the
+# sudo/wheel group — the machine's owner class, who can replace the drive),
+# and (2) RAMTORCH_NVME_ACKNOWLEDGE=1 is set. The obnoxious warning prints
+# on every use unless RAMTORCH_NVME_QUIET=1 is also set.
 _NVME_ACK_ENV = "RAMTORCH_NVME_ACKNOWLEDGE"
 _NVME_QUIET_ENV = "RAMTORCH_NVME_QUIET"
 
@@ -134,8 +138,9 @@ _NVME_WARNING = f"""
 !!    enough to wear out a consumer SSD (rated only a few hundred TBW)
 !!    in months, days, or less.
 !!
-!!  By setting {_NVME_ACK_ENV}=1 you acknowledged that YOU are
-!!  responsible for any drive wear or failure this causes.
+!!  By running this as a sudoer with {_NVME_ACK_ENV}=1 you
+!!  acknowledged that YOU are responsible for any drive wear or
+!!  failure this causes.
 !!
 !!  Mitigations: keep the tier small and cold-only, use a high-endurance
 !!  (enterprise/DWPD-rated) or sacrificial drive, monitor SMART counters.
@@ -146,17 +151,50 @@ _NVME_WARNING = f"""
 """
 
 
+def _is_sudoer() -> bool:
+    """True if the effective user is root or in the sudo/wheel group.
+
+    Group membership (not ``sudo -v``) so passwordless-sudo and already-
+    authenticated users are covered without prompting. Fails CLOSED: any
+    lookup error (non-POSIX host, missing groups) counts as not a sudoer.
+    """
+    try:
+        if os.geteuid() == 0:
+            return True
+        uid, gid = os.geteuid(), os.getegid()
+        name = pwd.getpwuid(uid).pw_name
+        for gname in ("sudo", "wheel"):
+            try:
+                g = grp.getgrnam(gname)
+            except KeyError:
+                continue
+            if name in g.gr_mem or g.gr_gid == gid:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _check_nvme_unlocked() -> None:
-    """Gate the NVMe tier behind an explicit env-var acknowledgment."""
+    """Gate the NVMe tier: sudoer-only, behind an env-var acknowledgment."""
+    if not _is_sudoer():
+        raise RuntimeError(
+            "The OffloadModel NVMe tier is restricted to sudoers (root or "
+            "sudo/wheel group members). Training with on-disk master weights "
+            "rewrites them every optimizer step and can physically wear out "
+            "the SSD — the decision to risk a drive belongs to whoever owns "
+            "the machine. Ask a sudoer to run it. See docs/offload.md, "
+            "'Drive-endurance caution'."
+        )
     if os.environ.get(_NVME_ACK_ENV) != "1":
         raise RuntimeError(
             "The OffloadModel NVMe tier is LOCKED. Training with on-disk "
             "master weights rewrites them every optimizer step and can wear "
             "out an SSD (consumer drives are rated for only a few hundred "
-            "TBW). If you understand this and accept responsibility for any "
-            "drive wear, set the environment variable "
-            f"{_NVME_ACK_ENV}=1 and retry. See docs/offload.md, "
-            "'Drive-endurance caution'."
+            "TBW; a FLUX-scale model can write PETABYTES per day). If you "
+            "understand this and accept responsibility for any drive wear, "
+            f"set the environment variable {_NVME_ACK_ENV}=1 and retry. See "
+            "docs/offload.md, 'Drive-endurance caution'."
         )
     if os.environ.get(_NVME_QUIET_ENV) != "1":
         print(_NVME_WARNING, flush=True)
