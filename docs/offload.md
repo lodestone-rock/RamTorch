@@ -77,6 +77,45 @@ model.close()                # stop the loader/writeback threads
 
 ---
 
+## Inference
+
+`model(x)` is a plain streamed forward — that's all there is to it:
+
+```python
+model.eval()
+logits = model(x)          # weights stream through the window as usual
+```
+
+* **Always `no_grad`.** `forward()` is decorated with `@torch.no_grad()`, so
+  inference builds no autograd graph and keeps no activations, regardless of
+  the `keep_activations` mode you trained with. Peak memory during inference
+  is just `(window + pin)` chunks of weights plus the live chunk's
+  activations.
+* **Same streaming path as training.** The loader thread prefetches upcoming
+  chunks over the H2D stream exactly as in a training forward, so the
+  transfer- vs compute-bound trade-off (and the `offload_simulator`
+  predictions) apply unchanged. There is no backward, so no D2H writeback
+  traffic — inference is the friendliest regime for offload.
+* **Tuple inputs/outputs work.** `x` may be a tensor or a tuple of tensors
+  (elements become the first chunk's positional args), and a tuple-returning
+  final chunk gives you a tuple back.
+* **Batched / repeated calls are fine.** The window persists between calls;
+  chunks still resident from the previous pass are reused (subject to
+  eviction), so back-to-back batches over the same weights skip some loads.
+  Note `flush_grads()` / `invalidate_residency()` drop that residency — call
+  them after optimizer steps, not between inference batches.
+* **Autocast works ambiently** — wrap the call in
+  `torch.autocast("cuda", dtype=torch.bfloat16)` for bf16 inference; no engine
+  support needed (all compute runs on the calling thread).
+* **`offload_checkpoint` marks are a no-op** under `no_grad`, so a model
+  annotated for selective checkpointing runs unchanged at inference.
+
+For a runnable streamed-eval loop with accuracy + peak-memory reporting, see
+`examples/mnist_offload_example.py` (its eval phase) and
+`examples/offload_quickstart.py`.
+
+---
+
 ## The three knobs
 
 | Knob | Default | What it does |
