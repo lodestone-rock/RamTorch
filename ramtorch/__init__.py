@@ -1,4 +1,4 @@
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 
 from .modules.linear import Linear
 from .stochastic_optimizers.adamw import AdamW
@@ -7,6 +7,7 @@ from .pipeline_relay import run_pipeline_relay, Pipeline
 from .pipeline_easy import PipelineModel, auto_split_spec, PipelinePaddingWarning
 from .pipeline_optimizer import PipelineOptimizer
 from .offload import OffloadModel, OffloadStepResult, offload_checkpoint
+from .nvme_store import NvmeTensorStore
 from . import schedule_simulator
 from . import offload_simulator
 
@@ -25,6 +26,7 @@ __all__ = [
     "OffloadModel",
     "OffloadStepResult",
     "offload_checkpoint",
+    "NvmeTensorStore",
     "schedule_simulator",
     "offload_simulator",
 ]

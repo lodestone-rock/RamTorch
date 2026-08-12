@@ -29,8 +29,12 @@ from torch.profiler import record_function  # just for profiling
 _DEVICE_STATE = {}
 
 
-def _get_device_state(device=torch.cuda.current_device()):
+def _get_device_state(device=None):
     """Get or initialize per-device state."""
+    if device is None:
+        # resolved lazily: a default of torch.cuda.current_device() would
+        # run at import time and break `import ramtorch` on CUDA-less hosts
+        device = torch.cuda.current_device()
     if isinstance(device, str):
         device = torch.device(device)
 
@@ -481,7 +485,7 @@ class CPUBouncingLinear(nn.Module):
         out_features,
         bias=True,
         dtype=None,
-        device=torch.cuda.current_device(),
+        device=None,
         skip_init=False,
     ):
         """
@@ -506,6 +510,10 @@ class CPUBouncingLinear(nn.Module):
             DeprecationWarning,
             stacklevel=2,
         )
+        if device is None:
+            # resolved lazily: a default of torch.cuda.current_device()
+            # would run at import time and break CUDA-less hosts
+            device = torch.cuda.current_device()
         self.in_features = in_features
         self.out_features = out_features
         self.device = device

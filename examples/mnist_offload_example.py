@@ -20,6 +20,12 @@ What it shows (the whole workflow, end to end):
   6. Report peak GPU memory vs the full-resident weight footprint, plus the
      streaming stats (loads / stall time) that tell you whether you are
      transfer-bound.
+  7. Optionally push some chunks one tier further down with --nvme K
+     --nvme-path FILE: their masters move from CPU RAM into a scratch file
+     (mmap-backed, interleaved placement) and stream disk -> pinned staging
+     -> GPU. Training works unchanged — the optimizer updates the mapped
+     masters in place. Saves host RAM for those chunks at the cost of
+     slower loads (see docs/offload.md, "The NVMe tier").
 
 The MLP here is deliberately deeper/wider than MNIST needs (default: 12
 FF blocks of Linear(512, 2048) -> GELU -> Linear(2048, 512)) so the streaming
@@ -38,11 +44,16 @@ Requirements: 1 GPU (any), torchvision for MNIST. Run:
     python examples/mnist_offload_example.py --device cuda:1 --steps 500 \
         --hidden 1024 --blocks 24 --window 2 --pin 4
     python examples/mnist_offload_example.py --device cuda:1 --selective
+    # NVMe tier: 6 chunks' masters on disk (put the file on a real drive,
+    # NOT /tmp — that is usually tmpfs, i.e. RAM)
+    python examples/mnist_offload_example.py --nvme 6 \
+        --nvme-path ./mnist_nvme_masters.bin
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 
 import torch
 import torch.nn as nn
@@ -111,6 +122,13 @@ def main() -> int:
     ap.add_argument("--blocks", type=int, default=12, help="FF chunks between head and tail")
     ap.add_argument("--window", type=int, default=2, help="GPU streaming slots")
     ap.add_argument("--pin", type=int, default=2, help="chunks pinned resident on the GPU")
+    ap.add_argument("--nvme", type=int, default=0,
+                    help="chunks whose masters live on disk instead of CPU "
+                         "RAM (interleaved placement; needs --nvme-path)")
+    ap.add_argument("--nvme-path", type=str, default="",
+                    help="scratch file for the NVMe-tier masters — put it on "
+                         "an actual drive, /tmp is usually tmpfs (RAM). "
+                         "Deleted on close")
     ap.add_argument("--backward", default="recompute",
                     choices=["recompute", "keep", "checkpoint"],
                     help="keep_activations strategy: engine recompute "
@@ -130,6 +148,13 @@ def main() -> int:
         args.backward = "keep"
     keep_activations = {"recompute": False, "keep": True,
                         "checkpoint": "checkpoint"}[args.backward]
+    if args.nvme > 0 and not args.nvme_path:
+        default = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "_mnist_nvme_masters.bin",
+        )
+        print(f"--nvme without --nvme-path: using {default}")
+        args.nvme_path = default
 
     torch.manual_seed(args.seed)
     dev = torch.device(args.device)
@@ -156,6 +181,8 @@ def main() -> int:
         device=dev,
         window=args.window,
         pin=args.pin,
+        nvme=args.nvme,
+        nvme_path=args.nvme_path or None,
         keep_activations=keep_activations,
     )
     print(f"model: {len(chunks)} chunks, {n_params / 1e6:.1f}M params "
@@ -166,6 +193,16 @@ def main() -> int:
           f"{' + selective FF marks' if args.selective else ''}")
     print(f"  -> peak GPU weight memory ~ {args.window + args.pin} of "
           f"{len(chunks)} chunks")
+    if model.nvme_layers:
+        nvme_bytes = sum(
+            p.numel() * p.element_size()
+            for i in model.nvme_layers
+            for p in model.chunks[i].parameters()
+        )
+        print(f"nvme tier: {len(model.nvme_layers)} chunks "
+              f"(layers {sorted(model.nvme_layers)}) — "
+              f"{nvme_bytes / 2**20:.0f} MiB of masters moved from CPU RAM "
+              f"to {args.nvme_path}")
 
     if is_cuda:
         torch.cuda.reset_peak_memory_stats(dev)
@@ -217,7 +254,9 @@ def main() -> int:
         print(f"peak GPU memory: {peak / 2**20:.0f} MiB incl. activations "
               f"(full-resident training needs ~{full / 2**20:.0f} MiB for "
               f"weights+grads+Adam state before activations)")
-    print(f"streaming: {model.stats['loads']} chunk loads, "
+    nvme_part = (f" ({model.stats['nvme_loads']} from the nvme tier)"
+                 if model.nvme_layers else "")
+    print(f"streaming: {model.stats['loads']} chunk loads{nvme_part}, "
           f"{model.stats['acquire_wait_s'] * 1e3:.0f} ms total stall "
           f"(large stall = transfer-bound; try more --pin, a bigger model, "
           f"or check with the offload_simulator)")

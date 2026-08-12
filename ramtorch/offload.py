@@ -12,6 +12,19 @@ farthest-next-use (Belady — optimal, since the itinerary is known). Backward
 grad writebacks return to pinned CPU accumulators over a D2H stream via a
 **writeback thread**. Total GPU weight memory ~= ``window + pin`` chunks.
 
+Optional third tier (``nvme=K`` / ``nvme_layers=...`` + ``nvme_path=``):
+masters of the selected chunks move from CPU RAM to a file on disk, held as
+mmap-backed tensors (:class:`ramtorch.nvme_store.NvmeTensorStore` — pure
+PyTorch, no GDS). The loader stages them disk -> shared pinned buffer -> GPU
+on its one thread, which is exactly the simulator's empirically validated
+"slower H2D" model (the disk->GPU host hop serializes on the H2D copy engine
+anyway — measured in ``examples/nvme_h2d_contention_test.py``). Placement
+defaults to *interleaved* among the chunks (best in simulation: slow loads
+spread out and hide behind neighboring compute). Optimizer steps update the
+mapped masters in place; the kernel writes them back to disk lazily. Grad
+accumulators for NVMe chunks still live in RAM (transient, one chunk's worth
+of overlap at a time is what matters for streaming).
+
 Model dicing follows the pipeline convention (``Pipeline(stage_modules=...)``)
 rather than module surgery: you cut your own model into an ordered list of
 chunk modules, each taking the previous chunk's output. This supersedes the
@@ -92,7 +105,8 @@ import torch.nn as nn
 import torch.utils.checkpoint
 from torch.profiler import record_function
 
-from .offload_simulator import evenly_pinned
+from .nvme_store import NvmeTensorStore
+from .offload_simulator import evenly_pinned, interleaved_nvme
 
 __all__ = ["OffloadModel", "OffloadStepResult", "offload_checkpoint"]
 
@@ -170,9 +184,13 @@ class _ChunkState:
     """Per-chunk storage: CPU master tensors, grad accumulators, staging."""
 
     def __init__(self, module: nn.Module, gpu_pinned: bool,
-                 device: torch.device, use_cuda: bool):
+                 device: torch.device, use_cuda: bool, nvme: bool = False):
         self.module = module
         self.gpu_pinned = gpu_pinned
+        # nvme masters start as plain CPU tensors here; OffloadModel rehomes
+        # them onto the file mapping right after all states are built (the
+        # store lays out every nvme chunk in one file, so it needs them all)
+        self.nvme = nvme
         self.param_names = frozenset(n for n, _ in module.named_parameters())
         # keep_activations mode: stable GPU tensor objects referenced by the
         # autograd graph; eviction frees their storage, reload refills it
@@ -194,14 +212,15 @@ class _ChunkState:
             self.staging = None
             return
 
-        # streamed chunk: master weights in CPU pinned memory
+        # streamed chunk: master weights in CPU pinned memory (nvme chunks
+        # skip the pinning — they are about to move onto the file mapping)
         for p in module.parameters():
             p.data = p.data.detach().cpu()
-            if use_cuda:
+            if use_cuda and not nvme:
                 p.data = p.data.pin_memory()
         for b in module.buffers():
             b.data = b.data.detach().cpu()
-            if use_cuda:
+            if use_cuda and not nvme:
                 b.data = b.data.pin_memory()
         self.tensors = dict(module.named_parameters()) | dict(
             module.named_buffers()
@@ -244,6 +263,20 @@ class OffloadModel(nn.Module):
                  spaced (``pin_layers`` overrides). Total weight memory is
                  ~``window + pin`` chunks.
     pin_layers : explicit chunk indices to pin (overrides ``pin``).
+    nvme       : number of chunks whose masters live on disk instead of CPU
+                 RAM, interleaved evenly among the chunks (``nvme_layers``
+                 overrides; overlaps with pinned chunks are dropped — pinned
+                 wins). Their weights are held as mmap-backed tensors in a
+                 single scratch file and stream disk -> pinned staging -> GPU
+                 on the loader thread ("slower H2D"). Saves CPU RAM at the
+                 cost of load latency for those chunks. Optimizer steps
+                 update the mapped masters in place (page-cache write-back).
+    nvme_layers: explicit chunk indices for the NVMe tier (overrides
+                 ``nvme``).
+    nvme_path  : path of the scratch weights file, REQUIRED when the NVMe
+                 tier is used. Put it on a real drive — /tmp is often tmpfs
+                 (RAM), which silently defeats the point. Deleted on
+                 :meth:`close`.
     keep_activations :
                  backward strategy for :meth:`step`.
                  ``False`` (default, "recompute"): the training forward runs
@@ -276,6 +309,9 @@ class OffloadModel(nn.Module):
         window: int = 2,
         pin: int = 0,
         pin_layers: Optional[Sequence[int]] = None,
+        nvme: int = 0,
+        nvme_layers: Optional[Sequence[int]] = None,
+        nvme_path: Optional[str] = None,
         keep_activations: Union[bool, str] = False,
     ):
         super().__init__()
@@ -310,12 +346,44 @@ class OffloadModel(nn.Module):
             pinned_idx = evenly_pinned(self.n, min(pin, self.n))
         self.pinned_layers = pinned_idx
 
+        if nvme_layers is not None:
+            nvme_idx = frozenset(int(i) for i in nvme_layers)
+            if not all(0 <= i < self.n for i in nvme_idx):
+                raise ValueError(f"nvme_layers out of range [0, {self.n})")
+        else:
+            nvme_idx = interleaved_nvme(self.n, min(nvme, self.n))
+        nvme_idx -= pinned_idx  # pinned wins (as in the simulator)
+        if nvme_idx and nvme_path is None:
+            raise ValueError(
+                "nvme_path is required when nvme chunks are requested; give "
+                "a file path on the actual drive (NOT /tmp — often tmpfs)"
+            )
+        self.nvme_layers = nvme_idx
+
         # register chunks so .parameters()/.state_dict() work
         self.chunks = nn.ModuleList(chunks)
         self._state = [
-            _ChunkState(m, i in pinned_idx, self.device, self._cuda)
+            _ChunkState(m, i in pinned_idx, self.device, self._cuda,
+                        nvme=i in nvme_idx)
             for i, m in enumerate(self.chunks)
         ]
+
+        # rehome NVMe masters onto one file mapping (frees their RAM copies)
+        self._nvme_store: Optional[NvmeTensorStore] = None
+        self._nvme_staging: Optional[torch.Tensor] = None  # loader-only
+        self._staging_ev = None       # H2D-out-of-staging completion event
+        if nvme_idx:
+            payload = {
+                f"{i}.{name}": t
+                for i in sorted(nvme_idx)
+                for name, t in self._state[i].tensors.items()
+            }
+            self._nvme_store = NvmeTensorStore(nvme_path)
+            mapped = self._nvme_store.write(payload)
+            with torch.no_grad():
+                for i in sorted(nvme_idx):
+                    for name, t in self._state[i].tensors.items():
+                        t.data = mapped[f"{i}.{name}"]
 
         # ── residency state (guarded by one condition variable) ──────────
         self._cv = threading.Condition()
@@ -331,7 +399,7 @@ class OffloadModel(nn.Module):
         self._h2d_stream = torch.cuda.Stream(self.device) if self._cuda else None
         self._d2h_stream = torch.cuda.Stream(self.device) if self._cuda else None
 
-        self.stats = {"loads": 0, "acquire_wait_s": 0.0}
+        self.stats = {"loads": 0, "nvme_loads": 0, "acquire_wait_s": 0.0}
         # (track, name, start_us, dur_us) spans from the worker threads,
         # collected only while step(profile_path=...) is active — kineto
         # cannot see record_function on threads it did not enter from
@@ -415,30 +483,70 @@ class OffloadModel(nn.Module):
                 # copy outside the lock, on the H2D stream (no_grad so the
                 # copies are plain leaves, not autograd-tracked views)
                 state = self._state[layer]
+                label = (f"N{layer} nvme load" if state.nvme
+                         else f"L{layer} h2d load")
                 t_us = time.monotonic_ns() / 1e3
-                with torch.no_grad(), record_function(f"L{layer} h2d load"):
+                with torch.no_grad(), record_function(label):
                     if self._cuda:
                         with torch.cuda.stream(self._h2d_stream):
                             gpu = self._materialize(state)
                             ev = torch.cuda.Event()
                             ev.record()
+                        if state.nvme:
+                            # staging is reused by the next nvme load; it may
+                            # be overwritten only after this H2D completes
+                            self._staging_ev = ev
                     else:
                         gpu = self._materialize(state)
                         ev = None
                 if self._span_log is not None:
                     self._span_log.append((
-                        "offload h2d loader", f"L{layer} h2d load",
+                        "offload h2d loader", label,
                         t_us, time.monotonic_ns() / 1e3 - t_us,
                     ))
                 with self._cv:
                     self._resident[layer] = _Resident(gpu, ev)
                     self._in_flight = None
                     self.stats["loads"] += 1
+                    if state.nvme:
+                        self.stats["nvme_loads"] += 1
                     self._cv.notify_all()
         except BaseException as e:  # noqa: BLE001 — propagate to compute thread
             with self._cv:
                 self._error = e
                 self._cv.notify_all()
+
+    def _stage_nvme(self, state: _ChunkState) -> Dict[str, torch.Tensor]:
+        """Copy a chunk's file-backed masters into the shared pinned staging
+        buffer; returns pinned views (loader thread only).
+
+        The ``copy_`` from the mmap tensors page-faults from disk when cold
+        (page-cache speed when hot); the caller's H2D copies out of the
+        pinned views then run at full PCIe speed. Both hops run serially on
+        the one loader thread — the simulator's "slower H2D" model.
+        """
+        align = 64  # covers every dtype's element size for .view(dtype)
+        need = 0
+        for t in state.tensors.values():
+            nb = t.numel() * t.element_size()
+            need += -(-nb // align) * align
+        if self._nvme_staging is None or self._nvme_staging.numel() < need:
+            self._nvme_staging = torch.empty(
+                need, dtype=torch.uint8, pin_memory=True
+            )
+        if self._staging_ev is not None:
+            # previous nvme chunk's H2D out of this buffer must be done
+            self._staging_ev.synchronize()
+            self._staging_ev = None
+        views: Dict[str, torch.Tensor] = {}
+        off = 0
+        for n, t in state.tensors.items():
+            nb = t.numel() * t.element_size()
+            v = self._nvme_staging[off:off + nb].view(t.dtype).view(t.shape)
+            v.copy_(t)
+            views[n] = v
+            off += -(-nb // align) * align
+        return views
 
     def _materialize(self, state: _ChunkState) -> Dict[str, torch.Tensor]:
         """Produce a chunk's device tensors (runs on the loader thread).
@@ -447,18 +555,26 @@ class OffloadModel(nn.Module):
         the blocks). Keep mode: stable tensor objects — the autograd graph
         points at them across evictions, so a reload refills the same objects'
         storage instead of allocating new ones.
+
+        NVMe chunks route their masters through the shared pinned staging
+        buffer first (disk -> pinned), so the device copies below always
+        read pinned memory.
         """
+        src = state.tensors
+        if state.nvme and self._cuda:
+            src = self._stage_nvme(state)
+
         if not self._keep_graph:
             if self._cuda:
                 return {
                     n: t.to(self.device, non_blocking=True)
-                    for n, t in state.tensors.items()
+                    for n, t in src.items()
                 }
-            return {n: t.clone() for n, t in state.tensors.items()}
+            return {n: t.clone() for n, t in src.items()}
 
         if state.graph_tensors is None:
             gt = {}
-            for n, t in state.tensors.items():
+            for n, t in src.items():
                 g = (t.to(self.device, non_blocking=True)
                      if self._cuda else t.clone())
                 if n in state.param_names:
@@ -467,7 +583,7 @@ class OffloadModel(nn.Module):
             state.graph_tensors = gt
             return gt
 
-        for n, t in state.tensors.items():
+        for n, t in src.items():
             g = state.graph_tensors[n]
             store = g.untyped_storage()
             if store.size() == 0:
@@ -1032,7 +1148,12 @@ class OffloadModel(nn.Module):
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def close(self):
-        """Stop the loader/writeback threads (idempotent)."""
+        """Stop the loader/writeback threads (idempotent).
+
+        Also unlinks the NVMe scratch file. The mapped master tensors stay
+        readable until garbage collected (POSIX unlink semantics), but the
+        file is gone — save a checkpoint first if you need the weights.
+        """
         if self._closed:
             return
         with self._cv:
@@ -1041,6 +1162,9 @@ class OffloadModel(nn.Module):
         self._wb_q.put(None)
         self._loader.join(timeout=5)
         self._writeback.join(timeout=5)
+        if self._nvme_store is not None:
+            self._nvme_store.close()
+            self._nvme_store = None
 
     def __del__(self):
         try:

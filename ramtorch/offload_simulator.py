@@ -25,6 +25,15 @@ Dependencies modeled:
     layer that is not resident, if a slot is free or a resident layer with a
     strictly farther next use can be evicted (never evicts the layer compute
     is currently running).
+  * Optional NVMe tier: layers in ``nvme`` load on the *same* H2D channel
+    but cost ``tnvme`` (> ``th2d``) per load — "slower H2D". Empirically the
+    disk->GPU path is disk -> RAM -> GPU and its second hop serializes on
+    the H2D copy engine with all other host->device traffic (measured in
+    ``examples/nvme_h2d_contention_test.py``: concurrent H2D throughputs sum
+    to the single-engine limit), so a separate parallel channel would be
+    wrong for anything but true GPUDirect Storage. Placement helpers:
+    ``interleaved_nvme`` (spread NVMe layers between CPU ones) vs
+    ``tail_nvme`` (CPU first, NVMe tail).
 
 Itineraries:
   * Training (echo): F0..F(N-1), B(N-1)..B0, repeatable for multiple steps.
@@ -42,9 +51,12 @@ Usage:
     python -m ramtorch.offload_simulator                     # window sweep table
     python -m ramtorch.offload_simulator --layers 10 --window 5 --mode train
     python -m ramtorch.offload_simulator --layers 10 --window 5 --plot out.png
+    # NVMe tier: 6 of 12 layers on NVMe, interleaved vs tail placement
+    python -m ramtorch.offload_simulator --layers 12 --window 4 --nvme 6
     # importable:
     from ramtorch.offload_simulator import (
-        train_itinerary, infer_itinerary, simulate_offload, gantt, plot_gantt)
+        train_itinerary, infer_itinerary, simulate_offload, gantt, plot_gantt,
+        interleaved_nvme, tail_nvme)
 
 Follow-up phase (not built here): once this simulator validates the design,
 implement a portable streaming executor at layer-chunk granularity — a loader
@@ -93,6 +105,26 @@ def evenly_pinned(n: int, k: int) -> FrozenSet[int]:
     return frozenset(i * n // k for i in range(k)) if k else frozenset()
 
 
+def interleaved_nvme(n: int, k: int) -> FrozenSet[int]:
+    """k evenly spaced NVMe-resident layers out of n (e.g. 6/12 ->
+    {1,3,5,7,9,11}).
+
+    Uses the *last* index of each stride so layer 0 stays CPU-resident when
+    k < n — the first load (the one compute unavoidably waits on) goes over
+    the faster H2D link.
+    """
+    if not 0 <= k <= n:
+        raise ValueError(f"need 0 <= k <= n, got k={k} n={n}")
+    return frozenset((i + 1) * n // k - 1 for i in range(k)) if k else frozenset()
+
+
+def tail_nvme(n: int, k: int) -> FrozenSet[int]:
+    """Contiguous placement: the last k of n layers on NVMe ("CPU then NVMe")."""
+    if not 0 <= k <= n:
+        raise ValueError(f"need 0 <= k <= n, got k={k} n={n}")
+    return frozenset(range(n - k, n))
+
+
 # ── Result ────────────────────────────────────────────────────────────────────
 
 class OffloadResult:
@@ -100,7 +132,8 @@ class OffloadResult:
 
     ``spans`` maps channel name -> ordered list of ``((kind, layer), (st, en))``:
       * ``"gpu"``: kind "F" or "B" (compute)
-      * ``"h2d"``: kind "L" (weight load)
+      * ``"h2d"``: kind "L" (load from CPU RAM) or "N" (slower load
+        staged from NVMe — same channel, higher cost)
       * ``"d2h"``: kind "G" (grad writeback)
 
     ``resident_at[i]`` is the frozenset of resident layers at the instant
@@ -124,13 +157,17 @@ class OffloadResult:
         n_loads: int,
         warmup: int = 0,
         pinned: FrozenSet[int] = frozenset(),
+        nvme: FrozenSet[int] = frozenset(),
+        tnvme: float = 0.0,
     ):
         self.itinerary = itinerary
         self.n_layers = n_layers
         self.window = window
         self.warmup = warmup
         self.pinned = frozenset(pinned)
+        self.nvme = frozenset(nvme)
         self.tf, self.tb, self.th2d, self.td2h = tf, tb, th2d, td2h
+        self.tnvme = tnvme
         self.spans = spans
         self.resident_at = resident_at
         self.occupancy_timeline = occupancy_timeline
@@ -171,10 +208,17 @@ class OffloadResult:
 
     @property
     def compute_bound(self) -> float:
-        """Serial compute + the first layer's load latency (0 if pinned)."""
+        """Serial compute + the first layer's load latency (0 if pinned,
+        ``tnvme`` if NVMe-resident, else ``th2d``)."""
         if not self.itinerary:
             return 0.0
-        first = 0.0 if self.itinerary[0][1] in self.pinned else self.th2d
+        l0 = self.itinerary[0][1]
+        if l0 in self.pinned:
+            first = 0.0
+        elif l0 in self.nvme:
+            first = self.tnvme
+        else:
+            first = self.th2d
         return first + self.total_compute
 
     @property
@@ -184,11 +228,15 @@ class OffloadResult:
 
     @property
     def transfer_bound(self) -> float:
-        """Each distinct unpinned layer loads at least once; writebacks serialize."""
-        distinct = len({l for _, l in self.itinerary} - self.pinned)
+        """Each distinct unpinned layer loads at least once, all on the one
+        H2D channel (NVMe loads just cost more); writebacks serialize on
+        D2H."""
+        used = {l for _, l in self.itinerary} - self.pinned
+        n_nvme = len(used & self.nvme)
+        n_cpu = len(used) - n_nvme
         nb = sum(1 for k, _ in self.itinerary if k == "B")
         d2h_total = nb * self.td2h if self.td2h > 0 else 0.0
-        return max(distinct * self.th2d, d2h_total)
+        return max(n_cpu * self.th2d + n_nvme * self.tnvme, d2h_total)
 
     @property
     def bound(self) -> float:
@@ -215,12 +263,16 @@ class OffloadResult:
             "pinned": sorted(self.pinned),
             "total_mem": self.total_mem,
             "ops": len(self.itinerary),
+            "nvme": sorted(self.nvme),
             "makespan": self.makespan,
             "stall": self.stall,
             "gpu_util": self.util("gpu"),
             "h2d_util": self.util("h2d"),
             "d2h_util": self.util("d2h"),
             "n_loads": self.n_loads,
+            "n_nvme_loads": sum(
+                1 for (k, _), _ in self.spans["h2d"] if k == "N"
+            ),
             "peak_resident": self.peak_resident,
             "compute_bound": self.compute_bound,
             "transfer_bound": self.transfer_bound,
@@ -241,6 +293,8 @@ def simulate_offload(
     td2h: float = 0.5,
     warmup: int = 0,
     pinned: Optional[FrozenSet[int]] = None,
+    nvme: Optional[FrozenSet[int]] = None,
+    tnvme: float = 2.5,
 ) -> OffloadResult:
     """Discrete-event simulation of the windowed streaming schedule.
 
@@ -260,6 +314,12 @@ def simulate_offload(
     ``pinned``: layers permanently resident on the GPU — never loaded, never
     evicted, occupying their own slots *in addition to* the ``window``
     streaming slots (total memory = ``window + len(pinned)``).
+
+    ``nvme``: layers resident on NVMe instead of CPU RAM. They load on the
+    same H2D channel but cost ``tnvme`` per load ("slower H2D") — the
+    disk->GPU path's host->device hop serializes on the H2D copy engine
+    (see ``examples/nvme_h2d_contention_test.py``). Pinned layers are
+    dropped from the set (they never load, so residency class is moot).
     """
     if window < 1:
         raise ValueError(f"window must be >= 1, got {window}")
@@ -267,6 +327,11 @@ def simulate_offload(
     for l in pinned:
         if not (0 <= l < n_layers):
             raise ValueError(f"pinned layer {l} out of range [0, {n_layers})")
+    nvme = frozenset(nvme or ())
+    for l in nvme:
+        if not (0 <= l < n_layers):
+            raise ValueError(f"nvme layer {l} out of range [0, {n_layers})")
+    nvme -= pinned
     for k, l in itinerary:
         if k not in ("F", "B"):
             raise ValueError(f"bad op kind {k!r}")
@@ -297,6 +362,12 @@ def simulate_offload(
     d2h_end = 0.0
     d2h_q: deque = deque()             # (layer, ready_time), FIFO
 
+    def load_cost(layer: int) -> float:
+        return tnvme if layer in nvme else th2d
+
+    def load_kind(layer: int) -> str:
+        return "N" if layer in nvme else "L"
+
     spans: Dict[str, List[Tuple[Tuple[str, int], Span]]] = {
         "gpu": [], "h2d": [], "d2h": []
     }
@@ -321,7 +392,7 @@ def simulate_offload(
             gpu_cur = None
         if h2d_cur is not None and h2d_end <= now + _EPS:
             layer, st = h2d_cur
-            spans["h2d"].append((("L", layer), (st, h2d_end)))
+            spans["h2d"].append(((load_kind(layer), layer), (st, h2d_end)))
             h2d_cur = None
             resident.add(layer)
             record_occ(now)
@@ -353,7 +424,8 @@ def simulate_offload(
             d2h_end = now + td2h
             progressed = True
 
-        # prefetch: earliest itinerary layer not yet resident
+        # prefetch: earliest itinerary layer not yet resident (NVMe layers
+        # ride the same channel at their higher cost)
         if h2d_cur is None:
             cand: Optional[Tuple[int, int]] = None  # (layer, needed_pos)
             for pos in range(comp_idx, n_ops):
@@ -382,7 +454,7 @@ def simulate_offload(
                         can_start = True
                 if can_start:
                     h2d_cur = (l, now)
-                    h2d_end = now + th2d
+                    h2d_end = now + load_cost(l)
                     n_loads += 1
                     record_occ(now)
                     progressed = True
@@ -418,17 +490,18 @@ def simulate_offload(
     return OffloadResult(
         itinerary, n_layers, window, tf, tb, th2d, td2h,
         spans, resident_at, occ_timeline, n_loads, warmup=warmup,
-        pinned=pinned,
+        pinned=pinned, nvme=nvme, tnvme=tnvme,
     )
 
 
 # ── ASCII Gantt ───────────────────────────────────────────────────────────────
 
-_ROW_CHAR = {"F": "F", "B": "b", "L": "L", "G": "G"}
+_ROW_CHAR = {"F": "F", "B": "b", "L": "L", "N": "N", "G": "G"}
 
 
 def gantt(res: OffloadResult, width: int = 100) -> str:
-    """Three rows (gpu / h2d / d2h); '.' = idle."""
+    """Three rows (gpu / h2d / d2h); '.' = idle. NVMe loads show as 'N' on
+    the h2d row (same channel, slower)."""
     ms = res.makespan
     if ms <= 0:
         return "(empty)"
@@ -459,8 +532,9 @@ def plot_gantt(
 ):
     """One Gantt (gpu/h2d/d2h rows) + residency strip per result.
 
-    Bars are labeled ``F3 / B3 / L3 / G3`` (op kind + layer index); the strip
-    below each Gantt steps through occupied window slots over time.
+    Bars are labeled ``F3 / B3 / L3 / N3 / G3`` (op kind + layer index);
+    NVMe loads ("N") share the h2d row in a distinct color. The strip below
+    each Gantt steps through occupied window slots over time.
     """
     import matplotlib
     if not show:
@@ -470,9 +544,11 @@ def plot_gantt(
 
     # Okabe-Ito colorblind-safe palette; the backward hatch adds a
     # color-independent cue vs the H2D loads (the confusable pair).
-    colors = {"F": "#0072B2", "B": "#E69F00", "L": "#009E73", "G": "#CC79A7"}
-    hatches = {"F": "", "B": "//", "L": "", "G": ""}
-    kind_name = {"F": "forward", "B": "backward", "L": "H2D load", "G": "D2H grad"}
+    colors = {"F": "#0072B2", "B": "#E69F00", "L": "#009E73",
+              "N": "#D55E00", "G": "#CC79A7"}
+    hatches = {"F": "", "B": "//", "L": "", "N": "", "G": ""}
+    kind_name = {"F": "forward", "B": "backward", "L": "H2D load",
+                 "N": "NVMe load", "G": "D2H grad"}
     n = len(results)
     max_ms = max((r.makespan for _, r in results), default=1.0)
     fig, axes = plt.subplots(
@@ -521,10 +597,17 @@ def plot_gantt(
         axr.grid(axis="x", alpha=0.25)
 
     axes[-1, 0].set_xlabel("time")
+    kinds_present = {
+        kind
+        for _, res in results
+        for ch in res.spans.values()
+        for (kind, _), _ in ch
+    }
     handles = [
         Patch(facecolor=c, hatch=hatches[k], edgecolor="white",
               label=kind_name[k])
         for k, c in colors.items()
+        if k in kinds_present
     ]
     axes[0, 0].legend(handles=handles, loc="upper right", fontsize=8)
     fig.suptitle("Windowed CPU->GPU offload streaming schedule", y=0.995)
@@ -578,6 +661,16 @@ def main() -> int:
     ap.add_argument("--pin", type=int, default=0,
                     help="pin this many evenly spaced layers permanently on "
                          "the GPU (adds to memory on top of the window)")
+    ap.add_argument("--nvme", type=int, default=0,
+                    help="place this many layers on NVMe; they load on the "
+                         "same H2D channel but cost --tnvme each")
+    ap.add_argument("--tnvme", type=float, default=2.5,
+                    help="NVMe load cost per layer (default 2.5 = 5x th2d)")
+    ap.add_argument("--nvme-placement",
+                    choices=("interleave", "tail", "both"), default="both",
+                    help="NVMe layer layout: interleave = evenly spread among "
+                         "CPU layers; tail = CPU first, NVMe last; "
+                         "both = compare (default)")
     ap.add_argument("--width", type=int, default=100, help="ascii gantt width")
     ap.add_argument("--plot", type=str, nargs="?", const="", default=None,
                     help="render a matplotlib Gantt; optionally give a .png path")
@@ -591,36 +684,71 @@ def main() -> int:
               pinned=evenly_pinned(n, args.pin))
     print(
         f"n={n} layers, mode={args.mode}, steps={args.steps}, "
-        f"tf={args.tf} tb={args.tb} th2d={args.th2d} td2h={args.td2h}\n"
+        f"tf={args.tf} tb={args.tb} th2d={args.th2d} td2h={args.td2h}"
+        + (f" tnvme={args.tnvme} nvme={args.nvme}" if args.nvme else "")
+        + "\n"
     )
+
+    # NVMe placements to simulate: [(label, nvme_set)]
+    if args.nvme > 0:
+        kw["tnvme"] = args.tnvme
+        placements = []
+        if args.nvme_placement in ("interleave", "both"):
+            placements.append(("interleave", interleaved_nvme(n, args.nvme)))
+        if args.nvme_placement in ("tail", "both"):
+            placements.append(("tail", tail_nvme(n, args.nvme)))
+    else:
+        placements = [("", frozenset())]
 
     if args.window > 0:
         wu = args.window if warmup < 0 else warmup
-        res = simulate_offload(itin, n, args.window, warmup=wu, **kw)
+        results = [
+            (label, simulate_offload(itin, n, args.window, warmup=wu,
+                                     nvme=nv, **kw))
+            for label, nv in placements
+        ]
         if args.json:
-            print(json.dumps(res.metrics(), indent=2))
+            payload = [r.metrics() if not lbl else {"placement": lbl,
+                                                    **r.metrics()}
+                       for lbl, r in results]
+            print(json.dumps(payload[0] if len(payload) == 1 else payload,
+                             indent=2))
         else:
-            print(report(f"W={args.window}", res, args.width))
+            for lbl, res in results:
+                tag = f"W={args.window}" + (f" {lbl}" if lbl else "")
+                print(report(tag, res, args.width))
+                if len(results) > 1:
+                    print()
         if args.plot is not None:
             out = args.plot or None
-            plot_gantt([(f"{args.mode} n={n} W={args.window}", res)],
-                       out_path=out, show=(out is None))
+            plot_gantt(
+                [(f"{args.mode} n={n} W={args.window}"
+                  + (f" nvme={args.nvme} {lbl}" if lbl else ""), res)
+                 for lbl, res in results],
+                out_path=out, show=(out is None),
+            )
         return 0
 
-    # default: comparison table across window sizes
+    # default: comparison table across window sizes (x placements if --nvme)
     rows = []
     for w in range(1, n + 1):
         wu = w if warmup < 0 else warmup
-        res = simulate_offload(itin, n, w, warmup=wu, **kw)
-        rows.append((w, res))
+        for label, nv in placements:
+            res = simulate_offload(itin, n, w, warmup=wu, nvme=nv, **kw)
+            rows.append((w, label, res))
     if args.json:
-        print(json.dumps([r.metrics() for _, r in rows], indent=2))
+        payload = [r.metrics() if not lbl else {"placement": lbl,
+                                                **r.metrics()}
+                   for _, lbl, r in rows]
+        print(json.dumps(payload, indent=2))
     else:
-        print(f"  {'W':>3}  {'makespan':>9}  {'stall':>7}  {'gpu%':>5}  "
+        plc_hdr = f"  {'placement':<11}" if args.nvme else ""
+        print(f"  {'W':>3}{plc_hdr}  {'makespan':>9}  {'stall':>7}  {'gpu%':>5}  "
               f"{'h2d%':>5}  {'d2h%':>5}  {'loads':>5}  {'peak':>4}  "
               f"{'regime':<15}  {'gap%':>5}")
-        for w, res in rows:
-            print(f"  {w:>3}  {res.makespan:>9.1f}  {res.stall:>7.1f}  "
+        for w, lbl, res in rows:
+            plc = f"  {lbl:<11}" if args.nvme else ""
+            print(f"  {w:>3}{plc}  {res.makespan:>9.1f}  {res.stall:>7.1f}  "
                   f"{100 * res.util('gpu'):>5.0f}  {100 * res.util('h2d'):>5.0f}  "
                   f"{100 * res.util('d2h'):>5.0f}  {res.n_loads:>5}  "
                   f"{res.peak_resident:>4}  {res.regime:<15}  "
@@ -628,9 +756,11 @@ def main() -> int:
     if args.plot is not None:
         out = args.plot or None
         picks = sorted({1, max(1, n // 2), n})
-        plot_gantt([(f"{args.mode} n={n} W={w}", res)
-                    for w, res in rows if w in picks],
-                   out_path=out, show=(out is None))
+        plot_gantt(
+            [(f"{args.mode} n={n} W={w}" + (f" {lbl}" if lbl else ""), res)
+             for w, lbl, res in rows if w in picks],
+            out_path=out, show=(out is None),
+        )
     return 0
 
 
