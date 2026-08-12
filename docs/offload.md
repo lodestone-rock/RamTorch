@@ -122,6 +122,7 @@ For a runnable streamed-eval loop with accuracy + peak-memory reporting, see
 |---|---|---|
 | `window` | `2` | Streaming slots on the GPU. `window=1` never overlaps a load with compute; `window≥2` lets the loader run ahead. Total weight memory ≈ `window + pin` chunks. |
 | `pin` | `0` | Number of **evenly-spaced** chunks pinned resident (never loaded/evicted). Eases PCIe pressure and steadies the schedule at the cost of their memory. `pin_layers=[...]` overrides with explicit indices. |
+| `nvme` | `0` | Number of chunks whose **masters live on disk** instead of CPU RAM (interleaved placement; `nvme_layers=[...]` overrides, `nvme_path=` required). Saves host RAM at the cost of slower loads for those chunks — see "The NVMe tier" below. |
 | `keep_activations` | `False` | Backward strategy: `False` (recompute), `True` (keep), or `"checkpoint"` (see below). |
 
 ### `keep_activations` — the three backward strategies
@@ -195,6 +196,72 @@ Measured on the same study config (light `d×d` kept + heavy 4x expansion
 marked): keep with no marks 2222 MiB → keep with marks **814 MiB** →
 `"checkpoint"` (everything) 702 MiB — and the marked run stays bit-identical
 to an ordinary unmarked full-resident model, dropout included.
+
+---
+
+## The NVMe tier — masters on disk (`nvme=`, `nvme_path=`)
+
+When even CPU RAM can't hold all the masters, push some chunks down one more
+level:
+
+```python
+model = OffloadModel(chunks, device="cuda:0", window=2, pin=4,
+                     nvme=8,                              # 8 chunks on disk
+                     nvme_path="/mnt/nvme/scratch/weights.bin")
+```
+
+* **Pure PyTorch, no GDS.** The selected chunks' weights move into one
+  page-aligned scratch file, held as **mmap-backed tensors**
+  (`torch.UntypedStorage.from_file`, exposed via `ramtorch.NvmeTensorStore`).
+  The loader streams them disk → shared pinned staging buffer → GPU on its
+  one thread. We measured the "real" GDS-style alternative and the disk→GPU
+  host hop serializes on the H2D copy engine anyway
+  (`examples/nvme_h2d_contention_test.py`), so this staged path is the honest
+  architecture — it is exactly the **"slower H2D"** model the simulator uses
+  (`--nvme K --tnvme ...`).
+* **Interleaved placement by default** — NVMe chunks spread evenly among the
+  CPU chunks, which simulation shows hides the slow loads behind neighboring
+  compute best (`python -m ramtorch.offload_simulator --nvme K` compares
+  `interleave` vs `tail` yourself). `nvme_layers=[...]` overrides; overlap
+  with pinned chunks resolves in pinned's favor.
+* **Training works unchanged.** The mapped masters are ordinary CPU tensors:
+  grads accumulate in RAM as usual, and the optimizer updates the masters in
+  place — writes land in the page cache and the kernel flushes them to disk
+  lazily. `state_dict()` reads through the mapping transparently.
+* **Page-cache semantics.** Cold loads run at disk speed; if the OS has free
+  RAM, recently-used chunks are served from cache (and evicted under memory
+  pressure — which is the scenario this tier exists for). Don't put
+  `nvme_path` on tmpfs (`/tmp` often is), that's just RAM with extra steps.
+* **Scratch, not a checkpoint.** `close()` deletes the file. Save checkpoints
+  with `torch.save(model.state_dict(), ...)` as usual.
+* `model.stats["nvme_loads"]` counts disk-tier loads; profile traces label
+  them `N3 nvme load` next to the `L3 h2d load` spans.
+
+### ⚠️ Drive-endurance caution: prefer this tier for inference, not training
+
+NAND flash wears out — consumer NVMe drives are typically rated for only a
+few hundred TB written (TBW). How the two workloads differ:
+
+* **Inference is fine.** The scratch file is written **once** at construction
+  and only ever *read* afterwards. Reads don't wear NAND in any meaningful
+  way, so even serving a model from this tier all day is easy on the drive.
+* **Training can trash a drive.** Every optimizer step rewrites every NVMe
+  master in place, and the kernel's page-cache writeback turns that into real
+  device writes. A 10 GiB NVMe tier at 2 steps/s is ~70 GB written per hour,
+  **~1.7 TB/day** — enough to burn through a consumer drive's TBW rating in
+  months, and sustained write pressure also hurts the drive's read latency
+  (which your loads depend on).
+
+If you do train with the NVMe tier:
+
+* Put **cold chunks only** on disk — layers whose masters rarely matter for
+  stalls — and keep the tier small (`nvme=` a minority of chunks).
+* Prefer a **high-endurance drive** (enterprise/datacenter-class, high
+  DWPD/TBW) or a dedicated scratch SSD you consider consumable.
+* Watch `nvme_loads` and your drive's SMART "percentage used" / "data units
+  written" counters (`smartctl -a /dev/nvmeX`) during long runs.
+* Gradient accumulation (fewer optimizer steps per sample) reduces write
+  volume proportionally.
 
 ---
 
@@ -383,7 +450,7 @@ and wrapping them in `OffloadModel`.
 | File | What it shows |
 |---|---|
 | `offload_quickstart.py` | Minimal train + inference walkthrough (the snippet above, runnable) |
-| `mnist_offload_example.py` | Canonical end-to-end training run: dice an MLP into chunks, train on MNIST with `step()` + `flush_grads()` + `AdamW(fused=True)`, streamed eval, checkpoint, peak-memory + stall report. `--backward {recompute,keep,checkpoint}` picks the strategy; `--selective` marks each block's FF with `offload_checkpoint` |
+| `mnist_offload_example.py` | Canonical end-to-end training run: dice an MLP into chunks, train on MNIST with `step()` + `flush_grads()` + `AdamW(fused=True)`, streamed eval, checkpoint, peak-memory + stall report. `--backward {recompute,keep,checkpoint}` picks the strategy; `--selective` marks each block's FF with `offload_checkpoint`; `--nvme K --nvme-path FILE` moves K chunks' masters onto the disk tier |
 | `offload_vs_plain_demo.py` | Side-by-side vs a full-resident model: 100-step SGD **bit-identity**, wall-time + peak-memory table, Perfetto traces, transfer- vs compute-bound regimes |
 | `offload_streaming_check.py` | Streaming executor vs full-resident reference: inference + training loss/grad parity across all three backward modes, tuple intermediates, bf16-autocast bit-identity, grad bypass (CPU always, CUDA when available) |
 | `offload_checkpoint_study.py` | The three backward strategies head to head: bit-parity (incl. dropout, where recompute's drift is shown) + the memory/time table above + selective `offload_checkpoint` marks |
