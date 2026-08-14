@@ -19,8 +19,9 @@ Both are built for **PCIe bandwidth**, not NVLink — which is exactly what a si
 
 - **Single-GPU Weight Streaming (`OffloadModel`)**: weights live in CPU pinned memory and stream through a sliding GPU window (with optional pinned layers). Train/infer models too big for one GPU.
 - **Single-Process Pipeline Parallelism**: split a model across GPUs with GPipe / 1F1B / staggered-1B1F schedules — no `torchrun`, no process groups, no NCCL.
+- **Pipeline + weight streaming combined**: a stage passed as a list of chunks streams its weights from CPU RAM through a small GPU window, prefetched in schedule order — for stages that don't fit their GPU.
 - **Mixed precision (`autocast=`)**, **tuple stage outputs**, and a **grad-bypass escape hatch** for custom losses.
-- **Design simulators**: predict makespan / GPU-utilization / memory *before* you run — `ramtorch.schedule_simulator` (pipeline) and `ramtorch.offload_simulator` (streaming).
+- **Design simulators**: predict makespan / GPU-utilization / memory *before* you run — `ramtorch.schedule_simulator` (pipeline), `ramtorch.offload_simulator` (streaming), and `ramtorch.pipeline_offload_simulator` (both combined).
 - **ZeRO-1 / ZeRO-2 sharding** and the original per-layer `ramtorch.Linear` are kept for backward compatibility (see [Legacy](#legacy-zero-12--per-layer-ramtorchlinear)).
 
 ## Installation
@@ -187,6 +188,27 @@ Or pass an explicit `split_spec` for full manual control over where the model is
 - **Tuple stage outputs & no-grad args**: a stage can return a tuple; non-float outputs (e.g. bool masks) are auto forward-only, and a module `out_no_grad=(i,...)` attribute marks float outputs forward-only. Backward flows only through grad-needing args.
 - **Grad-bypass**: `pipe.step(..., grad_outputs=...)` backprops a supplied `dL/dOutput` directly into the last stage, skipping `loss_fn` — for downstream-model gradients, RL advantages, custom differentiators.
 
+### Weight streaming inside a stage (pipeline + offload)
+
+If a stage's shard doesn't fit its GPU, pass that stage as a **list of chunk modules** — it becomes an `OffloadStage`: masters live in CPU pinned RAM and stream through a `offload_window`-chunk GPU window, prefetched in the schedule's exact chunk order (the executor's static op list is announced to the loader before the step runs, so H2D copies overlap compute *and* pipeline bubbles; the `staggered_1b1f` F↔B turnaround reuses the resident chunk for free).
+
+```python
+pipe = Pipeline(stage_modules=[[Block() for _ in range(12)],  # list -> streamed
+                               nn.Sequential(...)],           # module -> resident
+                devices=["cuda:0", "cuda:1"],
+                offload_window=2, offload_pin=0)
+
+# or simplest: one flat chunk list, split across the GPUs for you
+pipe = Pipeline(chunk_modules=[Block() for _ in range(32)],
+                devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"],  # 8 each
+                chunks_per_stage=[7, 8, 8, 9])  # optional explicit weighting
+
+# the same dicing without streaming: offload=False -> resident stages
+pipe = Pipeline(chunk_modules=chunks, devices=[...], offload=False)
+```
+
+GPU weight memory per streamed stage ≈ `(window + pin)` chunks. Bit-identical to the full-resident pipeline (`examples/pipeline_offload_check.py`); simulate your regime first with `python -m ramtorch.pipeline_offload_simulator`. No NVMe tier here, deliberately — pipeline training from disk would thrash the drive. See [docs/pipeline_parallel.md](docs/pipeline_parallel.md).
+
 ### Notes & gotchas
 
 - **Inference batch size**: traced stages specialize to the example microbatch's batch size; `forward()` chunks and pads arbitrary batches (emitting a silence-able `PipelinePaddingWarning`).
@@ -198,7 +220,8 @@ Or pass an explicit `split_spec` for full manual control over where the model is
 ## Which feature should I reach for?
 
 - **Model fits on one GPU but barely / OOMs** → `OffloadModel`, tune `window`/`pin` with the simulator.
-- **Model too big for one GPU, you have 2+ PCIe GPUs on one node** → `PipelineModel` (simple) or `Pipeline(stage_modules=...)` (complex). Per-GPU memory drops by ~`1/num_gpus`; combine with `OffloadModel` inside a stage if a single stage still doesn't fit.
+- **Model too big for one GPU, you have 2+ PCIe GPUs on one node** → `PipelineModel` (simple) or `Pipeline(stage_modules=...)` (complex). Per-GPU memory drops by ~`1/num_gpus`.
+- **Even a pipeline stage doesn't fit its GPU** → pass that stage as a *list of chunks* (`Pipeline` + weight streaming): per-GPU weight memory drops to ~`(offload_window + offload_pin)` chunks. Check the regime with `python -m ramtorch.pipeline_offload_simulator` first — compute-bound stages hide the traffic (~0.4% simulated overhead), transfer-bound ones pay real slowdown for the memory.
 - **Multi-node cluster with fast interconnect** → you probably want FSDP/DeepSpeed/Megatron instead; RamTorch targets single-node PCIe.
 
 ## Performance Considerations

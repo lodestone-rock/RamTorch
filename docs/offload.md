@@ -13,6 +13,9 @@ real loader/writeback overlap engine.
 > **End-to-end training:** [`examples/mnist_offload_example.py`](../examples/mnist_offload_example.py)
 > **Full study:** [`examples/offload_vs_plain_demo.py`](../examples/offload_vs_plain_demo.py)
 > **Design simulator:** `python -m ramtorch.offload_simulator --help`
+> **Multiple GPUs?** The same engine streams weights *inside a pipeline stage*
+> — see "Streaming inside a pipeline stage" below and
+> [docs/pipeline_parallel.md](pipeline_parallel.md).
 
 ---
 
@@ -411,6 +414,42 @@ Large `stall` / low `gpu%` means you're transfer-bound.
 
 ---
 
+## Streaming inside a pipeline stage (multiple GPUs)
+
+The engine also powers **weight offloading inside pipeline parallelism**: pass
+a pipeline stage to `Pipeline(stage_modules=...)` as a *list* of chunk modules
+(the same dicing convention) and it becomes an
+`ramtorch.pipeline_offload.OffloadStage` — the stage's masters live in CPU
+pinned RAM and stream through an `offload_window`-slot window on that stage's
+GPU, prefetched in the pipeline schedule's exact chunk order (the executor's
+static op list is announced to the loader before the step runs, so loads
+overlap compute *and* pipeline bubbles; the `staggered_1b1f` F↔B turnaround
+reuses the resident chunk for free).
+
+```python
+pipe = Pipeline(stage_modules=[[Block() for _ in range(12)],  # list -> streamed
+                               nn.Sequential(...)],           # module -> resident
+                devices=["cuda:0", "cuda:1"],
+                offload_window=2, offload_pin=0)
+```
+
+Differences from the single-GPU engine:
+
+* Backward strategies are `True` (keep) and `"checkpoint"` only — engine
+  recompute mode is rejected inside the pipeline (its no-grad forward would
+  leave the last stage's loss graph-disconnected at the executor's loss op).
+* **No NVMe tier**, deliberately: pipeline training from disk rewrites every
+  stage's masters every step — guaranteed drive thrashing.
+* Simulate the combined system with
+  `python -m ramtorch.pipeline_offload_simulator` (pipeline schedule + per-stage
+  streaming in one model).
+
+Full guide: [docs/pipeline_parallel.md](pipeline_parallel.md) ("Streaming stage
+weights from CPU RAM"). Bit-parity suite: `examples/pipeline_offload_check.py`;
+end-to-end run: `examples/mnist_pipeline_offload.py`.
+
+---
+
 ## Profiling a real step
 
 `step(profile_path=...)` writes a Chrome-trace (Perfetto) JSON with compute
@@ -474,4 +513,4 @@ and wrapping them in `OffloadModel`.
 | `offload_warmup_study.py` | Preload ("warmup") phase vs greedy start across load/compute ratios |
 | `offload_sim_check.py` | `offload_simulator` invariants + agreement with the real executor |
 
-(`vshape_schedule_check.py` belongs to the *pipeline* schedules, not offload — see `docs/pipeline_parallel.md`.)
+(`vshape_schedule_check.py` belongs to the *pipeline* schedules, not offload — see `docs/pipeline_parallel.md`. The pipeline+offload combination — `pipeline_offload_check.py`, `mnist_pipeline_offload.py`, and the `--offload` flag of `mnist_pipeline_big_transformer_manual.py` — is documented there too.)

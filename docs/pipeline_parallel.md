@@ -19,11 +19,13 @@ There are two entry points. **Choose based on your model's complexity:**
 |---|---|---|
 | `PipelineModel` | **Auto-split** via `torch.export` tracing | Simple models (linear stacks, basic CNNs/MLPs) |
 | `Pipeline(stage_modules=[...])` | **You pre-partition** into stage modules | Real/complex architectures (attention, control flow, custom ops) |
+| `Pipeline(chunk_modules=[...])` | **You dice into a flat chunk list**; the pipeline splits it across devices (evenly or per `chunks_per_stage`) | Models that are naturally a stack of blocks; also unlocks per-stage weight streaming (`offload=`) |
 
 **Rule of thumb:** start with `PipelineModel` for convenience. If `torch.export`
 fails or misbehaves on your model (see the gotchas below), switch to
 `Pipeline(stage_modules=...)` — it's the robust, recommended path for anything
-non-trivial.
+non-trivial. If your model is a plain stack of blocks anyway, `chunk_modules`
+is the least code of all.
 
 ---
 
@@ -106,11 +108,65 @@ equivalent fails on its attention reshapes; the manual version trains cleanly.
 
 ---
 
+## Manual splitting with chunks: `Pipeline(chunk_modules=[...])`
+
+Often the natural way to write a model is not "two big stage modules" but a
+**flat ordered list of small chunks** (embed, block, block, ..., head). Hand
+that list to the pipeline and let it do the stage splitting for you:
+
+```python
+from ramtorch import Pipeline
+
+chunks = [Embed(...)] + [Block(...) for _ in range(30)] + [Head(...)]
+
+# even split: one stage per device, earlier stages take the remainder
+pipe = Pipeline(chunk_modules=chunks,
+                devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"])
+
+# or weight the split yourself (must sum to len(chunk_modules)):
+pipe = Pipeline(chunk_modules=chunks, chunks_per_stage=[7, 8, 8, 9],
+                devices=["cuda:0", "cuda:1", "cuda:2", "cuda:3"])
+
+opt = torch.optim.Adam(
+    itertools.chain(*(st.params for st in pipe.stages)), lr=1e-3)
+```
+
+Chunk contract (the same dicing convention as `OffloadModel`): chunk `i+1`
+consumes chunk `i`'s output — a single tensor, or a **tuple** whose elements
+become the next chunk's positional args (non-float extras like masks pass
+through grad-free). The first chunk takes the pipeline input; the last returns
+the final output.
+
+Everything else (`step`, schedules, `infer`, autocast, grad bypass, tuple
+inputs) works exactly as with `stage_modules`. Notes:
+
+- With neither `chunks_per_stage` nor `devices`, every visible CUDA device
+  gets a stage (one CPU stage without CUDA).
+- The split weights by **chunk count** only — for unevenly sized chunks, pass
+  `chunks_per_stage` yourself.
+- Optimize over `pipe.stages[i].params` (as above); `Pipeline` itself has no
+  `.parameters()`.
+- By default chunked stages **stream their weights from CPU RAM**
+  (`offload=True` — see "Streaming stage weights from CPU RAM" below). Pass
+  **`offload=False`** for ordinary fully-resident stages: each stage then just
+  runs its chunks in sequence on its GPU, bit-identical to hand-building
+  `nn.Sequential` stages. Dice once, flip `offload` when a stage stops
+  fitting.
+
+Reference: `examples/mnist_pipeline_big_transformer_manual.py --chunks`
+(resident) / `--offload` (streamed) — the same ViT diced one level finer, and
+`examples/mnist_pipeline_offload.py`, which builds both its pipelines from one
+flat chunk list. Parity vs hand-built stages is asserted in
+`examples/pipeline_offload_check.py`.
+
+---
+
 ## Input features: tensor, tuple, and pre-diced microbatches
 
-`Pipeline.step` and `Pipeline.infer` accept three input forms. **Tuple forms are
-only supported on the manual `stage_modules` path** — the traced `PipelineModel`
-path raises a clear `ValueError` (torch.export can't trace them).
+`Pipeline.step` and `Pipeline.infer` accept three input forms. **Tuple forms
+are only supported on the manual paths (`stage_modules` / `chunk_modules`)** —
+the traced `PipelineModel` path raises a clear `ValueError` (torch.export
+can't trace them).
 
 ### 1. Single tensor (default)
 
@@ -317,6 +373,92 @@ python -m ramtorch.schedule_simulator --p 8 --m 16 --plot gantt.png
 
 ---
 
+## Streaming stage weights from CPU RAM (pipeline + offload)
+
+When a stage's shard doesn't fit in its GPU's memory, combine the pipeline
+with the weight-streaming engine: make that stage's `stage_modules` entry a
+**list of chunk modules** instead of a single module, and it becomes an
+`OffloadStage` — masters (weights, grad accumulators, optimizer state) live in
+CPU pinned RAM and stream through a small GPU window:
+
+```python
+stage0 = [Block() for _ in range(12)]        # list  -> offloaded stage
+stage1 = nn.Sequential(*[Block() for _ in range(12)])  # module -> resident
+pipe = Pipeline(
+    stage_modules=[stage0, stage1], devices=["cuda:0", "cuda:1"],
+    offload_window=2,                # streamed GPU slots per offloaded stage
+    offload_pin=0,                   # chunks pinned permanently on the GPU
+    offload_keep_activations=True,   # or "checkpoint" (recompute memory)
+)
+res = pipe.step(x, targets=y, schedule="staggered_1b1f",
+                n_microbatches=8, loss_fn=F.cross_entropy)
+res.flush_grads()   # streamed grads -> CPU .grad; residency invalidated
+opt.step()          # AdamW(fused=True) over all stages' params
+pipe.close()        # stops loader/writeback threads (also runs on __del__)
+```
+
+Or skip the per-stage nesting entirely — hand the pipeline ONE flat list of
+chunks via `chunk_modules=` and let it split them across the devices (see
+"Manual splitting with chunks" above; `offload=True` is the default there, so
+`Pipeline(chunk_modules=chunks, devices=[...], offload_window=2)` is the whole
+streamed setup).
+
+**GPU weight memory per offloaded stage ≈ `(window + pin)` chunks** instead of
+the whole shard. Chunks follow the `OffloadModel` dicing convention (chunk
+`i+1` consumes chunk `i`'s output, tuples fine); the stage's own input/output
+contract is unchanged, so mixing offloaded and resident stages, tuple stage
+boundaries, `autocast=`, `grad_outputs=`, and `infer()` all work as usual.
+
+### Why this composes well
+
+The relay executor walks a **static per-stage op list**, so the entire step's
+chunk-touch order is known before it runs: each `F` op touches chunks
+`0..L-1`, each `B` op `L-1..0`. `Pipeline.step` announces the whole expanded
+itinerary to each stage's loader up front, and the prefetcher overlaps H2D
+weight copies with compute *and with the pipeline bubbles*. The
+`staggered_1b1f` steady state (`... B F B F ...`) gets echo reuse for free —
+the chunk where a backward ends is the chunk where the next forward starts.
+
+### When it pays off
+
+Streaming adds PCIe traffic (weights H2D per touch, grads D2H once per
+microbatch), so it only comes for free when compute hides it. Explore your
+configuration first with the combined simulator:
+
+```bash
+python -m ramtorch.pipeline_offload_simulator --p 4 --m 8 --chunks 8 \
+    --window 2 --tf 1 --tb 2 --th2d 0.5 --plot gantt.png
+```
+
+Compute-bound (real transformers at useful batch sizes): a window of 2 of 8
+chunks measured **+0.4%** makespan in the simulator. Transfer-bound (small
+compute per weight byte — e.g. the deliberately-wide MNIST MLP in
+`examples/mnist_pipeline_offload.py`): several times slower than
+full-resident, at 4.5x less GPU memory; `offload_pin` trades memory back for
+traffic when the shard *almost* fits.
+
+### Rules and gotchas
+
+- **Backward strategy**: `offload_keep_activations=True` (keep per-chunk
+  graphs; plain-pipeline-like activation memory) or `"checkpoint"`
+  (non-reentrant per-chunk checkpoint; recompute-level memory, dropout-safe).
+  The engine's own recompute mode (`False`) is rejected — its no-grad forward
+  would leave the last stage's loss graph-disconnected at the relay's W op.
+- **No NVMe tier**, deliberately: sustained pipeline training from disk would
+  rewrite every stage's masters every step — guaranteed drive thrashing. Use
+  `offload.md`'s single-GPU engine if you truly need it (it is consent-gated).
+- The engine ctor **relocates params in place** (streamed → CPU pinned,
+  pinned → GPU). Deepcopy any reference copies *before* building the
+  `Pipeline`.
+- Buffer mutations (BatchNorm running stats) are not written back — use
+  buffer-free norms (LayerNorm).
+- `fake_compute` is not supported with chunked (offloaded) stage entries.
+- Bit-parity with a full-resident pipeline (same op order) is asserted across
+  schedules × modes × windows × tuple boundaries × bf16 × grad-bypass in
+  `examples/pipeline_offload_check.py`.
+
+---
+
 ## Inference
 
 `Pipeline.infer` runs a **forward-only GPipe** (no backward, no grad, no
@@ -358,7 +500,7 @@ sequential grad-accum final weights to **0.0** (bit-exact).
 | File | What it shows |
 |---|---|
 | `mnist_pipeline_example.py` | `PipelineModel` quickstart (auto-split MLP) |
-| `mnist_pipeline_big_transformer_manual.py` | Manual pre-partitioned transformer (the robust path) |
+| `mnist_pipeline_big_transformer_manual.py` | Manual pre-partitioned transformer (the robust path); `--offload` streams each stage's chunks from CPU RAM (`--window`, `--pin`, `--offload-mode`) |
 | `mnist_frozen_encoder_overlap.py` | Frozen "text encoder" inference feeding a trained model (tuple + pre-diced inputs + a bool padding mask crossing a stage boundary) |
 | `tuple_no_grad_check.py` | Tuple outputs + per-arg no-grad flags — parity vs sequential masked baseline |
 | `amp_check.py` | Mixed precision (`autocast=`) — bf16 bit-identity vs sequential accum, fp16 guard |
@@ -366,3 +508,5 @@ sequential grad-accum final weights to **0.0** (bit-exact).
 | `mnist_pipeline_vs_single.py` | Pipeline vs single-GPU loss/grad/weight parity |
 | `mnist_seq_vs_gradaccum.py` | Pipeline vs sequential grad-accum (liability check) |
 | `pipeline_easy_demo.py` | `PipelineModel` forward + train + eval |
+| `mnist_pipeline_offload.py` | Pipeline + weight streaming end to end: memory/traffic/stall report vs full-resident |
+| `pipeline_offload_check.py` | Offloaded-stage bit-parity vs plain pipeline + sequential ref (schedules × modes × windows × tuples × bf16 × bypass) |

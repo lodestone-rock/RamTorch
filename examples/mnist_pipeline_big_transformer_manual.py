@@ -22,9 +22,23 @@ and it's the recommended approach for anything non-trivial.
 `PipelineModel` is the convenient API for simple models; `Pipeline(stage_modules=...)`
 is the recommended API for real architectures. Make the informed choice.
 
+WEIGHT OFFLOADING (--offload)
+-----------------------------
+With `--offload`, each stage is passed to `Pipeline` as a LIST of chunk modules
+(embed / one transformer block / norm+head each) instead of one module, which
+makes it an `OffloadStage`: the chunk masters live in CPU pinned RAM and stream
+through a `--window`-slot GPU window, prefetched in the schedule's exact chunk
+order. GPU weight memory per stage drops to ~(window + pin) chunks. The
+transformer blocks have real arithmetic intensity, so unlike the wide-MLP
+example (`mnist_pipeline_offload.py`) the traffic largely hides behind compute
+and pipeline bubbles — check the `--profile` trace in Perfetto to see the H2D
+loads overlapping the F/B spans.
+
 Run:
     python examples/mnist_pipeline_big_transformer_manual.py
     python examples/mnist_pipeline_big_transformer_manual.py --steps 200 --devices cuda:1 cuda:3
+    python examples/mnist_pipeline_big_transformer_manual.py \
+        --devices cuda:0 cuda:1 cuda:2 cuda:3 --offload --window 2 --profile
 """
 
 from __future__ import annotations
@@ -77,9 +91,12 @@ class EmbedStage(nn.Module):
         self.patch_embed = nn.Conv2d(1, dim, kernel_size=patch, stride=patch)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, dim))
-        self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(n_blocks)])
+        # init the embed params BEFORE creating the blocks so this consumes
+        # the RNG in the same order as the chunked form (EmbedChunk, then
+        # Blocks) — a fixed seed then gives IDENTICAL weights in both modes
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
+        self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(n_blocks)])
 
     def forward(self, x):
         # x: (B, 1, 28, 28) image
@@ -135,6 +152,63 @@ def build_stages(dim: int, depth: int, heads: int, patch: int,
     return stages
 
 
+# ── Offloaded variant: the SAME model diced one level finer ──────────────────
+# For --offload each stage becomes a LIST of chunk modules (the OffloadModel
+# dicing convention: chunk i+1 consumes chunk i's output). Same math, but now
+# the Pipeline streams each stage's chunks from CPU pinned RAM.
+
+class EmbedChunk(nn.Module):
+    """Patch embed + cls token + positional embedding (no blocks)."""
+
+    def __init__(self, dim: int, patch: int):
+        super().__init__()
+        n_patches = (28 // patch) ** 2
+        self.patch_embed = nn.Conv2d(1, dim, kernel_size=patch, stride=patch)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, dim))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+    def forward(self, x):
+        x = self.patch_embed(x)                  # (B, dim, 7, 7)
+        x = x.flatten(2).transpose(1, 2)         # (B, 49, dim)
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        return torch.cat([cls, x], dim=1) + self.pos_embed
+
+
+class HeadChunk(nn.Module):
+    """Final norm + classifier head on the cls token."""
+
+    def __init__(self, dim: int, num_classes: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.head = nn.Linear(dim, num_classes)
+
+    def forward(self, x):
+        return self.head(self.norm(x)[:, 0])
+
+
+def build_stage_chunks(dim: int, depth: int, heads: int, patch: int,
+                       num_classes: int, n_stages: int):
+    """Same split as build_stages, but each stage is a list of chunks."""
+    base = depth // n_stages
+    rem = depth % n_stages
+    counts = [base + (1 if i < rem else 0) for i in range(n_stages)]
+
+    stage_chunks = []
+    for i, cnt in enumerate(counts):
+        # construct in pipeline order (embed BEFORE its blocks) so the RNG
+        # stream matches build_stages — same seed, same weights, both modes
+        chunks = []
+        if i == 0:
+            chunks.append(EmbedChunk(dim, patch))
+        chunks.extend(Block(dim, heads) for _ in range(cnt))
+        if i == n_stages - 1:
+            chunks.append(HeadChunk(dim, num_classes))
+        stage_chunks.append(chunks)
+    return stage_chunks
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=300)
@@ -154,6 +228,24 @@ def main() -> int:
     ap.add_argument("--parallel-opt", action="store_true",
                     help="use PipelineOptimizer (per-stage parallel optimizer) "
                          "instead of a single sequential Adam")
+    # ── Weight offloading (stream each stage's chunks from CPU pinned RAM) ──
+    ap.add_argument("--offload", action="store_true",
+                    help="dice the model into a flat chunk list "
+                         "(Pipeline(chunk_modules=...)) and STREAM each "
+                         "stage's chunks: masters in CPU pinned RAM, "
+                         "sliding GPU window")
+    ap.add_argument("--chunks", action="store_true",
+                    help="same flat chunk_modules dicing but RESIDENT stages "
+                         "(offload=False): the chunking convenience without "
+                         "the streaming machinery")
+    ap.add_argument("--window", type=int, default=2,
+                    help="streamed GPU chunk slots per offloaded stage")
+    ap.add_argument("--pin", type=int, default=0,
+                    help="chunks pinned permanently on each stage's GPU")
+    ap.add_argument("--offload-mode", default="keep",
+                    choices=["keep", "checkpoint"],
+                    help="offloaded backward: keep per-chunk graphs, or "
+                         "per-chunk non-reentrant checkpoint (less memory)")
     # ── Profiling (bounded to a small step window so files stay small) ──
     ap.add_argument("--profile", action="store_true",
                     help="capture a kineto profile + op-level Perfetto trace "
@@ -186,31 +278,75 @@ def main() -> int:
     )
 
     # ── Build the pre-partitioned stages (NO torch.export) ────────────────────
-    stages = build_stages(args.dim, args.depth, args.heads, args.patch,
-                          num_classes=10, n_stages=n_stages)
-    n_params = sum(p.numel() for st in stages for p in st.parameters())
-    print(f"model: {n_params/1e6:.1f}M params, manually split into {n_stages} stages")
-    for i, st in enumerate(stages):
-        sp = sum(p.numel() for p in st.parameters())
-        print(f"  stage {i} ({type(st).__name__}): {sp/1e6:.1f}M params -> {args.devices[i]}")
-
-    # ── Build the pipeline from the manual stages ─────────────────────────────
-    pipe = Pipeline(stage_modules=stages, devices=args.devices)
+    if args.offload and args.chunks:
+        raise SystemExit("--offload already implies chunked stages; "
+                         "pass only one of --offload / --chunks")
+    if args.offload or args.chunks:
+        # Flat chunk_modules path: dice the whole model into ONE ordered chunk
+        # list; the Pipeline splits it across the devices (chunks_per_stage
+        # keeps the embed/head placement of build_stage_chunks). offload=True
+        # streams each stage's chunks; offload=False keeps them resident.
+        stage_chunks = build_stage_chunks(args.dim, args.depth, args.heads,
+                                          args.patch, num_classes=10,
+                                          n_stages=n_stages)
+        chunks = [m for st in stage_chunks for m in st]
+        counts = [len(st) for st in stage_chunks]
+        n_params = sum(p.numel() for m in chunks for p in m.parameters())
+        kind = "offloaded" if args.offload else "resident chunked"
+        extra = (f" (window={args.window} pin={args.pin} "
+                 f"mode={args.offload_mode})" if args.offload else "")
+        print(f"model: {n_params/1e6:.1f}M params, {len(chunks)} chunks -> "
+              f"{n_stages} {kind} stages {counts}{extra}")
+        pipe = Pipeline(
+            chunk_modules=chunks, chunks_per_stage=counts,
+            devices=args.devices,
+            offload=args.offload,
+            offload_window=args.window, offload_pin=args.pin,
+            offload_keep_activations=(True if args.offload_mode == "keep"
+                                      else "checkpoint"),
+        )
+    else:
+        stages = build_stages(args.dim, args.depth, args.heads, args.patch,
+                              num_classes=10, n_stages=n_stages)
+        n_params = sum(p.numel() for st in stages for p in st.parameters())
+        print(f"model: {n_params/1e6:.1f}M params, manually split into {n_stages} stages")
+        for i, st in enumerate(stages):
+            sp = sum(p.numel() for p in st.parameters())
+            print(f"  stage {i} ({type(st).__name__}): {sp/1e6:.1f}M params -> {args.devices[i]}")
+        pipe = Pipeline(stage_modules=stages, devices=args.devices)
     # Optimize over ALL stage params (they're separate modules, not one model).
+    # pipe.stages[i].params works for plain and offloaded stages alike (for
+    # offloaded ones the masters live in CPU pinned RAM).
     if args.parallel_opt:
+        if args.offload:
+            raise SystemExit("--parallel-opt is not supported with --offload; "
+                             "use the default single optimizer (fused AdamW)")
         opt = PipelineOptimizer(
             pipe.stages, lambda p: torch.optim.Adam(p, lr=args.lr)
         )
         print("optimizer: PipelineOptimizer (per-stage parallel)")
+    elif args.offload:
+        # fused=True groups params by device: CPU masters get the fused CPU
+        # kernel, any GPU-resident params the fused CUDA kernel.
+        opt = torch.optim.AdamW(
+            itertools.chain(*(st.params for st in pipe.stages)),
+            lr=args.lr, fused=True,
+        )
+        print("optimizer: single AdamW(fused=True) over CPU masters")
     else:
+        # Works for plain module stages and resident chunked (--chunks) stages
+        # alike: every Stage exposes its own .params list.
         opt = torch.optim.Adam(
-            itertools.chain(*(st.parameters() for st in stages)), lr=args.lr
+            itertools.chain(*(st.params for st in pipe.stages)), lr=args.lr
         )
         print("optimizer: single sequential Adam")
     loss_fn = nn.CrossEntropyLoss()
     print(f"schedule={args.schedule}  microbatches={args.micro}  Adam lr={args.lr}")
 
     # ── Train ─────────────────────────────────────────────────────────────────
+    if args.offload and torch.cuda.is_available():
+        for d in args.devices:
+            torch.cuda.reset_peak_memory_stats(d)
     print(f"\ntraining ({args.steps} steps) ...")
     if args.profile:
         stop = args.profile_start + args.profile_steps
@@ -261,10 +397,22 @@ def main() -> int:
     print(f"  pipeline fwd+bwd : {t_fwd_bwd*1e3:8.1f}ms  ({t_fwd_bwd/step*1e3:6.2f} ms/step)")
     print(f"  optimizer step   : {t_opt*1e3:8.1f}ms  ({t_opt/step*1e3:6.2f} ms/step)")
     print(f"  optimizer share  : {100*t_opt/(t_fwd_bwd+t_opt):.1f}% of step time")
+    if args.offload:
+        print("  offload engine stats per stage:")
+        for i, st in enumerate(pipe.stages):
+            s = st.engine.stats
+            print(f"    stage {i}: H2D loads={s['loads']} "
+                  f"({s['loads']/step:.1f}/step), acquire stall="
+                  f"{s['acquire_wait_s']:.2f}s ({s['acquire_wait_s']/step*1e3:.1f} ms/step)")
+        for d in args.devices:
+            peak = torch.cuda.max_memory_allocated(d) / 2**20
+            print(f"    {d}: peak GPU memory {peak:.0f} MiB")
 
     # ── Evaluate: pipelined inference (GPipe-forward, keeps all GPUs busy) ────
-    for st in stages:
-        st.eval()
+    # st.module is the stage's module (for offloaded stages, the streaming
+    # engine, whose eval() propagates to the chunks).
+    for st in pipe.stages:
+        st.module.eval()
     correct = total = 0
     for bi, (x, y) in enumerate(test_loader):
         # pipe.infer() microbatches the batch through the stages concurrently
@@ -289,13 +437,17 @@ def main() -> int:
 
     # ── Checkpoint: save each stage's state_dict ──────────────────────────────
     if args.save:
-        ckpt = {f"stage_{i}": st.state_dict() for i, st in enumerate(stages)}
+        # st.module covers both cases: the plain stage module, or the offload
+        # engine (whose state_dict holds the CPU masters under chunks.N.*).
+        ckpt = {f"stage_{i}": st.module.state_dict()
+                for i, st in enumerate(pipe.stages)}
         torch.save(ckpt, args.save)
         print(f"saved checkpoint -> {args.save}")
 
     # Shut down the parallel optimizer's worker threads, if used.
     if args.parallel_opt:
         opt.close()
+    pipe.close()   # stops offloaded stages' loader/writeback threads (no-op otherwise)
 
     return 0
 

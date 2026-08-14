@@ -90,6 +90,12 @@ Notes
   pinned params on the GPU. torch optimizers handle per-param devices fine.
   For CPU params, a stochastic/fused CPU optimizer (e.g. ramtorch AdamW)
   keeps the step cheap.
+* The engine's internal primitives (``_announce``/``_acquire``/``_release``,
+  ``_call_chunk``, ``_grads_for``, ``_accumulate``) are also driven externally
+  by :class:`ramtorch.pipeline_offload.OffloadStage`, which streams a pipeline
+  stage's weights with the itinerary derived from the pipeline schedule
+  instead of ``step()``'s fixed F/B echo. Treat their signatures as a shared
+  contract when refactoring.
 """
 
 from __future__ import annotations
@@ -101,6 +107,7 @@ import pwd
 import queue
 import threading
 import time
+from collections import deque
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import torch
@@ -527,6 +534,9 @@ class OffloadModel(nn.Module):
         # bounded: if D2H writeback lags behind compute, step() blocks on put()
         # instead of letting per-chunk GPU grads pile up unboundedly
         self._wb_q: "queue.Queue" = queue.Queue(maxsize=4)
+        # D2H copies enqueued but not yet accumulated into grad_acc:
+        # (state, names, done_event) in FIFO order. Writeback thread only.
+        self._wb_pending: deque = deque()
         self._writeback = threading.Thread(
             target=self._writeback_loop, daemon=True, name="offload-writeback"
         )
@@ -721,11 +731,17 @@ class OffloadModel(nn.Module):
             try:
                 if self._error is None:
                     t_us = time.monotonic_ns() / 1e3
-                    with record_function("G d2h writeback"):
-                        self._do_writeback(*job)
+                    if job == "drain":
+                        label = "G wb drain"
+                        with record_function(label):
+                            self._retire_writebacks(wait_all=True)
+                    else:
+                        label = "G d2h writeback"
+                        with record_function(label):
+                            self._do_writeback(*job)
                     if self._span_log is not None:
                         self._span_log.append((
-                            "offload d2h writeback", "G d2h writeback",
+                            "offload d2h writeback", label,
                             t_us, time.monotonic_ns() / 1e3 - t_us,
                         ))
             except BaseException as e:  # noqa: BLE001 — surface on next check
@@ -744,6 +760,9 @@ class OffloadModel(nn.Module):
                 for n, g in grads.items()
             }
         if self._cuda:
+            # this state's previous copy (if still in flight) targets the
+            # same staging buffers we are about to overwrite — retire it first
+            self._retire_writebacks(for_state=state)
             with torch.cuda.stream(self._d2h_stream):
                 self._d2h_stream.wait_event(ev)
                 for n, g in grads.items():
@@ -754,12 +773,49 @@ class OffloadModel(nn.Module):
                     g.record_stream(self._d2h_stream)
                 done = torch.cuda.Event()
                 done.record()
-            done.synchronize()
+            # do NOT synchronize here: blocking this thread per packet idles
+            # the D2H stream during every CPU accumulate and backpressures
+            # compute through the bounded queue. Defer the accumulate until
+            # the copy has actually landed (checked via event.query()).
+            self._wb_pending.append((state, list(grads), done))
+            self._retire_writebacks()  # only copies that already completed
         else:
             for n, g in grads.items():
                 state.staging[n].copy_(g)
-        for n in grads:
-            state.grad_acc[n] += state.staging[n]
+                state.grad_acc[n] += state.staging[n]
+
+    def _retire_writebacks(self, for_state=None, wait_all: bool = False):
+        """Accumulate landed D2H copies into ``grad_acc`` (writeback thread
+        only). Entries retire in FIFO order — the D2H stream is FIFO, so the
+        head always completes first.
+
+        Default: retire only copies whose event already fired (non-blocking).
+        ``for_state``: block until no pending entry targets that state (its
+        staging buffers are about to be reused). ``wait_all``: drain
+        everything (the flush paths).
+        """
+        pend = self._wb_pending
+        while pend:
+            must = wait_all or (
+                for_state is not None
+                and any(e[0] is for_state for e in pend)
+            )
+            if not must and not pend[0][2].query():
+                break
+            state, names, done = pend.popleft()
+            done.synchronize()
+            for n in names:
+                state.grad_acc[n] += state.staging[n]
+
+    def _wb_drain(self):
+        """Flush queued writeback jobs AND retire all pending D2H copies.
+
+        ``_wb_q.join()`` alone is not enough since copies retire lazily; the
+        sentinel makes the writeback thread itself do the final blocking
+        retirement (``_wb_pending`` is single-thread-owned by design).
+        """
+        self._wb_q.put("drain")
+        self._wb_q.join()
 
     # ── compute-side residency handshake ───────────────────────────────────
     def _check_error(self):
@@ -923,7 +979,7 @@ class OffloadModel(nn.Module):
                 result = self._step_recompute(x, target, loss_fn,
                                               grad_outputs=grad_outputs)
             # ensure all writebacks landed before the caller touches grad_acc
-            self._wb_q.join()
+            self._wb_drain()
             self._check_error()
             return result
 
@@ -1218,7 +1274,7 @@ class OffloadModel(nn.Module):
         and a leftover resident copy would silently serve pre-update weights
         to the next forward.
         """
-        self._wb_q.join()
+        self._wb_drain()
         self._check_error()
         for state in self._state:
             named = dict(state.module.named_parameters())
