@@ -670,6 +670,26 @@ def _run_inference(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+class _ChunkSequential(nn.Module):
+    """Resident counterpart of an offloaded chunk list.
+
+    Runs the chunks in order on one device, relaying a tuple output as the
+    next chunk's positional args — the exact OffloadModel dicing convention —
+    so the same chunk list works with ``offload=True`` or ``offload=False``
+    without touching the chunks.
+    """
+
+    def __init__(self, chunks):
+        super().__init__()
+        self.chunks = nn.ModuleList(chunks)
+
+    def forward(self, *args):
+        out = args if len(args) != 1 else args[0]
+        for c in self.chunks:
+            out = c(*out) if isinstance(out, tuple) else c(out)
+        return out
+
+
 class Pipeline:
     """
     A reusable pipeline-parallel wrapper around ``model``.
@@ -692,13 +712,64 @@ class Pipeline:
     split_spec     : ``{layer_name: SplitPoint.BEGINNING|END}`` for pipeline().
                      Not required if ``stage_modules`` is given.
     stage_modules  : optional list of PRE-PARTITIONED ``nn.Module`` stages, one
-                     per pipeline stage, in order. When provided, the
+                     per pipeline stage, in order (see also ``chunk_modules``
+                     for the flat-list convenience form). When provided, the
                      ``torch.export`` tracer is **bypassed entirely** — use this
                      when the model is too complex for ``torch.export`` to trace
                      (graph breaks, data-dependent control flow, custom ops).
                      Each module's forward takes the previous stage's output and
                      returns its own output, exactly like a manually-split model.
                      ``model``/``example_input``/``split_spec`` are ignored.
+                     An entry that is a LIST/TUPLE of modules becomes an
+                     **offloaded stage** (:class:`ramtorch.pipeline_offload.
+                     OffloadStage`): the stage model is chunked, its masters
+                     are relocated to CPU pinned memory, and weights stream
+                     through a sliding GPU window prefetched in the schedule's
+                     exact chunk order (chunk ``i+1`` consumes chunk ``i``'s
+                     output — the OffloadModel dicing convention). Mixed
+                     pipelines (some stages offloaded, some plain) are fine.
+    chunk_modules  : the simplest way to build a chunked pipeline: a FLAT
+                     ordered list of chunk modules for the WHOLE model ("here,
+                     I have 32 chunks"). The pipeline dices it into one stage
+                     per device — evenly by count (earlier stages take the
+                     remainder), or per ``chunks_per_stage``. Stages stream
+                     their weights when ``offload=True`` (default) or stay
+                     fully resident when ``offload=False``.
+                     Mutually exclusive with ``stage_modules``/``model``.
+    chunks_per_stage :
+                     optional explicit per-stage chunk counts for
+                     ``chunk_modules``, e.g. ``[8, 8, 8, 8]`` or ``[7, 8, 8, 9]``
+                     (must sum to ``len(chunk_modules)``; its length sets the
+                     stage count and must match ``devices`` if both are given).
+    offload        : whether chunked stages STREAM their weights (default
+                     True). With ``offload=False`` the same chunk lists (flat
+                     ``chunk_modules`` or nested ``stage_modules`` entries)
+                     build plain RESIDENT stages instead — each stage runs its
+                     chunks in sequence on its GPU with all weights resident.
+                     Same convenient dicing, no streaming machinery.
+    offload_window : streaming GPU slots per offloaded stage (default 2;
+                     >= 2 overlaps weight loads with compute).
+    offload_pin    : chunks per offloaded stage pinned permanently on its GPU
+                     (evenly spaced; default 0). GPU weight memory per
+                     offloaded stage ~= ``offload_window + offload_pin`` chunks.
+    offload_keep_activations :
+                     backward strategy for offloaded stages: ``True``
+                     (default — keep per-chunk graphs, plain-pipeline-like
+                     activation memory) or ``"checkpoint"`` (per-chunk
+                     non-reentrant checkpoint: recompute-level memory,
+                     dropout-safe). Engine recompute mode is not supported
+                     inside the pipeline.
+    offload_grad_accum :
+                     "stream" (default): grad accumulators live on the GPU in
+                     ``offload_acc_slots`` streaming slots — zero CPU math;
+                     evicted accs spill over D2H and reload over H2D like
+                     weights. "cpu": legacy per-microbatch D2H packet + CPU
+                     accumulate (use when even the acc slots don't fit).
+    offload_acc_slots :
+                     grad-acc residency slots per offloaded stage (default =
+                     ``offload_window``). >= streamed chunks per stage keeps
+                     every acc GPU-resident for the whole step (one spill per
+                     chunk at flush time).
     devices        : one device per stage (default: cuda:i round-robin / CPU)
     fake_compute   : None | "replace" | {"fwd": s|[s...], "bwd": s|[s...]}
     overlap        : per-stage worker threads (True) or sequential debug (False)
@@ -726,14 +797,37 @@ class Pipeline:
         split_spec: Optional[dict] = None,
         *,
         stage_modules: Optional[Sequence[nn.Module]] = None,
+        chunk_modules: Optional[Sequence[nn.Module]] = None,
+        chunks_per_stage: Optional[Sequence[int]] = None,
         devices: Optional[Sequence[Union[str, torch.device]]] = None,
         fake_compute=None,
         overlap: bool = True,
         autocast=None,
+        offload: bool = True,
+        offload_window: int = 2,
+        offload_pin: int = 0,
+        offload_keep_activations: Union[bool, str] = True,
+        offload_grad_accum: str = "stream",
+        offload_acc_slots: Optional[int] = None,
     ):
         self.model = model
         self.overlap = overlap
         self.autocast_dtype = _normalize_autocast(autocast)
+
+        if chunk_modules is not None:
+            # ── Flat-chunk convenience: dice into offloaded stages ────────────
+            if stage_modules is not None or model is not None:
+                raise ValueError(
+                    "chunk_modules is mutually exclusive with stage_modules "
+                    "and model — pass ONE flat list of chunks and let the "
+                    "pipeline split it"
+                )
+            stage_modules = self._split_chunks(
+                chunk_modules, chunks_per_stage, devices
+            )
+        elif chunks_per_stage is not None:
+            raise ValueError("chunks_per_stage requires chunk_modules")
+
         # Tuple / nested-tuple inputs are only supported on the manual
         # (stage_modules) path; the traced torch.export path does not support them.
         self._manual = stage_modules is not None
@@ -745,17 +839,40 @@ class Pipeline:
                 raise ValueError("stage_modules must contain at least one module")
             self.num_stages = len(stage_modules)
             self.devices = self._resolve_devices(devices)
+            chunked = [isinstance(mod, (list, tuple)) for mod in stage_modules]
+            if offload and any(chunked) and fake_compute is not None:
+                raise ValueError(
+                    "fake_compute is not supported with offloaded (chunked) "
+                    "stage_modules entries (pass offload=False for resident "
+                    "chunked stages)"
+                )
             fake = (
                 _FakeCompute(fake_compute, self.num_stages)
                 if fake_compute is not None
                 else None
             )
-            self.stages = [
-                Stage(mod, i, self.num_stages, device=self.devices[i],
-                      fake=fake, tracer=None,
-                      autocast_dtype=self.autocast_dtype)
-                for i, mod in enumerate(stage_modules)
-            ]
+            self.stages = []
+            for i, mod in enumerate(stage_modules):
+                if chunked[i] and offload:
+                    from .pipeline_offload import OffloadStage
+
+                    self.stages.append(OffloadStage(
+                        mod, i, self.num_stages, device=self.devices[i],
+                        tracer=None, autocast_dtype=self.autocast_dtype,
+                        window=offload_window, pin=offload_pin,
+                        keep_activations=offload_keep_activations,
+                        grad_accum=offload_grad_accum,
+                        acc_slots=offload_acc_slots,
+                    ))
+                else:
+                    if chunked[i]:
+                        # offload=False: same chunk list, fully resident
+                        mod = _ChunkSequential(mod)
+                    self.stages.append(Stage(
+                        mod, i, self.num_stages, device=self.devices[i],
+                        fake=fake, tracer=None,
+                        autocast_dtype=self.autocast_dtype,
+                    ))
             return
 
         # ── Traced path: split the full model via torch.export ────────────────
@@ -783,6 +900,58 @@ class Pipeline:
                   fake=fake, tracer=None, autocast_dtype=self.autocast_dtype)
             for i in range(self.num_stages)
         ]
+
+    @staticmethod
+    def _split_chunks(chunk_modules, chunks_per_stage, devices):
+        """Dice a flat chunk list into per-stage chunk lists (offloaded stages).
+
+        Stage count comes from ``chunks_per_stage`` if given, else ``devices``,
+        else every visible CUDA device (1 CPU stage without CUDA). An even
+        split hands the remainder to the EARLIER stages (the build_stages
+        convention).
+        """
+        chunk_modules = list(chunk_modules)
+        if len(chunk_modules) < 1:
+            raise ValueError("chunk_modules must contain at least one module")
+        for i, m in enumerate(chunk_modules):
+            if isinstance(m, (list, tuple)):
+                raise ValueError(
+                    f"chunk_modules must be a FLAT list of modules; entry {i} "
+                    "is a list/tuple (nested per-stage lists belong in "
+                    "stage_modules)"
+                )
+
+        if chunks_per_stage is not None:
+            counts = [int(c) for c in chunks_per_stage]
+            if devices is not None and len(devices) != len(counts):
+                raise ValueError(
+                    f"chunks_per_stage has {len(counts)} entries but "
+                    f"{len(devices)} devices were given"
+                )
+            if any(c < 1 for c in counts):
+                raise ValueError("every chunks_per_stage entry must be >= 1")
+            if sum(counts) != len(chunk_modules):
+                raise ValueError(
+                    f"chunks_per_stage sums to {sum(counts)} but there are "
+                    f"{len(chunk_modules)} chunk modules"
+                )
+        else:
+            if devices is not None:
+                n_stages = len(devices)
+            else:
+                n_cuda = (torch.cuda.device_count()
+                          if torch.cuda.is_available() else 0)
+                n_stages = n_cuda if n_cuda > 0 else 1
+            if len(chunk_modules) < n_stages:
+                raise ValueError(
+                    f"{len(chunk_modules)} chunks cannot fill {n_stages} "
+                    "stages (need at least one chunk per stage)"
+                )
+            base, rem = divmod(len(chunk_modules), n_stages)
+            counts = [base + (1 if i < rem else 0) for i in range(n_stages)]
+
+        it = iter(chunk_modules)
+        return [[next(it) for _ in range(c)] for c in counts]
 
     def _resolve_devices(self, devices):
         if devices is None:
@@ -858,6 +1027,18 @@ class Pipeline:
         s = scale if scale is not None else 1.0 / n_microbatches
         for st in self.stages:
             st.flush_grads(scale=s)
+
+    def close(self):
+        """Release stage background resources (offloaded stages' loader and
+        writeback threads). Idempotent; plain stages no-op."""
+        for st in self.stages:
+            st.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @torch.no_grad()
     def infer(
@@ -1057,6 +1238,13 @@ def _run_step(
         rank_ops = _build_1f1b_rank_ops(num_stages, m)
     else:  # staggered_1b1f
         rank_ops = _build_staggered_1b1f_rank_ops(num_stages, m)
+
+    # Announce the step to every stage now that the op order is known.
+    # Offloaded stages expand their op list into a chunk prefetch itinerary
+    # here (plain stages no-op), so their loaders start prefetching before
+    # the workers even launch.
+    for s, st in enumerate(stages):
+        st.begin_step(rank_ops[s], m)
 
     if profile_path:
         from torch.profiler import ProfilerActivity, profile as _torch_profile

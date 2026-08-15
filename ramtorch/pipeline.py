@@ -395,6 +395,16 @@ class Stage:
         with self._lock:
             self._cache.clear()
 
+    # ------------------------------------------------------------------
+    def begin_step(self, ops, n_microbatches: int):
+        """Hook called by the executor once the schedule's per-stage op list
+        is known, before any op runs. No-op for a plain resident stage;
+        :class:`ramtorch.pipeline_offload.OffloadStage` announces its chunk
+        prefetch itinerary here."""
+
+    def close(self):
+        """Hook for stages owning background resources (no-op here)."""
+
 
 # ── Overlap engine ────────────────────────────────────────────────────────────
 

@@ -7,9 +7,11 @@ from .pipeline_relay import run_pipeline_relay, Pipeline
 from .pipeline_easy import PipelineModel, auto_split_spec, PipelinePaddingWarning
 from .pipeline_optimizer import PipelineOptimizer
 from .offload import OffloadModel, OffloadStepResult, offload_checkpoint
+from .pipeline_offload import OffloadStage
 from .nvme_store import NvmeTensorStore
 from . import schedule_simulator
 from . import offload_simulator
+from . import pipeline_offload_simulator
 
 __all__ = [
     "Linear",
@@ -26,7 +28,9 @@ __all__ = [
     "OffloadModel",
     "OffloadStepResult",
     "offload_checkpoint",
+    "OffloadStage",
     "NvmeTensorStore",
     "schedule_simulator",
     "offload_simulator",
+    "pipeline_offload_simulator",
 ]

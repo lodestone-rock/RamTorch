@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 
 import torch
 import torch.nn as nn
@@ -139,8 +140,24 @@ def main() -> int:
                     help="mark each block's heavy FF with offload_checkpoint "
                          "in its own forward (implies --backward keep): "
                          "marked parts recompute, the rest keeps activations")
+    ap.add_argument("--grad-accum", default="stream",
+                    choices=["stream", "cpu"],
+                    help="grad accumulation for streamed chunks: 'stream' "
+                         "keeps accumulators on GPU (evict/reload like "
+                         "weights, zero CPU math), 'cpu' is the legacy "
+                         "per-microbatch D2H writeback + CPU add")
+    ap.add_argument("--acc-slots", type=int, default=None,
+                    help="GPU slots for streamed grad accumulators "
+                         "(default: same as --window)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--save", type=str, default="", help="optional checkpoint path")
+    ap.add_argument("--profile", action="store_true",
+                    help="capture a kineto profile (profile_step<N>.json) "
+                         "during the profile window")
+    ap.add_argument("--profile-start", type=int, default=20,
+                    help="first step to profile (after this many warm steps)")
+    ap.add_argument("--profile-steps", type=int, default=2,
+                    help="how many steps to profile (keeps the files small)")
     args = ap.parse_args()
 
     if args.selective and args.backward != "keep":
@@ -194,6 +211,8 @@ def main() -> int:
         nvme=args.nvme,
         nvme_path=args.nvme_path or None,
         keep_activations=keep_activations,
+        grad_accum=args.grad_accum,
+        acc_slots=args.acc_slots,
     )
     print(f"model: {len(chunks)} chunks, {n_params / 1e6:.1f}M params "
           f"({n_params * 4 / 2**20:.0f} MiB fp32 full-resident)")
@@ -226,13 +245,22 @@ def main() -> int:
 
     model.train()
     step, running = 0, 0.0
+    step_times: list[float] = []          # clean steps only (no warmup/profiler)
     done = False
     while not done:
         for x, y in train_loader:
-            res = model.step(x, targets=y, loss_fn=F.cross_entropy)
+            in_window = (args.profile and
+                         args.profile_start <= step
+                         < args.profile_start + args.profile_steps)
+            t0 = time.perf_counter()
+            res = model.step(x, targets=y, loss_fn=F.cross_entropy,
+                             profile_path=(f"profile_step{step}.json"
+                                           if in_window else None))
             model.flush_grads()
             opt.step()
             model.zero_grad_acc()
+            if step > 0 and not in_window:
+                step_times.append(time.perf_counter() - t0)
 
             running += res.loss.item()
             step += 1
@@ -242,6 +270,10 @@ def main() -> int:
             if step >= args.steps:
                 done = True
                 break
+
+    if step_times:
+        print(f"  avg step time: {sum(step_times) / len(step_times) * 1e3:.1f} ms "
+              f"over {len(step_times)} clean steps (warmup + profiled excluded)")
 
     # ── 4. Evaluate — streamed forward, any batch size ────────────────────────
     model.eval()

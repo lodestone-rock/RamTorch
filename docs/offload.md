@@ -13,6 +13,9 @@ real loader/writeback overlap engine.
 > **End-to-end training:** [`examples/mnist_offload_example.py`](../examples/mnist_offload_example.py)
 > **Full study:** [`examples/offload_vs_plain_demo.py`](../examples/offload_vs_plain_demo.py)
 > **Design simulator:** `python -m ramtorch.offload_simulator --help`
+> **Multiple GPUs?** The same engine streams weights *inside a pipeline stage*
+> — see "Streaming inside a pipeline stage" below and
+> [docs/pipeline_parallel.md](pipeline_parallel.md).
 
 ---
 
@@ -24,8 +27,14 @@ copy for chunk `i+1` overlaps the compute of chunk `i`. `pin` evenly-spaced
 chunks stay on the GPU permanently (they never load, never evict, easing PCIe
 traffic at the cost of their memory). Eviction is **farthest-next-use**
 (Belady — optimal, because the chunk itinerary is known in advance). Backward
-gradient writebacks return to pinned CPU accumulators over a D2H stream via a
-separate **writeback thread**.
+gradient accumulation also happens **on the GPU** (`grad_accum="stream"`, the
+default): each streamed chunk's accumulator occupies one of `acc_slots`
+bounded GPU slots (default = `window`), spilling D2H / reloading H2D like a
+weight when slots run out — a plain overwrite copy, zero CPU arithmetic. The
+legacy `grad_accum="cpu"` mode instead ships every microbatch's grads D2H and
+adds them into pinned CPU accumulators on a **writeback thread**; it costs a
+D2H packet plus serial host math per microbatch, which stalls compute-bound
+configs.
 
 **Peak GPU weight memory ≈ `(window + pin)` chunks** — independent of how many
 chunks the model has.
@@ -124,6 +133,8 @@ For a runnable streamed-eval loop with accuracy + peak-memory reporting, see
 | `pin` | `0` | Number of **evenly-spaced** chunks pinned resident (never loaded/evicted). Eases PCIe pressure and steadies the schedule at the cost of their memory. `pin_layers=[...]` overrides with explicit indices. |
 | `nvme` | `0` | Number of chunks whose **masters live on disk** instead of CPU RAM (interleaved placement; `nvme_layers=[...]` overrides, `nvme_path=` required). Saves host RAM at the cost of slower loads for those chunks — see "The NVMe tier" below. |
 | `keep_activations` | `False` | Backward strategy: `False` (recompute), `True` (keep), or `"checkpoint"` (see below). |
+| `grad_accum` | `"stream"` | Where streamed chunks accumulate grads. `"stream"`: on the GPU in `acc_slots` bounded slots, spilling/reloading over the copy streams like weights — zero CPU math, grad PCIe traffic per *step* when slots suffice. `"cpu"` (legacy): per-microbatch D2H packets added into pinned CPU buffers by the writeback thread. |
+| `acc_slots` | `window` | GPU slots for `"stream"` accumulators. `acc_slots ≥` streamed-chunk count keeps every accumulator resident between flushes; smaller values trade PCIe traffic for memory (one extra chunk-sized GPU buffer per slot). |
 
 ### `keep_activations` — the three backward strategies
 
@@ -411,6 +422,42 @@ Large `stall` / low `gpu%` means you're transfer-bound.
 
 ---
 
+## Streaming inside a pipeline stage (multiple GPUs)
+
+The engine also powers **weight offloading inside pipeline parallelism**: pass
+a pipeline stage to `Pipeline(stage_modules=...)` as a *list* of chunk modules
+(the same dicing convention) and it becomes an
+`ramtorch.pipeline_offload.OffloadStage` — the stage's masters live in CPU
+pinned RAM and stream through an `offload_window`-slot window on that stage's
+GPU, prefetched in the pipeline schedule's exact chunk order (the executor's
+static op list is announced to the loader before the step runs, so loads
+overlap compute *and* pipeline bubbles; the `staggered_1b1f` F↔B turnaround
+reuses the resident chunk for free).
+
+```python
+pipe = Pipeline(stage_modules=[[Block() for _ in range(12)],  # list -> streamed
+                               nn.Sequential(...)],           # module -> resident
+                devices=["cuda:0", "cuda:1"],
+                offload_window=2, offload_pin=0)
+```
+
+Differences from the single-GPU engine:
+
+* Backward strategies are `True` (keep) and `"checkpoint"` only — engine
+  recompute mode is rejected inside the pipeline (its no-grad forward would
+  leave the last stage's loss graph-disconnected at the executor's loss op).
+* **No NVMe tier**, deliberately: pipeline training from disk rewrites every
+  stage's masters every step — guaranteed drive thrashing.
+* Simulate the combined system with
+  `python -m ramtorch.pipeline_offload_simulator` (pipeline schedule + per-stage
+  streaming in one model).
+
+Full guide: [docs/pipeline_parallel.md](pipeline_parallel.md) ("Streaming stage
+weights from CPU RAM"). Bit-parity suite: `examples/pipeline_offload_check.py`;
+end-to-end run: `examples/mnist_pipeline_offload.py`.
+
+---
+
 ## Profiling a real step
 
 `step(profile_path=...)` writes a Chrome-trace (Perfetto) JSON with compute
@@ -474,4 +521,4 @@ and wrapping them in `OffloadModel`.
 | `offload_warmup_study.py` | Preload ("warmup") phase vs greedy start across load/compute ratios |
 | `offload_sim_check.py` | `offload_simulator` invariants + agreement with the real executor |
 
-(`vshape_schedule_check.py` belongs to the *pipeline* schedules, not offload — see `docs/pipeline_parallel.md`.)
+(`vshape_schedule_check.py` belongs to the *pipeline* schedules, not offload — see `docs/pipeline_parallel.md`. The pipeline+offload combination — `pipeline_offload_check.py`, `mnist_pipeline_offload.py`, and the `--offload` flag of `mnist_pipeline_big_transformer_manual.py` — is documented there too.)
