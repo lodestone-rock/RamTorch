@@ -82,10 +82,14 @@ def seq_reference_grads(chunks_flat, x, y, m, loss_fn):
 
 
 def run_config(devices, schedule, mode, window, pin, errs,
-               m=4, dim=16, chunks_per_stage=4, mixed=False):
+               m=4, dim=16, chunks_per_stage=4, mixed=False,
+               grad_accum="stream", acc_slots=None):
     """One offloaded-pipeline config vs plain pipeline + sequential ref."""
+    acc_tag = "" if grad_accum == "stream" else f" ga={grad_accum}"
+    if acc_slots is not None:
+        acc_tag += f" slots={acc_slots}"
     tag = (f"[{devices[0]}/{devices[-1]} {schedule} {MODE_LABEL[mode]} "
-           f"W={window} pin={pin}{' mixed' if mixed else ''}]")
+           f"W={window} pin={pin}{' mixed' if mixed else ''}{acc_tag}]")
     n_before = len(errs)
 
     src = [make_chunks(chunks_per_stage, dim, seed=s) for s in range(2)]
@@ -101,7 +105,9 @@ def run_config(devices, schedule, mode, window, pin, errs,
 
     pipe = Pipeline(stage_modules=off_spec, devices=devices,
                     offload_window=window, offload_pin=pin,
-                    offload_keep_activations=mode)
+                    offload_keep_activations=mode,
+                    offload_grad_accum=grad_accum,
+                    offload_acc_slots=acc_slots)
     ref = Pipeline(stage_modules=plain_spec, devices=devices)
 
     torch.manual_seed(1)
@@ -456,6 +462,17 @@ def main() -> int:
                            chunks_per_stage=L)
         run_config(devices, "staggered_1b1f", True, 2, 0, errs,
                    chunks_per_stage=L, mixed=True)
+        # legacy CPU packet accumulation stays supported ...
+        run_config(devices, "staggered_1b1f", True, 2, 0, errs,
+                   chunks_per_stage=L, grad_accum="cpu")
+        run_config(devices, "gpipe", "checkpoint", 2, 0, errs,
+                   chunks_per_stage=L, grad_accum="cpu")
+        # ... and acc_slots=1 forces constant evict/reload round trips —
+        # accumulated values must survive the D2H/H2D moves bit-exactly
+        run_config(devices, "staggered_1b1f", True, 2, 0, errs,
+                   chunks_per_stage=L, acc_slots=1)
+        run_config(devices, "gpipe", True, 1, 0, errs,
+                   chunks_per_stage=L, acc_slots=1)
         for mode in (True, "checkpoint"):
             check_tuple(devices, mode, errs)
         check_autocast(devices, errs)

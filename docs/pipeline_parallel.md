@@ -389,6 +389,8 @@ pipe = Pipeline(
     offload_window=2,                # streamed GPU slots per offloaded stage
     offload_pin=0,                   # chunks pinned permanently on the GPU
     offload_keep_activations=True,   # or "checkpoint" (recompute memory)
+    offload_grad_accum="stream",     # default: accumulate grads ON the GPU
+    offload_acc_slots=None,          # GPU accumulator slots (default: window)
 )
 res = pipe.step(x, targets=y, schedule="staggered_1b1f",
                 n_microbatches=8, loss_fn=F.cross_entropy)
@@ -404,7 +406,14 @@ chunks via `chunk_modules=` and let it split them across the devices (see
 streamed setup).
 
 **GPU weight memory per offloaded stage ≈ `(window + pin)` chunks** instead of
-the whole shard. Chunks follow the `OffloadModel` dicing convention (chunk
+the whole shard (plus `acc_slots` chunk-sized grad accumulators during
+training). With `offload_grad_accum="stream"` (default) each streamed chunk's
+grad accumulator lives on the GPU and spills/reloads over the copy streams
+like a weight — zero CPU arithmetic; when `acc_slots` covers the streamed
+chunks, grads cross PCIe once per step at `flush_grads()`. The legacy
+`offload_grad_accum="cpu"` ships every microbatch's grads D2H and adds them
+into pinned CPU buffers on the writeback thread — per-microbatch PCIe traffic
+plus serial host math, which stalls compute-bound configs. Chunks follow the `OffloadModel` dicing convention (chunk
 `i+1` consumes chunk `i`'s output, tuples fine); the stage's own input/output
 contract is unchanged, so mixing offloaded and resident stages, tuple stage
 boundaries, `autocast=`, `grad_outputs=`, and `infer()` all work as usual.

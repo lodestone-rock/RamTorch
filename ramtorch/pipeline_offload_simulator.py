@@ -35,6 +35,20 @@ Model (one instance of the ``offload_simulator`` machinery PER STAGE):
         stage's own ``F(s, mb)`` (the loss — same device, no comm).
   * Every backward chunk emits a grad writeback on the D2H channel.
 
+Grad accumulation modes (``grad_mode=``):
+  * ``"writeback"`` (current implementation): every backward chunk emits a
+    per-microbatch grad packet — D2H copy (``td2h``) then, if ``tcpu`` > 0, a
+    serial CPU accumulate (models ``grad_acc += staging``, the measured
+    bottleneck on real hardware: ~100-150 ms per 800 MB packet).
+  * ``"stream"``: the grad ACCUMULATOR is streamed like the weights. Zero-
+    init on first touch (free, occupies an ``acc_slots`` residency slot), GPU
+    add at the end of each B (free), H2D reload (``th2d``) when it fell out
+    of residency, D2H writeback (``td2h``) to hand a slot back or to flush.
+    The CPU does zero math — RAM is storage only. With ``acc_slots >= L``
+    the accs never leave the GPU (one writeback per chunk per step); with
+    small ``acc_slots`` it degrades to a load->add->writeback round trip per
+    microbatch visit.
+
 Simplifications (deliberate): activation hops cost ``comm`` latency but do NOT
 occupy the h2d/d2h channels (the premise: boundary activations are small next
 to weights); host DDR bandwidth shared across GPUs is not modeled; the
@@ -150,11 +164,14 @@ class PipelineOffloadResult:
 
     ``spans[s]`` maps channel -> ordered ``(op, (start, end))``:
       * ``"gpu"``: op = ``(kind, mb, chunk)`` with kind "F"/"B"
-      * ``"h2d"``: op = ``("L", chunk)`` weight load
-      * ``"d2h"``: op = ``("G", chunk)`` grad writeback
+      * ``"h2d"``: op = ``("L", chunk)`` weight load or ``("A", chunk)``
+        grad-accumulator reload (stream mode)
+      * ``"d2h"``: op = ``("G", chunk)`` grad / accumulator writeback
+      * ``"cpu"``: op = ``("C", chunk)`` CPU accumulate (writeback mode
+        with ``tcpu`` > 0)
     """
 
-    CHANNELS = ("gpu", "h2d", "d2h")
+    CHANNELS = ("gpu", "h2d", "d2h", "cpu")
 
     def __init__(
         self,
@@ -173,6 +190,13 @@ class PipelineOffloadResult:
         n_loads: List[int],
         peak_resident: List[int],
         ref_makespan: float,
+        *,
+        grad_mode: str = "writeback",
+        tcpu: float = 0.0,
+        acc_slots: int = 0,
+        n_acc_loads: Optional[List[int]] = None,
+        n_acc_wb: Optional[List[int]] = None,
+        peak_acc: Optional[List[int]] = None,
     ):
         self.p, self.m, self.chunks, self.window = p, m, chunks, window
         self.tf, self.tb, self.th2d, self.td2h, self.comm = tf, tb, th2d, td2h, comm
@@ -182,6 +206,15 @@ class PipelineOffloadResult:
         self.n_loads = n_loads
         self.peak_resident = peak_resident
         self.ref_makespan = ref_makespan
+        self.grad_mode = grad_mode
+        self.tcpu = tcpu
+        self.acc_slots = acc_slots
+        self.n_acc_loads = n_acc_loads or [0] * p
+        self.n_acc_wb = n_acc_wb or [0] * p
+        self.peak_acc = peak_acc or [0] * p
+        # hide the cpu row unless something actually ran there
+        if not any(st.get("cpu") for st in spans):
+            self.CHANNELS = ("gpu", "h2d", "d2h")
         self.makespan = max(
             (en for st_spans in spans for ch in st_spans.values()
              for _, (_, en) in ch),
@@ -223,12 +256,20 @@ class PipelineOffloadResult:
             "makespan": self.makespan,
             "ref_makespan": self.ref_makespan,
             "overhead_vs_ref": self.overhead_vs_ref,
+            "grad_mode": self.grad_mode,
+            "tcpu": self.tcpu,
+            "acc_slots": self.acc_slots,
             "gpu_util": [self.util(s, "gpu") for s in range(self.p)],
             "h2d_util": [self.util(s, "h2d") for s in range(self.p)],
             "d2h_util": [self.util(s, "d2h") for s in range(self.p)],
+            "cpu_util": [self.util(s, "cpu") if "cpu" in self.CHANNELS
+                         else 0.0 for s in range(self.p)],
             "loads": list(self.n_loads),
             "naive_loads": [self.naive_loads(s) for s in range(self.p)],
+            "acc_loads": list(self.n_acc_loads),
+            "acc_writebacks": list(self.n_acc_wb),
             "peak_resident": list(self.peak_resident),
+            "peak_acc": list(self.peak_acc),
         }
 
 
@@ -244,60 +285,127 @@ def simulate_pipeline_offload(
     td2h: float = 0.5,
     comm: float = 0.0,
     pinned: Optional[FrozenSet[int]] = None,
+    grad_mode: str = "writeback",
+    tcpu: float = 0.0,
+    acc_slots: Optional[int] = None,
 ) -> PipelineOffloadResult:
     """Discrete-event simulation: p offload state machines + cross-stage deps.
 
     ``tf``/``tb``/``th2d``/``td2h`` are PER-CHUNK costs (a stage-level forward
     costs ``chunks * tf``). ``pinned`` chunk indices (same set on every stage)
     are permanently GPU-resident on top of the ``window`` streaming slots.
+
+    ``grad_mode="writeback"``: every B chunk emits a per-microbatch grad
+    packet: D2H copy (``td2h``), then a serial CPU accumulate (``tcpu``, 0
+    disables — the pre-fix simulator behavior). ``grad_mode="stream"``: the
+    grad accumulator is streamed like the weights through ``acc_slots``
+    residency slots (default = ``window``); zero-init first touch is free,
+    reloads cost ``th2d`` on the H2D channel, evictions/flushes cost ``td2h``
+    on the D2H channel, and the CPU does nothing. Pinned chunks accumulate
+    on-GPU in both modes (no grad traffic), matching ``OffloadModel``.
     """
     if window < 1:
         raise ValueError(f"window must be >= 1, got {window}")
+    if grad_mode not in ("writeback", "stream"):
+        raise ValueError(f"grad_mode must be writeback|stream, got {grad_mode!r}")
     pinned = frozenset(pinned or ())
     for c in pinned:
         if not (0 <= c < chunks):
             raise ValueError(f"pinned chunk {c} out of range [0, {chunks})")
+    acc_slots = window if acc_slots is None else acc_slots
+    if grad_mode == "stream" and acc_slots < 1:
+        raise ValueError(f"acc_slots must be >= 1, got {acc_slots}")
 
     p = len(rank_ops)
     itins, firsts, lasts = expand_rank_ops(rank_ops, chunks)
     m = 1 + max((mb for itin in itins for _, mb, _ in itin), default=-1)
     n_ops = [len(itin) for itin in itins]
     capacity = window + len(pinned)
+    stream = grad_mode == "stream" and td2h > 0
 
     # chunk -> itinerary positions, per stage (Belady next-use queries)
     uses: List[List[List[int]]] = [
         [[] for _ in range(chunks)] for _ in range(p)
     ]
+    acc_uses: List[List[List[int]]] = [
+        [[] for _ in range(chunks)] for _ in range(p)
+    ]
     for s, itin in enumerate(itins):
-        for i, (_, _, c) in enumerate(itin):
+        for i, (k, _, c) in enumerate(itin):
             uses[s][c].append(i)
+            if k == "B":
+                acc_uses[s][c].append(i)
 
     def next_use(s: int, chunk: int, from_pos: int) -> float:
         us = uses[s][chunk]
         j = bisect.bisect_left(us, from_pos)
         return us[j] if j < len(us) else INF
 
+    def next_acc_use(s: int, chunk: int, from_pos: int) -> float:
+        us = acc_uses[s][chunk]
+        j = bisect.bisect_left(us, from_pos)
+        return us[j] if j < len(us) else INF
+
     # per-stage channel state
     resident: List[set] = [set(pinned) for _ in range(p)]
     comp_idx = [0] * p
-    # gpu_cur[s] = (itin_index, start); h2d_cur[s] = (chunk, start);
-    # d2h_cur[s] = (chunk, start)
+    # gpu_cur[s] = (itin_index, start); h2d_cur[s] = (kind, chunk, start)
+    # with kind "L" weight load / "A" acc reload; d2h_cur[s] = (chunk, start);
+    # cpu_cur[s] = (chunk, start)
     gpu_cur: List[Optional[Tuple[int, float]]] = [None] * p
     gpu_end = [0.0] * p
-    h2d_cur: List[Optional[Tuple[int, float]]] = [None] * p
+    h2d_cur: List[Optional[Tuple[str, int, float]]] = [None] * p
     h2d_end = [0.0] * p
     d2h_cur: List[Optional[Tuple[int, float]]] = [None] * p
     d2h_end = [0.0] * p
     d2h_q: List[deque] = [deque() for _ in range(p)]  # (chunk, ready_time)
+    cpu_cur: List[Optional[Tuple[int, float]]] = [None] * p
+    cpu_end = [0.0] * p
+    cpu_q: List[deque] = [deque() for _ in range(p)]  # (chunk, ready_time)
+
+    # stream-mode grad accumulator residency (streamed chunks only)
+    acc_res: List[set] = [set() for _ in range(p)]
+    acc_dirty: List[set] = [set() for _ in range(p)]
+    acc_touched: List[set] = [set() for _ in range(p)]
 
     spans: List[Dict[str, List[Tuple[Tuple, Span]]]] = [
-        {"gpu": [], "h2d": [], "d2h": []} for _ in range(p)
+        {"gpu": [], "h2d": [], "d2h": [], "cpu": []} for _ in range(p)
     ]
     n_loads = [0] * p
+    n_acc_loads = [0] * p
+    n_acc_wb = [0] * p
     peak_res = [len(pinned) for _ in range(p)]
+    peak_acc = [0] * p
     # (stage, kind, mb) -> end time of that stage-op's LAST chunk
     done: Dict[Tuple[int, str, int], float] = {}
     now = 0.0
+
+    def running_b_chunk(s: int) -> Optional[int]:
+        """Chunk of the B op currently on the GPU (its acc is in use)."""
+        if gpu_cur[s] is None:
+            return None
+        k, _, c = itins[s][gpu_cur[s][0]]
+        return c if k == "B" else None
+
+    def acc_make_room(s: int, need_pos: int) -> bool:
+        """Free an acc slot for a need at ``need_pos``: True if one is free
+        or a clean, idle acc with a farther next B use was evicted (its
+        value is safe in RAM — a later reload brings it back)."""
+        if len(acc_res[s]) < acc_slots:
+            return True
+        in_use = running_b_chunk(s)
+        cleaning = d2h_cur[s][0] if d2h_cur[s] is not None else None
+        victim, victim_nu = None, float(need_pos)
+        for r in acc_res[s]:
+            if r == in_use or r == cleaning or r in acc_dirty[s]:
+                continue
+            nu = next_acc_use(s, r, comp_idx[s])
+            if nu > victim_nu:
+                victim, victim_nu = r, nu
+        if victim is None:
+            return False
+        acc_res[s].discard(victim)
+        return True
 
     def dep_ready(s: int, i: int) -> Optional[float]:
         """Earliest time the cross-stage dependency of itinerary op ``i`` on
@@ -325,18 +433,33 @@ def simulate_pipeline_offload(
                 spans[s]["gpu"].append(((kind, mb, c), (st, gpu_end[s])))
                 if lasts[s][(kind, mb)] == i:
                     done[(s, kind, mb)] = gpu_end[s]
-                if kind == "B" and td2h > 0:
-                    d2h_q[s].append((c, gpu_end[s]))
+                if kind == "B" and td2h > 0 and c not in pinned:
+                    if stream:
+                        acc_dirty[s].add(c)  # GPU add landed in the acc
+                    else:
+                        d2h_q[s].append((c, gpu_end[s]))
                 gpu_cur[s] = None
             if h2d_cur[s] is not None and h2d_end[s] <= now + _EPS:
-                c, st = h2d_cur[s]
-                spans[s]["h2d"].append((("L", c), (st, h2d_end[s])))
+                lk, c, st = h2d_cur[s]
+                spans[s]["h2d"].append(((lk, c), (st, h2d_end[s])))
                 h2d_cur[s] = None
-                resident[s].add(c)
+                if lk == "L":
+                    resident[s].add(c)
+                else:  # "A": acc reload landed
+                    acc_res[s].add(c)
+                    peak_acc[s] = max(peak_acc[s], len(acc_res[s]))
             if d2h_cur[s] is not None and d2h_end[s] <= now + _EPS:
                 c, st = d2h_cur[s]
                 spans[s]["d2h"].append((("G", c), (st, d2h_end[s])))
                 d2h_cur[s] = None
+                if stream:
+                    acc_dirty[s].discard(c)  # value safe in RAM; stays resident
+                elif tcpu > 0:
+                    cpu_q[s].append((c, d2h_end[s]))
+            if cpu_cur[s] is not None and cpu_end[s] <= now + _EPS:
+                c, st = cpu_cur[s]
+                spans[s]["cpu"].append((("C", c), (st, cpu_end[s])))
+                cpu_cur[s] = None
 
         # 2) start whatever can start at `now` (fixed point for zero-cost ops)
         progressed = False
@@ -346,55 +469,104 @@ def simulate_pipeline_offload(
                 i = comp_idx[s]
                 kind, _, c = itins[s][i]
                 dep = dep_ready(s, i)
-                if (c in resident[s] and dep is not None
-                        and dep <= now + _EPS):
+                ok = (c in resident[s] and dep is not None
+                      and dep <= now + _EPS)
+                if ok and stream and kind == "B" and c not in pinned:
+                    # the GPU add at the end of B needs the acc on device and
+                    # not mid-writeback (the copy must not race the add)
+                    if (d2h_cur[s] is not None and d2h_cur[s][0] == c):
+                        ok = False
+                    elif c in acc_res[s]:
+                        pass
+                    elif c not in acc_touched[s] and acc_make_room(s, i):
+                        acc_res[s].add(c)  # zero-init in place: no transfer
+                        acc_touched[s].add(c)
+                        peak_acc[s] = max(peak_acc[s], len(acc_res[s]))
+                    else:
+                        ok = False  # wait for the acc reload / a free slot
+                if ok:
                     gpu_cur[s] = (i, now)
                     gpu_end[s] = now + (tf if kind == "F" else tb)
                     comp_idx[s] += 1
                     progressed = True
 
-            # grad writeback
+            # cpu accumulate (writeback mode)
+            if cpu_cur[s] is None and cpu_q[s] and cpu_q[s][0][1] <= now + _EPS:
+                c, _ = cpu_q[s].popleft()
+                cpu_cur[s] = (c, now)
+                cpu_end[s] = now + tcpu
+                progressed = True
+
+            # d2h: per-microbatch grad packets (writeback mode) ...
             if d2h_cur[s] is None and d2h_q[s] and d2h_q[s][0][1] <= now + _EPS:
                 c, _ = d2h_q[s].popleft()
                 d2h_cur[s] = (c, now)
                 d2h_end[s] = now + td2h
                 progressed = True
-
-            # prefetch: earliest itinerary chunk not resident on this stage
-            if h2d_cur[s] is None:
-                cand: Optional[Tuple[int, int]] = None  # (chunk, needed_pos)
-                for pos in range(comp_idx[s], n_ops[s]):
-                    c = itins[s][pos][2]
-                    if c not in resident[s]:
-                        cand = (c, pos)
+            # ... or acc writebacks (stream mode): finals (past their last B)
+            # must go out anyway; others only under slot pressure, farthest
+            # next use first (the acc stays resident and turns clean)
+            elif d2h_cur[s] is None and stream and acc_dirty[s]:
+                in_use = running_b_chunk(s)
+                best, best_nu = None, -1.0
+                for c in acc_dirty[s]:
+                    if c == in_use:
+                        continue
+                    nu = next_acc_use(s, c, comp_idx[s])
+                    if nu == INF:
+                        best, best_nu = c, INF
                         break
-                if cand is not None:
-                    c, pos = cand
-                    can_start = len(resident[s]) < capacity
-                    if not can_start:
-                        # Belady: evict the farthest-next-use resident chunk,
-                        # never the one compute is running, never pinned, and
-                        # only if farther than the candidate's need
-                        in_use = (
-                            itins[s][gpu_cur[s][0]][2]
-                            if gpu_cur[s] is not None else None
-                        )
-                        victim, victim_nu = None, -1.0
-                        for r in resident[s]:
-                            if r == in_use or r in pinned:
-                                continue
-                            nu = next_use(s, r, comp_idx[s])
-                            if nu > victim_nu:
-                                victim, victim_nu = r, nu
-                        if victim is not None and victim_nu > pos:
-                            resident[s].discard(victim)
-                            can_start = True
-                    if can_start:
-                        h2d_cur[s] = (c, now)
-                        h2d_end[s] = now + th2d
-                        n_loads[s] += 1
-                        peak_res[s] = max(peak_res[s], len(resident[s]) + 1)
-                        progressed = True
+                    if len(acc_res[s]) >= acc_slots and nu > best_nu:
+                        best, best_nu = c, nu
+                if best is not None:
+                    d2h_cur[s] = (best, now)
+                    d2h_end[s] = now + td2h
+                    n_acc_wb[s] += 1
+                    progressed = True
+
+            # prefetch: earliest unmet need on this stage — a weight load
+            # (any op) or, in stream mode, an evicted acc's reload (B ops)
+            if h2d_cur[s] is None:
+                for pos in range(comp_idx[s], n_ops[s]):
+                    kind, _, c = itins[s][pos]
+                    if c not in resident[s]:
+                        can_start = len(resident[s]) < capacity
+                        if not can_start:
+                            # Belady: evict the farthest-next-use resident
+                            # chunk, never the one compute is running, never
+                            # pinned, and only if farther than the need
+                            in_use = (
+                                itins[s][gpu_cur[s][0]][2]
+                                if gpu_cur[s] is not None else None
+                            )
+                            victim, victim_nu = None, -1.0
+                            for r in resident[s]:
+                                if r == in_use or r in pinned:
+                                    continue
+                                nu = next_use(s, r, comp_idx[s])
+                                if nu > victim_nu:
+                                    victim, victim_nu = r, nu
+                            if victim is not None and victim_nu > pos:
+                                resident[s].discard(victim)
+                                can_start = True
+                        if can_start:
+                            h2d_cur[s] = ("L", c, now)
+                            h2d_end[s] = now + th2d
+                            n_loads[s] += 1
+                            peak_res[s] = max(peak_res[s],
+                                              len(resident[s]) + 1)
+                            progressed = True
+                        break  # first unmet weight need wins (or waits)
+                    if (stream and kind == "B" and c not in pinned
+                            and c in acc_touched[s]
+                            and c not in acc_res[s]):
+                        if acc_make_room(s, pos):
+                            h2d_cur[s] = ("A", c, now)
+                            h2d_end[s] = now + th2d
+                            n_acc_loads[s] += 1
+                            progressed = True
+                            break
+                        continue  # slot-blocked: scan on for a weight load
 
         if progressed:
             continue
@@ -405,7 +577,10 @@ def simulate_pipeline_offload(
             or gpu_cur[s] is not None
             or h2d_cur[s] is not None
             or d2h_cur[s] is not None
+            or cpu_cur[s] is not None
             or d2h_q[s]
+            or cpu_q[s]
+            or acc_dirty[s]
             for s in range(p)
         )
         if not work_left:
@@ -414,7 +589,8 @@ def simulate_pipeline_offload(
         for s in range(p):
             for cur, end in ((gpu_cur[s], gpu_end[s]),
                              (h2d_cur[s], h2d_end[s]),
-                             (d2h_cur[s], d2h_end[s])):
+                             (d2h_cur[s], d2h_end[s]),
+                             (cpu_cur[s], cpu_end[s])):
                 if cur is not None:
                     pending.append(end)
             # a stage whose next op waits only on a known future dep time
@@ -440,12 +616,14 @@ def simulate_pipeline_offload(
     return PipelineOffloadResult(
         p, m, chunks, window, tf, tb, th2d, td2h, comm, pinned,
         itins, spans, n_loads, peak_res, ref,
+        grad_mode=grad_mode, tcpu=tcpu, acc_slots=acc_slots,
+        n_acc_loads=n_acc_loads, n_acc_wb=n_acc_wb, peak_acc=peak_acc,
     )
 
 
 # ── ASCII Gantt ───────────────────────────────────────────────────────────────
 
-_ROW_CHAR = {"F": "F", "B": "b", "L": "L", "G": "G"}
+_ROW_CHAR = {"F": "F", "B": "b", "L": "L", "G": "G", "A": "A", "C": "C"}
 
 
 def gantt(res: PipelineOffloadResult, width: int = 120) -> str:
@@ -491,10 +669,12 @@ def plot_gantt(
     import matplotlib.pyplot as plt
     from matplotlib.patches import Patch
 
-    colors = {"F": "#0072B2", "B": "#E69F00", "L": "#009E73", "G": "#CC79A7"}
-    hatches = {"F": "", "B": "//", "L": "", "G": ""}
+    colors = {"F": "#0072B2", "B": "#E69F00", "L": "#009E73", "G": "#CC79A7",
+              "A": "#56B4E9", "C": "#D55E00"}
+    hatches = {"F": "", "B": "//", "L": "", "G": "", "A": "//", "C": ""}
     kind_name = {"F": "forward", "B": "backward", "L": "H2D weight load",
-                 "G": "D2H grad writeback"}
+                 "G": "D2H grad/acc writeback", "A": "H2D acc reload",
+                 "C": "CPU accumulate"}
 
     n = len(results)
     max_ms = max((r.makespan for _, r in results), default=1.0)
@@ -584,13 +764,24 @@ def report(name: str, res: PipelineOffloadResult, width: int = 120) -> str:
         f"  mem={res.total_mem}/{res.chunks} chunks/GPU"
     ]
     for s in range(res.p):
-        out.append(
+        line = (
             f"    s{s}: gpu={100 * res.util(s, 'gpu'):3.0f}%"
             f"  h2d={100 * res.util(s, 'h2d'):3.0f}%"
             f"  d2h={100 * res.util(s, 'd2h'):3.0f}%"
+        )
+        if "cpu" in res.CHANNELS:
+            line += f"  cpu={100 * res.util(s, 'cpu'):3.0f}%"
+        line += (
             f"  loads={res.n_loads[s]:4d}/{mt['naive_loads'][s]:4d} naive"
             f"  peak_res={res.peak_resident[s]}"
         )
+        if res.grad_mode == "stream":
+            line += (
+                f"  accL={res.n_acc_loads[s]:3d}"
+                f"  accW={res.n_acc_wb[s]:3d}"
+                f"  peak_acc={res.peak_acc[s]}"
+            )
+        out.append(line)
     out.append(gantt(res, width))
     return "\n".join(out)
 
@@ -615,6 +806,16 @@ def main() -> int:
                     help="cross-stage activation/grad hop latency")
     ap.add_argument("--pin", type=int, default=0,
                     help="pin this many evenly spaced chunks per stage")
+    ap.add_argument("--grad-mode", choices=("writeback", "stream"),
+                    default="writeback",
+                    help="grad accumulation: per-microbatch D2H+CPU add "
+                         "(writeback) or streamed GPU accumulator (stream)")
+    ap.add_argument("--tcpu", type=float, default=0.0,
+                    help="CPU accumulate cost per grad packet "
+                         "(writeback mode; 0 disables)")
+    ap.add_argument("--acc-slots", type=int, default=None,
+                    help="grad accumulator residency slots per stage "
+                         "(stream mode; default = window)")
     ap.add_argument("--schedule", choices=sorted(_BUILDERS), default="1b1f")
     ap.add_argument("--width", type=int, default=120, help="ascii gantt width")
     ap.add_argument("--plot", type=str, nargs="?", const="", default=None,
@@ -625,11 +826,13 @@ def main() -> int:
     rank_ops = _BUILDERS[args.schedule](p, m)
     pinned = evenly_pinned(L, args.pin)
     kw = dict(tf=args.tf, tb=args.tb, th2d=args.th2d, td2h=args.td2h,
-              comm=args.comm, pinned=pinned)
+              comm=args.comm, pinned=pinned, grad_mode=args.grad_mode,
+              tcpu=args.tcpu, acc_slots=args.acc_slots)
     print(
         f"schedule={args.schedule} p={p} m={m} chunks={L} "
         f"tf={args.tf} tb={args.tb} th2d={args.th2d} td2h={args.td2h} "
-        f"comm={args.comm} pin={args.pin}\n"
+        f"comm={args.comm} pin={args.pin} grad_mode={args.grad_mode}"
+        f" tcpu={args.tcpu} acc_slots={args.acc_slots}\n"
     )
 
     if args.window > 0:

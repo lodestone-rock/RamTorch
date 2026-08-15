@@ -127,6 +127,8 @@ class OffloadStage(Stage):
         window: int = 2,
         pin: int = 0,
         keep_activations: Union[bool, str] = True,
+        grad_accum: str = "stream",
+        acc_slots: Optional[int] = None,
     ):
         # Deliberately NOT calling Stage.__init__: it moves the module onto
         # the stage device, but an offloaded stage's masters must go to CPU
@@ -155,6 +157,8 @@ class OffloadStage(Stage):
             window=window,
             pin=pin,
             keep_activations=keep_activations,
+            grad_accum=grad_accum,
+            acc_slots=acc_slots,
         )
         # ``module`` is what Pipeline.infer's worker calls directly; the
         # engine's streamed forward (inference ring) drops in unchanged.
@@ -187,19 +191,24 @@ class OffloadStage(Stage):
         eng = self.engine
         n = eng.n
         itin: List[int] = []
+        kinds: List[str] = []
         for op in ops:
             kind = op[0]
             if kind == "F":
                 itin.extend(range(n))
+                kinds.extend("F" * n)
             elif kind == "B":
                 itin.extend(range(n - 1, -1, -1))
+                kinds.extend("B" * n)
         with eng._cv:
             eng._check_error()
             # any previous itinerary is fully consumed by now (or belongs to
             # an aborted step) — start this step's future list fresh
             del eng._future[:]
+            del eng._future_kinds[:]
             eng._fpos = 0
             eng._future.extend(itin)
+            eng._future_kinds.extend(kinds)
             eng._cv.notify_all()
         with self._lock:
             self._mb_chunks.clear()

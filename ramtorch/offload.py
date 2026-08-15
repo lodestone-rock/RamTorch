@@ -8,9 +8,27 @@ live in CPU pinned memory, a **loader thread** prefetches upcoming chunks into
 a GPU window of ``window`` slots over a dedicated H2D stream, and ``pin``
 evenly spaced chunks stay permanently on the GPU (they never load, never
 evict, and ease PCIe traffic at the cost of their memory). Eviction is
-farthest-next-use (Belady — optimal, since the itinerary is known). Backward
-grad writebacks return to pinned CPU accumulators over a D2H stream via a
-**writeback thread**. Total GPU weight memory ~= ``window + pin`` chunks.
+farthest-next-use (Belady — optimal, since the itinerary is known). Total GPU
+weight memory ~= ``window + pin`` chunks.
+
+Gradient accumulation for streamed chunks (``grad_accum=``):
+
+* ``"stream"`` (default): the accumulator itself streams like a weight. Each
+  chunk's accumulated grad lives in exactly one place — "empty" (zeroed,
+  nothing since the last flush), on the GPU (``acc_slots`` bounded slots,
+  default = ``window``), or evicted to its pinned CPU buffer. Backward adds
+  happen **on the GPU** on the compute stream; under slot pressure the
+  accumulator is spilled D2H (a plain overwrite copy — zero CPU arithmetic)
+  and reloaded H2D by the loader before that chunk's next backward (the
+  itinerary marks which visits are backwards, so reloads prefetch like
+  weights). ``flush_grads`` spills whatever is still on-GPU in one batch.
+  With ``acc_slots >= streamed chunks`` accumulators never leave the GPU
+  between flushes: grad PCIe traffic drops from once per microbatch to once
+  per step.
+* ``"cpu"`` (legacy): every microbatch's grads are copied D2H as a packet and
+  a **writeback thread** adds them into the pinned CPU accumulators
+  (``grad_acc += staging`` — host math, serialized per stage, and the reason
+  compute-bound configs used to stall).
 
 Optional third tier (``nvme=K`` / ``nvme_layers=...`` + ``nvme_path=``):
 masters of the selected chunks move from CPU RAM to a file on disk, held as
@@ -299,9 +317,23 @@ class _ChunkState:
     """Per-chunk storage: CPU master tensors, grad accumulators, staging."""
 
     def __init__(self, module: nn.Module, gpu_pinned: bool,
-                 device: torch.device, use_cuda: bool, nvme: bool = False):
+                 device: torch.device, use_cuda: bool, nvme: bool = False,
+                 idx: int = -1, pin_acc: bool = False):
         self.module = module
         self.gpu_pinned = gpu_pinned
+        self.idx = idx
+        # streamed-accumulator (grad_accum="stream") state, guarded by the
+        # engine's _cv: the accumulated value lives in EXACTLY one place —
+        #   "empty": zero (nothing accumulated since the last flush/zero)
+        #   "gpu"  : acc_gpu holds it (CPU grad_acc is stale)
+        #   "cpu"  : grad_acc holds it (evicted / spilled)
+        self.acc_where: str = "empty"
+        self.acc_gpu: Optional[Dict[str, torch.Tensor]] = None
+        # last event that must complete before acc_gpu may be read on another
+        # stream (H2D reload or the latest GPU add); acc_fresh marks a reload
+        # the compute stream has not synchronized with yet
+        self.acc_ev = None
+        self.acc_fresh = False
         # nvme masters start as plain CPU tensors here; OffloadModel rehomes
         # them onto the file mapping right after all states are built (the
         # store lays out every nvme chunk in one file, so it needs them all)
@@ -340,11 +372,15 @@ class _ChunkState:
         self.tensors = dict(module.named_parameters()) | dict(
             module.named_buffers()
         )
+        # stream mode transfers accs whole over PCIe: pin them so the copies
+        # run at full speed ("cpu" mode keeps them pageable and stages instead)
         self.grad_acc = {
-            n: torch.zeros_like(p, device="cpu")
+            n: (torch.zeros_like(p, device="cpu").pin_memory() if pin_acc
+                else torch.zeros_like(p, device="cpu"))
             for n, p in module.named_parameters()
         }
         # pinned D2H staging buffers, allocated lazily at first backward
+        # (grad_accum="cpu" packet path only)
         self.staging: Optional[Dict[str, torch.Tensor]] = None
 
 
@@ -432,6 +468,8 @@ class OffloadModel(nn.Module):
         nvme_layers: Optional[Sequence[int]] = None,
         nvme_path: Optional[str] = None,
         keep_activations: Union[bool, str] = False,
+        grad_accum: str = "stream",
+        acc_slots: Optional[int] = None,
     ):
         super().__init__()
         if len(chunks) < 1:
@@ -443,6 +481,12 @@ class OffloadModel(nn.Module):
                 "keep_activations must be False, True, or 'checkpoint', "
                 f"got {keep_activations!r}"
             )
+        if grad_accum not in ("stream", "cpu"):
+            raise ValueError(
+                f"grad_accum must be 'stream' or 'cpu', got {grad_accum!r}"
+            )
+        if acc_slots is not None and acc_slots < 1:
+            raise ValueError(f"acc_slots must be >= 1, got {acc_slots}")
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -482,11 +526,15 @@ class OffloadModel(nn.Module):
         self._nvme_gate_passed = False
         self.nvme_layers = nvme_idx
 
+        self.grad_accum = grad_accum
+        self.acc_slots = window if acc_slots is None else acc_slots
+
         # register chunks so .parameters()/.state_dict() work
         self.chunks = nn.ModuleList(chunks)
+        pin_acc = grad_accum == "stream" and self._cuda
         self._state = [
             _ChunkState(m, i in pinned_idx, self.device, self._cuda,
-                        nvme=i in nvme_idx)
+                        nvme=i in nvme_idx, idx=i, pin_acc=pin_acc)
             for i, m in enumerate(self.chunks)
         ]
 
@@ -510,10 +558,17 @@ class OffloadModel(nn.Module):
         # ── residency state (guarded by one condition variable) ──────────
         self._cv = threading.Condition()
         self._future: List[int] = []      # upcoming chunk uses, itinerary order
+        # aligned op kinds ("F"/"B") — the acc prefetcher only cares about Bs
+        self._future_kinds: List[str] = []
         self._fpos = 0                    # next compute position in _future
         self._resident: Dict[int, _Resident] = {}
         self._in_flight: Optional[int] = None
         self._in_use: Optional[int] = None
+        # streamed grad accumulator residency (grad_accum="stream")
+        self._acc_res: set = set()            # chunk idxs with a GPU acc
+        self._acc_evicting: set = set()       # eviction D2H queued/running
+        self._acc_in_flight: Optional[int] = None  # loader H2D acc reload
+        self._acc_adding: Optional[int] = None     # compute mid-add (no evict)
         self._error: Optional[BaseException] = None
         self._closed = False
 
@@ -521,7 +576,8 @@ class OffloadModel(nn.Module):
         self._h2d_stream = torch.cuda.Stream(self.device) if self._cuda else None
         self._d2h_stream = torch.cuda.Stream(self.device) if self._cuda else None
 
-        self.stats = {"loads": 0, "nvme_loads": 0, "acquire_wait_s": 0.0}
+        self.stats = {"loads": 0, "nvme_loads": 0, "acquire_wait_s": 0.0,
+                      "acc_loads": 0, "acc_evictions": 0}
         # (track, name, start_us, dur_us) spans from the worker threads,
         # collected only while step(profile_path=...) is active — kineto
         # cannot see record_function on threads it did not enter from
@@ -550,6 +606,18 @@ class OffloadModel(nn.Module):
         except ValueError:
             return _INF
 
+    def _next_acc_use(self, layer: int, from_pos: int) -> float:
+        """Position of the next BACKWARD use of ``layer`` (acc Belady)."""
+        pos = from_pos
+        while True:
+            try:
+                pos = self._future.index(layer, pos)
+            except ValueError:
+                return _INF
+            if self._future_kinds[pos] == "B":
+                return pos
+            pos += 1
+
     def _pick_load(self):
         """Under _cv: next (layer, needed_pos) to prefetch, or None."""
         for pos in range(self._fpos, len(self._future)):
@@ -561,37 +629,86 @@ class OffloadModel(nn.Module):
             return layer, pos
         return None
 
-    def _try_start_load(self):
-        """Under _cv: pick a candidate and free a slot for it (Belady).
+    def _pick_acc_load(self):
+        """Under _cv: next evicted acc needed by an upcoming B, or None."""
+        if self.grad_accum != "stream" or self._acc_in_flight is not None:
+            return None
+        for pos in range(self._fpos, len(self._future)):
+            if self._future_kinds[pos] != "B":
+                continue
+            layer = self._future[pos]
+            state = self._state[layer]
+            if state.gpu_pinned or layer in self._acc_res:
+                continue
+            if state.acc_where == "cpu":
+                return layer, pos
+        return None
 
-        Returns the layer to load, or None if there is nothing to do or no
-        slot can be freed yet (the loader then waits for compute progress).
+    def _acc_pick_victim(self, need_pos: float):
+        """Under _cv: farthest-next-B-use resident acc to spill, or None.
+
+        Never picks an acc mid-add or mid-eviction, and never one whose next
+        B use is at/before ``need_pos`` (that eviction would thrash)."""
+        victim, victim_nu = None, float(need_pos)
+        for r in self._acc_res:
+            if r == self._acc_adding or r in self._acc_evicting:
+                continue
+            nu = self._next_acc_use(r, self._fpos)
+            if nu > victim_nu:
+                victim, victim_nu = r, nu
+        return victim
+
+    def _try_start_load(self):
+        """Under _cv: pick the loader's next action.
+
+        Returns ``("w", layer)`` weight load, ``("acc", layer)`` grad-acc
+        reload, ``("evict", layer)`` acc spill needed to free an acc slot,
+        or None (nothing to do / no slot freeable yet — wait for progress).
         """
         cand = self._pick_load()
-        if cand is None:
-            return None
-        layer, pos = cand
-        occupancy = len(self._resident) + (1 if self._in_flight is not None else 0)
-        if occupancy >= self.window:
-            victim, victim_nu = None, -1.0
-            for r in self._resident:
-                if r == self._in_use:
-                    continue
-                nu = self._next_use(r, self._fpos)
-                if nu > victim_nu:
-                    victim, victim_nu = r, nu
-            if victim is None or victim_nu <= pos:
-                return None  # nothing evictable (or eviction would thrash)
-            del self._resident[victim]
-            if self._keep_graph:
-                # the autograd graph still references these tensor objects;
-                # free the storage behind them (refilled before backward)
-                vstate = self._state[victim]
-                if vstate.graph_tensors is not None:
-                    for t in vstate.graph_tensors.values():
-                        t.untyped_storage().resize_(0)
-        self._in_flight = layer
-        return layer
+        if cand is not None:
+            layer, pos = cand
+            occupancy = (len(self._resident)
+                         + (1 if self._in_flight is not None else 0))
+            can_start = occupancy < self.window
+            if not can_start:
+                victim, victim_nu = None, -1.0
+                for r in self._resident:
+                    if r == self._in_use:
+                        continue
+                    nu = self._next_use(r, self._fpos)
+                    if nu > victim_nu:
+                        victim, victim_nu = r, nu
+                if victim is not None and victim_nu > pos:
+                    del self._resident[victim]
+                    if self._keep_graph:
+                        # the autograd graph still references these tensor
+                        # objects; free the storage behind them (refilled
+                        # before backward)
+                        vstate = self._state[victim]
+                        if vstate.graph_tensors is not None:
+                            for t in vstate.graph_tensors.values():
+                                t.untyped_storage().resize_(0)
+                    can_start = True
+            if can_start:
+                self._in_flight = layer
+                return ("w", layer)
+            # weight slot blocked: fall through — an acc reload can still
+            # use the idle H2D link meanwhile
+
+        acc = self._pick_acc_load()
+        if acc is not None:
+            layer, pos = acc
+            occupancy = len(self._acc_res)
+            if occupancy >= self.acc_slots:
+                victim = self._acc_pick_victim(pos)
+                if victim is None:
+                    return None
+                self._acc_evicting.add(victim)
+                return ("evict", victim)
+            self._acc_in_flight = layer
+            return ("acc", layer)
+        return None
 
     def _loader_loop(self):
         try:
@@ -599,15 +716,54 @@ class OffloadModel(nn.Module):
                 torch.cuda.set_device(self.device)
             while True:
                 with self._cv:
-                    layer = self._try_start_load()
-                    while layer is None and not self._closed:
+                    action = self._try_start_load()
+                    while action is None and not self._closed:
                         self._cv.wait()
-                        layer = self._try_start_load()
+                        action = self._try_start_load()
                     if self._closed:
                         return
+                what, layer = action
+                state = self._state[layer]
+
+                if what == "evict":
+                    # hand the spill to the writeback thread (D2H channel);
+                    # put() may block on a full queue — we hold no lock here
+                    self._wb_q.put(("acc_evict", state))
+                    continue
+
+                if what == "acc":
+                    # H2D reload of an evicted grad accumulator
+                    label = f"A{layer} acc reload"
+                    t_us = time.monotonic_ns() / 1e3
+                    with torch.no_grad(), record_function(label):
+                        if self._cuda:
+                            with torch.cuda.stream(self._h2d_stream):
+                                gpu = {
+                                    n: a.to(self.device, non_blocking=True)
+                                    for n, a in state.grad_acc.items()
+                                }
+                                ev = torch.cuda.Event()
+                                ev.record()
+                        else:  # pragma: no cover — cpu engines add in place
+                            gpu, ev = dict(state.grad_acc), None
+                    if self._span_log is not None:
+                        self._span_log.append((
+                            "offload h2d loader", label,
+                            t_us, time.monotonic_ns() / 1e3 - t_us,
+                        ))
+                    with self._cv:
+                        state.acc_gpu = gpu
+                        state.acc_ev = ev
+                        state.acc_fresh = True
+                        state.acc_where = "gpu"
+                        self._acc_res.add(layer)
+                        self._acc_in_flight = None
+                        self.stats["acc_loads"] += 1
+                        self._cv.notify_all()
+                    continue
+
                 # copy outside the lock, on the H2D stream (no_grad so the
                 # copies are plain leaves, not autograd-tracked views)
-                state = self._state[layer]
                 label = (f"N{layer} nvme load" if state.nvme
                          else f"L{layer} h2d load")
                 t_us = time.monotonic_ns() / 1e3
@@ -735,6 +891,10 @@ class OffloadModel(nn.Module):
                         label = "G wb drain"
                         with record_function(label):
                             self._retire_writebacks(wait_all=True)
+                    elif job[0] == "acc_evict":
+                        label = f"G acc evict {job[1].idx}"
+                        with record_function(label):
+                            self._do_acc_evict(job[1])
                     else:
                         label = "G d2h writeback"
                         with record_function(label):
@@ -817,6 +977,43 @@ class OffloadModel(nn.Module):
         self._wb_q.put("drain")
         self._wb_q.join()
 
+    def _do_acc_evict(self, state: _ChunkState) -> None:
+        """Spill a GPU grad accumulator home to its pinned CPU tensor.
+
+        Stream-mode replacement for the per-microbatch CPU accumulate: the
+        value MOVES (plain overwrite copy, no arithmetic) — after this the
+        CPU ``grad_acc`` holds it and the GPU copy is freed. A later B visit
+        reloads it via the loader ("A{i} acc reload")."""
+        with self._cv:
+            gpu, ev = state.acc_gpu, state.acc_ev
+        if gpu is None:  # already spilled (a flush raced this job)
+            with self._cv:
+                self._acc_evicting.discard(state.idx)
+                self._cv.notify_all()
+            return
+        if self._cuda:
+            with torch.no_grad(), torch.cuda.stream(self._d2h_stream):
+                if ev is not None:
+                    # order after the H2D reload / last GPU add of this acc
+                    self._d2h_stream.wait_event(ev)
+                for n, g in gpu.items():
+                    state.grad_acc[n].copy_(g, non_blocking=True)
+                    g.record_stream(self._d2h_stream)
+                done = torch.cuda.Event()
+                done.record()
+            done.synchronize()
+        else:  # pragma: no cover — cpu engines accumulate in place
+            with torch.no_grad():
+                for n, g in gpu.items():
+                    state.grad_acc[n].copy_(g)
+        with self._cv:
+            state.acc_gpu = None
+            state.acc_where = "cpu"
+            self._acc_res.discard(state.idx)
+            self._acc_evicting.discard(state.idx)
+            self.stats["acc_evictions"] += 1
+            self._cv.notify_all()
+
     # ── compute-side residency handshake ───────────────────────────────────
     def _check_error(self):
         if self._error is not None:
@@ -859,14 +1056,26 @@ class OffloadModel(nn.Module):
             # compact the consumed prefix now and then
             if self._fpos > 8 * self.n:
                 del self._future[: self._fpos]
+                del self._future_kinds[: self._fpos]
                 self._fpos = 0
             self._cv.notify_all()
 
-    def _announce(self, itinerary: List[int]):
-        """Append upcoming chunk uses so the loader can prefetch ahead."""
+    def _announce(self, itinerary: List[int],
+                  kinds: Optional[Sequence[str]] = None):
+        """Append upcoming chunk uses so the loader can prefetch ahead.
+
+        ``kinds`` marks each entry "F" or "B" (default all "F"); the loader
+        prefetches evicted grad accumulators for upcoming "B" entries in
+        stream mode. Weight prefetch ignores kinds.
+        """
+        if kinds is None:
+            kinds = ["F"] * len(itinerary)
+        elif len(kinds) != len(itinerary):
+            raise ValueError("kinds must align with the itinerary")
         with self._cv:
             self._check_error()
             self._future.extend(itinerary)
+            self._future_kinds.extend(kinds)
             self._cv.notify_all()
 
     def _call_chunk(self, layer: int, tensors: Dict[str, torch.Tensor],
@@ -966,7 +1175,8 @@ class OffloadModel(nn.Module):
 
         def _run() -> OffloadStepResult:
             self._announce(
-                list(range(self.n)) + list(range(self.n - 1, -1, -1))
+                list(range(self.n)) + list(range(self.n - 1, -1, -1)),
+                kinds=["F"] * self.n + ["B"] * self.n,
             )
             if self.keep_activations == "checkpoint":
                 result = self._step_keep(x, target, loss_fn,
@@ -1118,13 +1328,23 @@ class OffloadModel(nn.Module):
 
     def _accumulate(self, state: _ChunkState,
                     named_grads: Dict[str, torch.Tensor]):
-        """Route param grads: GPU accumulate (pinned) or D2H writeback."""
+        """Route param grads.
+
+        Pinned chunks add into their permanent GPU accumulator. Streamed
+        chunks: ``grad_accum="stream"`` adds on the GPU into a streamed
+        accumulator (zero CPU math); ``"cpu"`` ships a per-microbatch packet
+        to the writeback thread (D2H + CPU add — the legacy path).
+        """
         if state.gpu_pinned:
             # grads stay on the GPU next to the pinned weights
             with torch.no_grad():
                 for nme, g in named_grads.items():
                     state.grad_acc[nme] += g.detach()
-        elif named_grads:
+        elif not named_grads:
+            return
+        elif self.grad_accum == "stream":
+            self._acc_add(state, named_grads)
+        else:
             if self._cuda:
                 ev = torch.cuda.Event()
                 # grads are ready on OUR device's compute stream (record on it
@@ -1135,6 +1355,79 @@ class OffloadModel(nn.Module):
             self._wb_q.put(
                 (state, {nme: g.detach() for nme, g in named_grads.items()}, ev)
             )
+
+    def _acc_add(self, state: _ChunkState,
+                 named_grads: Dict[str, torch.Tensor]):
+        """Add ``named_grads`` into the chunk's streamed GPU accumulator.
+
+        First touch in an accumulation cycle zero-inits the acc in place (no
+        transfer). An evicted acc is reloaded by the loader (it sees this B
+        at the head of the announced future) — we only wait. Blocking here
+        is the stream-mode analogue of the old bounded-queue backpressure.
+        """
+        layer = state.idx
+        if not self._cuda:
+            # device IS the storage tier: add straight into the accumulator
+            with torch.no_grad():
+                for nme, g in named_grads.items():
+                    state.grad_acc[nme] += g.detach()
+            state.acc_where = "cpu"
+            return
+
+        while True:
+            evict_target = None
+            ready = False
+            with self._cv:
+                self._check_error()
+                if layer in self._acc_res and layer not in self._acc_evicting:
+                    self._acc_adding = layer
+                    ready = True
+                elif state.acc_where == "empty":
+                    if len(self._acc_res) < self.acc_slots:
+                        with torch.no_grad():
+                            state.acc_gpu = {
+                                n: torch.zeros_like(a, device=self.device)
+                                for n, a in state.grad_acc.items()
+                            }
+                        state.acc_ev = None
+                        state.acc_fresh = False
+                        state.acc_where = "gpu"
+                        self._acc_res.add(layer)
+                        self._acc_adding = layer
+                        ready = True
+                    else:
+                        # need a slot NOW: any idle resident acc will do
+                        victim = self._acc_pick_victim(-1.0)
+                        if victim is not None:
+                            self._acc_evicting.add(victim)
+                            evict_target = self._state[victim]
+                # acc_where == "cpu": reload is the loader's job — wait
+                if not ready and evict_target is None:
+                    self._cv.wait()
+                    continue
+            if ready:
+                break
+            # enqueue outside the lock (put() may block on a full queue)
+            self._wb_q.put(("acc_evict", evict_target))
+
+        cs = torch.cuda.current_stream(self.device)
+        fresh = getattr(state, "acc_fresh", False)
+        if fresh and state.acc_ev is not None:
+            # the acc landed on the H2D stream: order our adds after it
+            cs.wait_event(state.acc_ev)
+        with torch.no_grad():
+            for nme, g in named_grads.items():
+                state.acc_gpu[nme] += g.detach()
+            if fresh:
+                for t in state.acc_gpu.values():
+                    t.record_stream(cs)
+        ev = torch.cuda.Event()
+        ev.record(cs)
+        with self._cv:
+            state.acc_ev = ev
+            state.acc_fresh = False
+            self._acc_adding = None
+            self._cv.notify_all()
 
     def _step_recompute(self, x, target, loss_fn,
                         grad_outputs=None) -> OffloadStepResult:
@@ -1276,6 +1569,7 @@ class OffloadModel(nn.Module):
         """
         self._wb_drain()
         self._check_error()
+        self._acc_spill_all()
         for state in self._state:
             named = dict(state.module.named_parameters())
             for nme, acc in state.grad_acc.items():
@@ -1288,7 +1582,47 @@ class OffloadModel(nn.Module):
                 torch.mul(acc, scale, out=buf)
                 named[nme].grad = buf
                 acc.zero_()
+            if not state.gpu_pinned:
+                state.acc_where = "empty"  # next cycle zero-inits on GPU
         self.invalidate_residency()
+
+    def _acc_spill_all(self):
+        """Bring every streamed GPU accumulator home to CPU (stream mode).
+
+        Batched on the D2H stream with a single host sync. Runs after
+        ``_wb_drain`` (no eviction jobs in flight) and blocks a concurrent
+        loader reload from racing the spill."""
+        if self.grad_accum != "stream" or not self._cuda:
+            return
+        with self._cv:
+            while ((self._acc_in_flight is not None or self._acc_evicting)
+                   and self._error is None):
+                self._cv.wait()
+            self._check_error()
+            spill = [st for st in self._state if st.acc_gpu is not None]
+            for st in spill:
+                self._acc_evicting.add(st.idx)
+        if not spill:
+            return
+        with torch.no_grad(), torch.cuda.stream(self._d2h_stream):
+            for st in spill:
+                if st.acc_ev is not None:
+                    self._d2h_stream.wait_event(st.acc_ev)
+                for n, g in st.acc_gpu.items():
+                    st.grad_acc[n].copy_(g, non_blocking=True)
+                    g.record_stream(self._d2h_stream)
+            done = torch.cuda.Event()
+            done.record()
+        done.synchronize()
+        with self._cv:
+            for st in spill:
+                st.acc_gpu = None
+                st.acc_where = "cpu"
+                st.acc_ev = None
+                st.acc_fresh = False
+                self._acc_res.discard(st.idx)
+                self._acc_evicting.discard(st.idx)
+            self._cv.notify_all()
 
     def invalidate_residency(self):
         """Drop streamed GPU weight copies so the next use reloads masters.
@@ -1316,6 +1650,20 @@ class OffloadModel(nn.Module):
             self._cv.notify_all()
 
     def zero_grad_acc(self):
+        if self.grad_accum == "stream":
+            with self._cv:
+                while ((self._acc_in_flight is not None
+                        or self._acc_evicting) and self._error is None):
+                    self._cv.wait()
+                self._check_error()
+                for st in self._state:
+                    if not st.gpu_pinned:
+                        st.acc_gpu = None  # drop — the value is discarded
+                        st.acc_where = "empty"
+                        st.acc_ev = None
+                        st.acc_fresh = False
+                        self._acc_res.discard(st.idx)
+                self._cv.notify_all()
         for state in self._state:
             for acc in state.grad_acc.values():
                 acc.zero_()

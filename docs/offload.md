@@ -27,8 +27,14 @@ copy for chunk `i+1` overlaps the compute of chunk `i`. `pin` evenly-spaced
 chunks stay on the GPU permanently (they never load, never evict, easing PCIe
 traffic at the cost of their memory). Eviction is **farthest-next-use**
 (Belady — optimal, because the chunk itinerary is known in advance). Backward
-gradient writebacks return to pinned CPU accumulators over a D2H stream via a
-separate **writeback thread**.
+gradient accumulation also happens **on the GPU** (`grad_accum="stream"`, the
+default): each streamed chunk's accumulator occupies one of `acc_slots`
+bounded GPU slots (default = `window`), spilling D2H / reloading H2D like a
+weight when slots run out — a plain overwrite copy, zero CPU arithmetic. The
+legacy `grad_accum="cpu"` mode instead ships every microbatch's grads D2H and
+adds them into pinned CPU accumulators on a **writeback thread**; it costs a
+D2H packet plus serial host math per microbatch, which stalls compute-bound
+configs.
 
 **Peak GPU weight memory ≈ `(window + pin)` chunks** — independent of how many
 chunks the model has.
@@ -127,6 +133,8 @@ For a runnable streamed-eval loop with accuracy + peak-memory reporting, see
 | `pin` | `0` | Number of **evenly-spaced** chunks pinned resident (never loaded/evicted). Eases PCIe pressure and steadies the schedule at the cost of their memory. `pin_layers=[...]` overrides with explicit indices. |
 | `nvme` | `0` | Number of chunks whose **masters live on disk** instead of CPU RAM (interleaved placement; `nvme_layers=[...]` overrides, `nvme_path=` required). Saves host RAM at the cost of slower loads for those chunks — see "The NVMe tier" below. |
 | `keep_activations` | `False` | Backward strategy: `False` (recompute), `True` (keep), or `"checkpoint"` (see below). |
+| `grad_accum` | `"stream"` | Where streamed chunks accumulate grads. `"stream"`: on the GPU in `acc_slots` bounded slots, spilling/reloading over the copy streams like weights — zero CPU math, grad PCIe traffic per *step* when slots suffice. `"cpu"` (legacy): per-microbatch D2H packets added into pinned CPU buffers by the writeback thread. |
+| `acc_slots` | `window` | GPU slots for `"stream"` accumulators. `acc_slots ≥` streamed-chunk count keeps every accumulator resident between flushes; smaller values trade PCIe traffic for memory (one extra chunk-sized GPU buffer per slot). |
 
 ### `keep_activations` — the three backward strategies
 

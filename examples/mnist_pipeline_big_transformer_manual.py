@@ -246,6 +246,15 @@ def main() -> int:
                     choices=["keep", "checkpoint"],
                     help="offloaded backward: keep per-chunk graphs, or "
                          "per-chunk non-reentrant checkpoint (less memory)")
+    ap.add_argument("--grad-accum", default="stream",
+                    choices=["stream", "cpu"],
+                    help="grad accumulation for streamed chunks: 'stream' "
+                         "keeps accumulators on GPU (evict/reload like "
+                         "weights, zero CPU math), 'cpu' is the legacy "
+                         "per-microbatch D2H writeback + CPU add")
+    ap.add_argument("--acc-slots", type=int, default=None,
+                    help="GPU slots for streamed grad accumulators "
+                         "(default: same as --window)")
     # ── Profiling (bounded to a small step window so files stay small) ──
     ap.add_argument("--profile", action="store_true",
                     help="capture a kineto profile + op-level Perfetto trace "
@@ -304,6 +313,8 @@ def main() -> int:
             offload_window=args.window, offload_pin=args.pin,
             offload_keep_activations=(True if args.offload_mode == "keep"
                                       else "checkpoint"),
+            offload_grad_accum=args.grad_accum,
+            offload_acc_slots=args.acc_slots,
         )
     else:
         stages = build_stages(args.dim, args.depth, args.heads, args.patch,

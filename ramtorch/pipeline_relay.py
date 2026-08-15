@@ -759,6 +759,17 @@ class Pipeline:
                      non-reentrant checkpoint: recompute-level memory,
                      dropout-safe). Engine recompute mode is not supported
                      inside the pipeline.
+    offload_grad_accum :
+                     "stream" (default): grad accumulators live on the GPU in
+                     ``offload_acc_slots`` streaming slots — zero CPU math;
+                     evicted accs spill over D2H and reload over H2D like
+                     weights. "cpu": legacy per-microbatch D2H packet + CPU
+                     accumulate (use when even the acc slots don't fit).
+    offload_acc_slots :
+                     grad-acc residency slots per offloaded stage (default =
+                     ``offload_window``). >= streamed chunks per stage keeps
+                     every acc GPU-resident for the whole step (one spill per
+                     chunk at flush time).
     devices        : one device per stage (default: cuda:i round-robin / CPU)
     fake_compute   : None | "replace" | {"fwd": s|[s...], "bwd": s|[s...]}
     overlap        : per-stage worker threads (True) or sequential debug (False)
@@ -796,6 +807,8 @@ class Pipeline:
         offload_window: int = 2,
         offload_pin: int = 0,
         offload_keep_activations: Union[bool, str] = True,
+        offload_grad_accum: str = "stream",
+        offload_acc_slots: Optional[int] = None,
     ):
         self.model = model
         self.overlap = overlap
@@ -848,6 +861,8 @@ class Pipeline:
                         tracer=None, autocast_dtype=self.autocast_dtype,
                         window=offload_window, pin=offload_pin,
                         keep_activations=offload_keep_activations,
+                        grad_accum=offload_grad_accum,
+                        acc_slots=offload_acc_slots,
                     ))
                 else:
                     if chunked[i]:
