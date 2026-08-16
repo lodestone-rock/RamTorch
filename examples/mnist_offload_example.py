@@ -39,11 +39,21 @@ norm/residual activations stay live, only the marked 4x expansion is
 recomputed at backward). All choices train to the same accuracy — they trade
 activation memory vs recompute time; see offload_checkpoint_study.py.
 
+Activation offloading is one more flag: --act-offload (implies --backward
+keep) streams each chunk's saved activations to pinned CPU RAM between its
+forward and its backward, capping resident activation graphs at --act-slots
+chunks (default 2) instead of all of them. Bit-exact — same losses/grads as
+without it; it trades PCIe traffic for activation memory (best when the
+chunk internals dominate, e.g. the 4x FF expansion here). See
+docs/offload.md, "Activation offload".
+
 Requirements: 1 GPU (any), torchvision for MNIST. Run:
     python examples/mnist_offload_example.py
     python examples/mnist_offload_example.py --device cuda:1 --steps 500 \
         --hidden 1024 --blocks 24 --window 2 --pin 4
     python examples/mnist_offload_example.py --device cuda:1 --selective
+    # activation offload: keep-mode speed at ~2 chunks of activation memory
+    python examples/mnist_offload_example.py --device cuda:1 --act-offload
     # NVMe tier: 6 chunks' masters on disk (put the file on a real drive,
     # NOT /tmp — that is usually tmpfs, i.e. RAM)
     python examples/mnist_offload_example.py --nvme 6 \
@@ -140,6 +150,16 @@ def main() -> int:
                     help="mark each block's heavy FF with offload_checkpoint "
                          "in its own forward (implies --backward keep): "
                          "marked parts recompute, the rest keeps activations")
+    ap.add_argument("--act-offload", action="store_true",
+                    help="stream saved activations to pinned CPU RAM between "
+                         "each chunk's forward and backward (implies "
+                         "--backward keep unless checkpoint was chosen); "
+                         "bounds resident activation graphs at --act-slots "
+                         "chunks. Bit-exact; trades PCIe traffic for memory")
+    ap.add_argument("--act-slots", type=int, default=2,
+                    help="resident activation packets before the lazy "
+                         "offload kicks in (default 2: one in compute, one "
+                         "in flight)")
     ap.add_argument("--grad-accum", default="stream",
                     choices=["stream", "cpu"],
                     help="grad accumulation for streamed chunks: 'stream' "
@@ -162,6 +182,10 @@ def main() -> int:
 
     if args.selective and args.backward != "keep":
         print(f"--selective implies --backward keep (was {args.backward})")
+        args.backward = "keep"
+    if args.act_offload and args.backward == "recompute":
+        # recompute mode has no saved-tensor graph to offload from
+        print("--act-offload implies --backward keep (was recompute)")
         args.backward = "keep"
     keep_activations = {"recompute": False, "keep": True,
                         "checkpoint": "checkpoint"}[args.backward]
@@ -213,13 +237,17 @@ def main() -> int:
         keep_activations=keep_activations,
         grad_accum=args.grad_accum,
         acc_slots=args.acc_slots,
+        offload_activations=args.act_offload,
+        act_slots=args.act_slots,
     )
     print(f"model: {len(chunks)} chunks, {n_params / 1e6:.1f}M params "
           f"({n_params * 4 / 2**20:.0f} MiB fp32 full-resident)")
+    act_part = (f" + act offload (slots={args.act_slots})"
+                if args.act_offload else "")
     print(f"offload: device={dev}  window={args.window}  pin={args.pin} "
           f"(pinned layers {sorted(model.pinned_layers)})  "
           f"backward={args.backward}"
-          f"{' + selective FF marks' if args.selective else ''}")
+          f"{' + selective FF marks' if args.selective else ''}{act_part}")
     print(f"  -> peak GPU weight memory ~ {args.window + args.pin} of "
           f"{len(chunks)} chunks")
     if model.nvme_layers:
@@ -302,6 +330,12 @@ def main() -> int:
           f"{model.stats['acquire_wait_s'] * 1e3:.0f} ms total stall "
           f"(large stall = transfer-bound; try more --pin, a bigger model, "
           f"or check with the offload_simulator)")
+    if args.act_offload:
+        print(f"activations: {model.stats['act_offloads']} packet offloads, "
+              f"{model.stats['act_reloads']} reloads, "
+              f"{model.stats['act_bytes_offloaded'] / 2**20:.0f} MiB moved "
+              f"D2H total ({model.stats['act_bytes_offloaded'] / 2**20 / max(step, 1):.1f} "
+              f"MiB/step; raise --act-slots to trade memory for traffic)")
 
     # ── 5. Checkpoint — standard state_dict, chunks are model.chunks[i] ───────
     if args.save:
