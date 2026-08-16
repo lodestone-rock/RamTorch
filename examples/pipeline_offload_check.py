@@ -26,6 +26,10 @@ Checks (on CPU always, and on two CUDA devices when available):
   8. Flat chunk_modules= convenience: even + weighted (chunks_per_stage=)
      splits match the nested stage_modules spec bit-for-bit; malformed specs
      (sum/length mismatches, nesting, too few chunks) are rejected.
+  9. Activation offload (offload_activations=True): bit-exact vs the plain
+     pipeline across {staggered_1b1f, gpipe, 1f1b} x {keep, checkpoint} x
+     act_slots {1, 2}, plus W=1 + acc_slots=1 + act_slots=1 combined thrash
+     and the mixed offloaded+plain topology.
 
 Run:  PYTHONPATH=. python examples/pipeline_offload_check.py
 """
@@ -83,11 +87,14 @@ def seq_reference_grads(chunks_flat, x, y, m, loss_fn):
 
 def run_config(devices, schedule, mode, window, pin, errs,
                m=4, dim=16, chunks_per_stage=4, mixed=False,
-               grad_accum="stream", acc_slots=None):
+               grad_accum="stream", acc_slots=None,
+               act=False, act_slots=2):
     """One offloaded-pipeline config vs plain pipeline + sequential ref."""
     acc_tag = "" if grad_accum == "stream" else f" ga={grad_accum}"
     if acc_slots is not None:
         acc_tag += f" slots={acc_slots}"
+    if act:
+        acc_tag += f" act={act_slots}"
     tag = (f"[{devices[0]}/{devices[-1]} {schedule} {MODE_LABEL[mode]} "
            f"W={window} pin={pin}{' mixed' if mixed else ''}{acc_tag}]")
     n_before = len(errs)
@@ -107,7 +114,9 @@ def run_config(devices, schedule, mode, window, pin, errs,
                     offload_window=window, offload_pin=pin,
                     offload_keep_activations=mode,
                     offload_grad_accum=grad_accum,
-                    offload_acc_slots=acc_slots)
+                    offload_acc_slots=acc_slots,
+                    offload_activations=act,
+                    offload_act_slots=act_slots)
     ref = Pipeline(stage_modules=plain_spec, devices=devices)
 
     torch.manual_seed(1)
@@ -473,6 +482,22 @@ def main() -> int:
                    chunks_per_stage=L, acc_slots=1)
         run_config(devices, "gpipe", True, 1, 0, errs,
                    chunks_per_stage=L, acc_slots=1)
+        # activation offload: bit-exact vs the plain pipeline across
+        # schedules x modes x act_slots {1 (thrash), 2}; gpipe holds all m
+        # microbatch packets in flight — the heaviest pressure case
+        for schedule, mode in itertools.product(
+                ("staggered_1b1f", "gpipe", "1f1b"), (True, "checkpoint")):
+            for aslots in (1, 2):
+                run_config(devices, schedule, mode, 2, 0, errs,
+                           chunks_per_stage=L, act=True, act_slots=aslots)
+        # combined thrash: W=1 weights + 1 acc slot + 1 act slot, and the
+        # mixed offloaded+plain topology with act offload on
+        run_config(devices, "staggered_1b1f", True, 1, 0, errs,
+                   chunks_per_stage=L, acc_slots=1, act=True, act_slots=1)
+        run_config(devices, "gpipe", "checkpoint", 1, 0, errs,
+                   chunks_per_stage=L, acc_slots=1, act=True, act_slots=1)
+        run_config(devices, "staggered_1b1f", True, 2, 0, errs,
+                   chunks_per_stage=L, mixed=True, act=True, act_slots=1)
         for mode in (True, "checkpoint"):
             check_tuple(devices, mode, errs)
         check_autocast(devices, errs)

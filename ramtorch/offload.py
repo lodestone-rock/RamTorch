@@ -118,6 +118,7 @@ Notes
 
 from __future__ import annotations
 
+import contextlib
 import grp
 import json
 import os
@@ -394,6 +395,76 @@ class _Resident:
         self.event = event
 
 
+class _ActPinnedPool:
+    """Reusable pinned staging buffers for activation packets.
+
+    Buckets by power-of-two byte size; training loops repeat shapes, so
+    after the first step every take() is a hit. A buffer is returned with
+    the event of its last H2D read — take() synchronizes it only if the
+    read is somehow still in flight (rare: by reuse time it is long done).
+    A fresh pinned alloc per pack is 10-20x slower (probe, §0.11).
+    """
+
+    def __init__(self):
+        self._free: Dict[int, List[tuple]] = {}
+
+    @staticmethod
+    def _bucket(nbytes: int) -> int:
+        return max(512, 1 << max(0, nbytes - 1).bit_length())
+
+    def take(self, nbytes: int, pin: bool) -> torch.Tensor:
+        bucket = self._bucket(nbytes)
+        free = self._free.get(bucket)
+        if free:
+            buf, ev = free.pop()
+            if ev is not None and not ev.query():
+                ev.synchronize()
+            return buf
+        return torch.empty(bucket, dtype=torch.uint8, pin_memory=pin)
+
+    def give(self, buf: torch.Tensor, ev) -> None:
+        self._free.setdefault(buf.numel(), []).append((buf, ev))
+
+
+class _ActEntry:
+    """One saved tensor inside an activation packet."""
+
+    __slots__ = ("gpu", "buf", "view", "dtype", "shape", "nbytes")
+
+    def __init__(self, gpu: torch.Tensor):
+        self.gpu: Optional[torch.Tensor] = gpu
+        self.buf: Optional[torch.Tensor] = None    # pooled pinned uint8
+        self.view: Optional[torch.Tensor] = None   # buf viewed as the tensor
+        self.dtype = gpu.dtype
+        self.shape = tuple(gpu.shape)
+        self.nbytes = gpu.numel() * gpu.element_size()
+
+
+class _ActPacket:
+    """The saved tensors of one chunk forward (``saved_tensors_hooks``).
+
+    States mirror the simulator's residency classes:
+      * ``"gpu"``       — resident, dirty (no RAM copy yet)
+      * ``"gpu_clean"`` — resident with a still-valid RAM copy (a re-drop
+                          is free: just release the GPU refs again)
+      * ``"cpu"``       — offloaded (GPU refs dropped; reload before B)
+    ``bpos`` is the packet's backward position in the announced schedule —
+    eviction picks the farthest (Belady, exact: the itinerary is known).
+    """
+
+    __slots__ = ("key", "bpos", "entries", "dedup", "where",
+                 "d2h_ev", "h2d_ev")
+
+    def __init__(self, key, bpos: int):
+        self.key = key
+        self.bpos = bpos
+        self.entries: List[_ActEntry] = []
+        self.dedup: Dict[tuple, int] = {}
+        self.where = "gpu"
+        self.d2h_ev = None    # offload copies complete (RAM copy valid)
+        self.h2d_ev = None    # reload copies complete (GPU refs valid)
+
+
 class OffloadModel(nn.Module):
     """
     Run an ordered list of chunk modules with weights streamed from CPU
@@ -454,6 +525,21 @@ class OffloadModel(nn.Module):
                  activations are dropped and recomputed by autograd during
                  backward, with RNG stashed/restored. Recompute-cheap
                  memory AND dropout-safe (the mode recompute cannot be).
+    offload_activations :
+                 stream saved activations to pinned CPU RAM like weights
+                 (``saved_tensors_hooks`` packets, one per chunk forward).
+                 Policy is the simulator-validated *lazy* one: offload only
+                 when more than ``act_slots`` chunk graphs are resident,
+                 evict the packet whose backward is farthest, reload one
+                 backward ahead. Requires ``keep_activations=True`` or
+                 ``"checkpoint"`` (recompute mode already drops them).
+                 With keep mode this bounds activation memory to
+                 ~``act_slots`` chunks instead of all ``n``. Bit-exact:
+                 the same values return at unpack. Never touches NVMe.
+    act_slots  : resident chunk-activation packets allowed before the lazy
+                 offload kicks in (default 2 — simulator sweet spot: one
+                 in compute + one prefetched; raise it to trade GPU memory
+                 for less PCIe traffic).
     """
 
     def __init__(
@@ -470,6 +556,8 @@ class OffloadModel(nn.Module):
         keep_activations: Union[bool, str] = False,
         grad_accum: str = "stream",
         acc_slots: Optional[int] = None,
+        offload_activations: bool = False,
+        act_slots: int = 2,
     ):
         super().__init__()
         if len(chunks) < 1:
@@ -487,6 +575,14 @@ class OffloadModel(nn.Module):
             )
         if acc_slots is not None and acc_slots < 1:
             raise ValueError(f"acc_slots must be >= 1, got {acc_slots}")
+        if offload_activations and keep_activations is False:
+            raise ValueError(
+                "offload_activations requires keep_activations=True or "
+                "'checkpoint' — recompute mode has no saved-tensor graph "
+                "to offload from (it already drops activations)"
+            )
+        if act_slots < 1:
+            raise ValueError(f"act_slots must be >= 1, got {act_slots}")
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -528,6 +624,8 @@ class OffloadModel(nn.Module):
 
         self.grad_accum = grad_accum
         self.acc_slots = window if acc_slots is None else acc_slots
+        self.offload_activations = bool(offload_activations)
+        self.act_slots = act_slots
 
         # register chunks so .parameters()/.state_dict() work
         self.chunks = nn.ModuleList(chunks)
@@ -576,8 +674,17 @@ class OffloadModel(nn.Module):
         self._h2d_stream = torch.cuda.Stream(self.device) if self._cuda else None
         self._d2h_stream = torch.cuda.Stream(self.device) if self._cuda else None
 
+        # ── activation packet store (compute-thread only, no lock) ───────
+        # saved_tensors_hooks packets keyed by the caller's chunk key
+        # (int chunk idx for step(); (mb, chunk) for OffloadStage)
+        self._act_store: Dict[object, _ActPacket] = {}
+        self._act_pool = _ActPinnedPool()
+        self._act_in_use: Optional[object] = None  # packet mid-backward
+
         self.stats = {"loads": 0, "nvme_loads": 0, "acquire_wait_s": 0.0,
-                      "acc_loads": 0, "acc_evictions": 0}
+                      "acc_loads": 0, "acc_evictions": 0,
+                      "act_offloads": 0, "act_reloads": 0,
+                      "act_bytes_offloaded": 0}
         # (track, name, start_us, dur_us) spans from the worker threads,
         # collected only while step(profile_path=...) is active — kineto
         # cannot see record_function on threads it did not enter from
@@ -1082,6 +1189,204 @@ class OffloadModel(nn.Module):
                     args: tuple):
         return torch.func.functional_call(self.chunks[layer], tensors, args)
 
+    # ── activation offload (saved_tensors_hooks packets, notes §0.11) ───────
+    # Everything here runs on the compute thread only (step() caller or the
+    # stage's relay worker) — no lock. Copies ride the existing D2H/H2D
+    # streams, ordered purely by events (no host syncs). Policy is the
+    # simulator-validated "lazy": offload only under slot pressure, victim =
+    # farthest next backward (exact Belady — bpos comes from the announced
+    # schedule), clean re-drops are free, reloads prefetched one B ahead.
+
+    @contextlib.contextmanager
+    def _act_ctx(self, key, bpos: int, tensors: Dict[str, torch.Tensor]):
+        """Install pack/unpack hooks around one chunk's forward.
+
+        ``key`` identifies the packet (chunk idx for :meth:`step`,
+        ``(mb, chunk)`` for the pipeline stage); ``bpos`` is its backward's
+        position in the schedule (eviction ranks by it). ``tensors`` is the
+        mapping passed to ``functional_call`` — their storage pointers are
+        the weight filter (weights already stream; §0.11 probe recipe).
+        MUST be installed OUTSIDE ``torch.utils.checkpoint`` regions, never
+        inside (hooks outside see only region inputs — the desired set).
+        """
+        if not self.offload_activations:
+            yield
+            return
+        weight_ptrs = {
+            t.untyped_storage().data_ptr() for t in tensors.values()
+            if t.untyped_storage().size() > 0
+        }
+        packet = _ActPacket(key, bpos)
+        self._act_store[key] = packet
+        dev = self.device
+
+        def pack(t: torch.Tensor):
+            if t.device != dev:
+                return ("raw", t)
+            st = t.untyped_storage()
+            if st.size() == 0 or st.data_ptr() in weight_ptrs:
+                return ("raw", t)
+            # dedup: autograd saves the same tensor many times (e.g. an
+            # input reused by several ops) — one entry, one copy
+            dk = (st.data_ptr(), t.storage_offset(), t.dtype,
+                  tuple(t.shape), tuple(t.stride()), t._version)
+            idx = packet.dedup.get(dk)
+            if idx is None:
+                idx = len(packet.entries)
+                packet.entries.append(_ActEntry(t))
+                packet.dedup[dk] = idx
+            return ("act", key, idx)
+
+        def unpack(h):
+            if h[0] == "raw":
+                return h[1]
+            return self._act_unpack(h[1], h[2])
+
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            yield
+
+    def _act_offload(self, packet: _ActPacket):
+        """Evict a packet to pinned RAM (D2H stream) or re-drop if clean."""
+        if packet.where == "gpu_clean":
+            # the RAM copy from the previous offload is still valid
+            for e in packet.entries:
+                e.gpu = None
+            packet.where = "cpu"
+            packet.h2d_ev = None
+            return
+        if packet.entries:
+            self.stats["act_offloads"] += 1
+        for e in packet.entries:
+            if e.buf is None:
+                e.buf = self._act_pool.take(e.nbytes, pin=self._cuda)
+                e.view = e.buf[: e.nbytes].view(e.dtype).view(e.shape)
+            self.stats["act_bytes_offloaded"] += e.nbytes
+        if self._cuda:
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(self.device))
+            with torch.no_grad(), torch.cuda.stream(self._d2h_stream):
+                self._d2h_stream.wait_event(ready)
+                for e in packet.entries:
+                    src = (e.gpu if e.gpu.is_contiguous()
+                           else e.gpu.contiguous())
+                    e.view.copy_(src, non_blocking=True)
+                    e.gpu.record_stream(self._d2h_stream)
+                    e.gpu = None
+                ev = torch.cuda.Event()
+                ev.record()
+            packet.d2h_ev = ev
+        else:
+            with torch.no_grad():
+                for e in packet.entries:
+                    e.view.copy_(e.gpu)
+                    e.gpu = None
+        packet.where = "cpu"
+        packet.h2d_ev = None
+
+    def _act_reload(self, key):
+        """Bring an offloaded packet back to the GPU (H2D stream)."""
+        packet = self._act_store[key]
+        if packet.where != "cpu":
+            return
+        if packet.entries:
+            self.stats["act_reloads"] += 1
+        if self._cuda:
+            with torch.no_grad(), torch.cuda.stream(self._h2d_stream):
+                if packet.d2h_ev is not None:
+                    self._h2d_stream.wait_event(packet.d2h_ev)
+                for e in packet.entries:
+                    g = torch.empty(e.shape, dtype=e.dtype, device=self.device)
+                    g.copy_(e.view, non_blocking=True)
+                    e.gpu = g
+                ev = torch.cuda.Event()
+                ev.record()
+            packet.h2d_ev = ev
+        else:
+            with torch.no_grad():
+                for e in packet.entries:
+                    e.gpu = e.view.clone()
+        packet.where = "gpu_clean"
+
+    def _act_unpack(self, key, idx: int) -> torch.Tensor:
+        """saved_tensors_hooks unpack: hand autograd the (reloaded) tensor."""
+        packet = self._act_store[key]
+        e = packet.entries[idx]
+        if e.gpu is None:
+            # prefetch miss — issue the reload now (still event-ordered,
+            # the compute stream just waits longer)
+            self._act_reload(key)
+        if self._cuda and packet.h2d_ev is not None:
+            cs = torch.cuda.current_stream(self.device)
+            cs.wait_event(packet.h2d_ev)
+            e.gpu.record_stream(cs)
+        return e.gpu
+
+    def _act_resident(self) -> List[_ActPacket]:
+        return [p for p in self._act_store.values() if p.where != "cpu"]
+
+    def _act_settle(self):
+        """Lazy pressure check after a forward: evict down to act_slots.
+
+        Victim = resident packet with the farthest backward (largest bpos),
+        never the one mid-backward. A packet only exists once its forward
+        ran, so occupancy can transiently hit act_slots+1 during a chunk's
+        forward — the bound applies between chunks (as in the simulator).
+        """
+        resident = [p for p in self._act_resident()
+                    if p.key != self._act_in_use]
+        excess = len(self._act_resident()) - self.act_slots
+        while excess > 0 and resident:
+            victim = max(resident, key=lambda p: p.bpos)
+            self._act_offload(victim)
+            resident.remove(victim)
+            excess -= 1
+
+    def _act_stage_backward(self, key, prefetch_keys: Sequence[object] = ()):
+        """Prepare backward for ``key``: reload it + prefetch one B ahead."""
+        keep = {key, *prefetch_keys}
+        packet = self._act_store.get(key)
+        if packet is not None and packet.where == "cpu":
+            self._act_make_room(keep)
+            self._act_reload(key)
+        self._act_in_use = key
+        for nk in prefetch_keys:
+            nxt = self._act_store.get(nk)
+            if nxt is not None and nxt.where == "cpu":
+                self._act_make_room(keep)
+                self._act_reload(nk)
+
+    def _act_make_room(self, keep):
+        """Evict farthest-backward packets until a slot is free."""
+        resident = [p for p in self._act_resident() if p.key not in keep]
+        while len(self._act_resident()) >= self.act_slots and resident:
+            victim = max(resident, key=lambda p: p.bpos)
+            self._act_offload(victim)
+            resident.remove(victim)
+
+    def _act_discard(self, key):
+        """Free a packet after its backward; pinned buffers go to the pool."""
+        packet = self._act_store.pop(key, None)
+        if packet is None:
+            return
+        ev = packet.h2d_ev or packet.d2h_ev  # last op touching the buffers
+        for e in packet.entries:
+            if e.buf is not None:
+                self._act_pool.give(e.buf, ev)
+            e.gpu = e.view = e.buf = None
+        if self._act_in_use == key:
+            self._act_in_use = None
+
+    def _act_assert_drained(self):
+        """Every packet must be consumed by its backward within the step."""
+        if self._act_store:
+            leaked = list(self._act_store)
+            self._act_store.clear()
+            self._act_in_use = None
+            raise RuntimeError(
+                f"activation packets leaked past the step: {leaked} — "
+                "every announced backward must run (internal bug)"
+            )
+
     # ── tuple intermediates ─────────────────────────────────────────────────
     # A chunk may return a single tensor OR a tuple of tensors; a tuple's
     # elements become the next chunk's positional args. Internally everything
@@ -1500,6 +1805,7 @@ class OffloadModel(nn.Module):
         dropout masks — unlike ``_step_recompute``.
         """
         n = self.n
+        act_on = self.offload_activations
         # per-chunk (input_leaves, outs, raw_out, tensors)
         cache: List[Optional[tuple]] = [None] * n
         hs = self._to_device_args(x)
@@ -1510,7 +1816,9 @@ class OffloadModel(nn.Module):
                 inps = tuple(t.detach() for t in hs)
                 for t in inps:
                     t.requires_grad_(i > 0 and t.is_floating_point())
-                with torch.enable_grad():
+                # bpos: B_i runs at echo position 2n-1-i (F0..Fn-1, Bn-1..B0)
+                with self._act_ctx(i, 2 * n - 1 - i, tensors), \
+                        torch.enable_grad():
                     if use_checkpoint:
                         raw_out = torch.utils.checkpoint.checkpoint(
                             lambda *a, _i=i, _ts=tensors:
@@ -1522,6 +1830,8 @@ class OffloadModel(nn.Module):
                 outs = self._as_tuple(raw_out)
                 cache[i] = (inps, outs, raw_out, tensors)
                 hs = tuple(t.detach() for t in outs)
+                if act_on:
+                    self._act_settle()
             self._release()
         output = self._detach_like(raw_out)
 
@@ -1530,6 +1840,8 @@ class OffloadModel(nn.Module):
         for i in range(n - 1, -1, -1):
             with record_function(f"B{i} grad"):
                 self._acquire(i)  # refills evicted weights before backward
+                if act_on:
+                    self._act_stage_backward(i, (i - 1,) if i > 0 else ())
                 inps, outs, raw_out, tensors = cache[i]
                 is_last = i == n - 1
                 if is_last and grad_outputs is not None:
@@ -1544,7 +1856,11 @@ class OffloadModel(nn.Module):
                     loss_out = loss.detach()
                 self._accumulate(self._state[i], named_grads)
                 cache[i] = None  # release the chunk's graph + activations
+                if act_on:
+                    self._act_discard(i)
             self._release()
+        if act_on:
+            self._act_assert_drained()
         return OffloadStepResult(output, loss_out,
                                  grad_bypassed=grad_outputs is not None)
 

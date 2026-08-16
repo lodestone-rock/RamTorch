@@ -391,6 +391,8 @@ pipe = Pipeline(
     offload_keep_activations=True,   # or "checkpoint" (recompute memory)
     offload_grad_accum="stream",     # default: accumulate grads ON the GPU
     offload_acc_slots=None,          # GPU accumulator slots (default: window)
+    offload_activations=False,       # stream saved activations to CPU RAM
+    offload_act_slots=2,             # resident activation packets per stage
 )
 res = pipe.step(x, targets=y, schedule="staggered_1b1f",
                 n_microbatches=8, loss_fn=F.cross_entropy)
@@ -453,6 +455,18 @@ traffic when the shard *almost* fits.
   (non-reentrant per-chunk checkpoint; recompute-level memory, dropout-safe).
   The engine's own recompute mode (`False`) is rejected — its no-grad forward
   would leave the last stage's loss graph-disconnected at the relay's W op.
+- **Activation offload** (`offload_activations=True`): each (microbatch,
+  chunk) forward's saved activations become a `saved_tensors_hooks` packet
+  that streams to pinned CPU RAM under slot pressure and reloads one backward
+  ahead of its use (lazy policy, Belady eviction by the stage's announced op
+  schedule — the same signals the weight window uses). This matters more here
+  than on a single GPU: a pipeline keeps up to `p` microbatches' activations
+  in flight per stage, and the packet cap replaces that `m x chunks` residency
+  with `offload_act_slots` packets. Bit-exact (asserted across schedules x
+  modes x slot counts in `examples/pipeline_offload_check.py`); packets never
+  touch NVMe. Pair it with `offload_keep_activations=True` — checkpoint-mode
+  packets hold only chunk boundaries, which the stage's backward cache keeps
+  resident anyway.
 - **No NVMe tier**, deliberately: sustained pipeline training from disk would
   rewrite every stage's masters every step — guaranteed drive thrashing. Use
   `offload.md`'s single-GPU engine if you truly need it (it is consent-gated).

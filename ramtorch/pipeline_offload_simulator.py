@@ -49,16 +49,31 @@ Grad accumulation modes (``grad_mode=``):
     small ``acc_slots`` it degrades to a load->add->writeback round trip per
     microbatch visit.
 
-Simplifications (deliberate): activation hops cost ``comm`` latency but do NOT
-occupy the h2d/d2h channels (the premise: boundary activations are small next
-to weights); host DDR bandwidth shared across GPUs is not modeled; the
-optimizer step is out of scope (same as ``offload_simulator``).
+Activation offloading (``tact`` > 0, same model as ``offload_simulator``):
+each stage's ``F(mb, chunk)`` saves one activation packet that the matching
+``B(mb, chunk)`` consumes. Packets occupy ``act_slots`` GPU slots per stage (a
+pool separate from the weight window). A packet can be offloaded to CPU RAM
+(kind "O" on the stage's D2H channel) freeing its slot, and must be reloaded
+(kind "R" on the stage's H2D channel) before its B. Eviction is
+farthest-next-B-use; packets with a valid RAM copy re-drop for free.
+``act_policy="eager"`` offloads at birth whenever D2H is idle; ``"lazy"``
+only under slot pressure. This matters most for EARLY stages, which hold
+activations for all in-flight microbatches across the pipeline bubble.
+
+Simplifications (deliberate): boundary activation hops between stages cost
+``comm`` latency but do NOT occupy the h2d/d2h channels (the premise: boundary
+activations are small next to weights; the INTERNAL saved-tensor packets that
+``tact`` models are the big ones); host DDR bandwidth shared across GPUs is
+not modeled; the optimizer step is out of scope (same as
+``offload_simulator``).
 
 Usage:
     python -m ramtorch.pipeline_offload_simulator                  # W sweep
     python -m ramtorch.pipeline_offload_simulator --window 2
     python -m ramtorch.pipeline_offload_simulator --window 2 --plot out.png
     python -m ramtorch.pipeline_offload_simulator --schedule gpipe --th2d 3
+    python -m ramtorch.pipeline_offload_simulator --window 2 --tact 0.3 \
+        --act-slots 4                          # activation offload on
     # importable:
     from ramtorch.pipeline_offload_simulator import (
         expand_rank_ops, simulate_pipeline_offload, gantt, plot_gantt)
@@ -164,9 +179,11 @@ class PipelineOffloadResult:
 
     ``spans[s]`` maps channel -> ordered ``(op, (start, end))``:
       * ``"gpu"``: op = ``(kind, mb, chunk)`` with kind "F"/"B"
-      * ``"h2d"``: op = ``("L", chunk)`` weight load or ``("A", chunk)``
-        grad-accumulator reload (stream mode)
-      * ``"d2h"``: op = ``("G", chunk)`` grad / accumulator writeback
+      * ``"h2d"``: op = ``("L", chunk)`` weight load, ``("A", chunk)``
+        grad-accumulator reload (stream mode), or ``("R", mb, chunk)``
+        activation reload (``tact`` > 0)
+      * ``"d2h"``: op = ``("G", chunk)`` grad / accumulator writeback or
+        ``("O", mb, chunk)`` activation offload (``tact`` > 0)
       * ``"cpu"``: op = ``("C", chunk)`` CPU accumulate (writeback mode
         with ``tcpu`` > 0)
     """
@@ -197,6 +214,13 @@ class PipelineOffloadResult:
         n_acc_loads: Optional[List[int]] = None,
         n_acc_wb: Optional[List[int]] = None,
         peak_acc: Optional[List[int]] = None,
+        tact: float = 0.0,
+        act_slots: Optional[List[int]] = None,
+        act_policy: str = "eager",
+        act_timelines: Optional[List[List[Tuple[float, int]]]] = None,
+        n_act_offloads: Optional[List[int]] = None,
+        n_act_reloads: Optional[List[int]] = None,
+        baseline_peak_act: Optional[List[int]] = None,
     ):
         self.p, self.m, self.chunks, self.window = p, m, chunks, window
         self.tf, self.tb, self.th2d, self.td2h, self.comm = tf, tb, th2d, td2h, comm
@@ -212,6 +236,13 @@ class PipelineOffloadResult:
         self.n_acc_loads = n_acc_loads or [0] * p
         self.n_acc_wb = n_acc_wb or [0] * p
         self.peak_acc = peak_acc or [0] * p
+        self.tact = tact
+        self.act_slots = act_slots or [0] * p
+        self.act_policy = act_policy
+        self.act_timelines = act_timelines or [[] for _ in range(p)]
+        self.n_act_offloads = n_act_offloads or [0] * p
+        self.n_act_reloads = n_act_reloads or [0] * p
+        self.baseline_peak_act = baseline_peak_act or [0] * p
         # hide the cpu row unless something actually ran there
         if not any(st.get("cpu") for st in spans):
             self.CHANNELS = ("gpu", "h2d", "d2h")
@@ -239,6 +270,14 @@ class PipelineOffloadResult:
         return self.window + len(self.pinned)
 
     @property
+    def act_on(self) -> bool:
+        return self.tact > 0 and any(self.baseline_peak_act)
+
+    def peak_act(self, s: int) -> int:
+        """Peak GPU activation slots occupied on stage ``s`` (0 when off)."""
+        return max((occ for _, occ in self.act_timelines[s]), default=0)
+
+    @property
     def overhead_vs_ref(self) -> float:
         """(makespan - no-offload pipeline makespan) / no-offload makespan."""
         if self.ref_makespan == 0:
@@ -246,7 +285,7 @@ class PipelineOffloadResult:
         return (self.makespan - self.ref_makespan) / self.ref_makespan
 
     def metrics(self) -> Dict[str, object]:
-        return {
+        out: Dict[str, object] = {
             "p": self.p,
             "m": self.m,
             "chunks": self.chunks,
@@ -271,6 +310,17 @@ class PipelineOffloadResult:
             "peak_resident": list(self.peak_resident),
             "peak_acc": list(self.peak_acc),
         }
+        if self.act_on:
+            out.update({
+                "tact": self.tact,
+                "act_slots": list(self.act_slots),
+                "act_policy": self.act_policy,
+                "peak_act": [self.peak_act(s) for s in range(self.p)],
+                "baseline_peak_act": list(self.baseline_peak_act),
+                "n_act_offloads": list(self.n_act_offloads),
+                "n_act_reloads": list(self.n_act_reloads),
+            })
+        return out
 
 
 # ── Simulator ─────────────────────────────────────────────────────────────────
@@ -288,6 +338,9 @@ def simulate_pipeline_offload(
     grad_mode: str = "writeback",
     tcpu: float = 0.0,
     acc_slots: Optional[int] = None,
+    tact: float = 0.0,
+    act_slots: Optional[int] = None,
+    act_policy: str = "eager",
 ) -> PipelineOffloadResult:
     """Discrete-event simulation: p offload state machines + cross-stage deps.
 
@@ -303,11 +356,24 @@ def simulate_pipeline_offload(
     reloads cost ``th2d`` on the H2D channel, evictions/flushes cost ``td2h``
     on the D2H channel, and the CPU does nothing. Pinned chunks accumulate
     on-GPU in both modes (no grad traffic), matching ``OffloadModel``.
+
+    ``tact`` > 0 enables ACTIVATION offloading (0 = feature off, behavior
+    byte-identical to before): per stage, ``F(mb, chunk)`` creates one packet
+    that ``B(mb, chunk)`` consumes, occupying one of ``act_slots`` per-stage
+    GPU slots (default: unlimited). Offloads ("O", cost ``tact``) ride the
+    stage's D2H channel — needed offloads outrank grad/acc writebacks;
+    reloads ("R", cost ``tact``) ride the stage's H2D channel, prefetched in
+    itinerary order after weight/acc needs. ``act_policy`` as in
+    ``offload_simulator``.
     """
     if window < 1:
         raise ValueError(f"window must be >= 1, got {window}")
     if grad_mode not in ("writeback", "stream"):
         raise ValueError(f"grad_mode must be writeback|stream, got {grad_mode!r}")
+    if act_policy not in ("eager", "lazy"):
+        raise ValueError(f"act_policy must be eager|lazy, got {act_policy!r}")
+    if act_slots is not None and act_slots < 1:
+        raise ValueError(f"act_slots must be >= 1, got {act_slots}")
     pinned = frozenset(pinned or ())
     for c in pinned:
         if not (0 <= c < chunks):
@@ -346,17 +412,46 @@ def simulate_pipeline_offload(
         j = bisect.bisect_left(us, from_pos)
         return us[j] if j < len(us) else INF
 
+    # ── activation machinery (tact > 0) ─────────────────────────────────────
+    # per stage: packet key (mb, chunk) -> the position of its single B
+    act_bpos: List[Dict[Tuple[int, int], int]] = [{} for _ in range(p)]
+    for s, itin in enumerate(itins):
+        for i, (k, mb, c) in enumerate(itin):
+            if k == "B":
+                act_bpos[s][(mb, c)] = i
+    act_on = tact > 0 and any(act_bpos)
+    # per stage baseline peak = concurrently-alive packets with NO offloading
+    baseline_peak_act = [0] * p
+    for s, itin in enumerate(itins):
+        alive: set = set()
+        for i, (k, mb, c) in enumerate(itin):
+            if k == "F" and act_bpos[s].get((mb, c), -1) > i:
+                alive.add((mb, c))
+                baseline_peak_act[s] = max(baseline_peak_act[s], len(alive))
+            elif k == "B":
+                alive.discard((mb, c))
+    n_act_slots = [
+        baseline_peak_act[s] if act_slots is None else act_slots
+        for s in range(p)
+    ]
+
+    def next_act_use(s: int, key: Tuple[int, int], from_pos: int) -> float:
+        bp = act_bpos[s].get(key)
+        return bp if bp is not None and bp >= from_pos else INF
+
     # per-stage channel state
     resident: List[set] = [set(pinned) for _ in range(p)]
     comp_idx = [0] * p
-    # gpu_cur[s] = (itin_index, start); h2d_cur[s] = (kind, chunk, start)
-    # with kind "L" weight load / "A" acc reload; d2h_cur[s] = (chunk, start);
-    # cpu_cur[s] = (chunk, start)
+    # gpu_cur[s] = (itin_index, start); h2d_cur[s] = (kind, payload, start)
+    # with kind "L" weight load / "A" acc reload (payload = chunk) or "R"
+    # act reload (payload = (mb, chunk)); d2h_cur[s] = (kind, payload, start)
+    # with kind "G" grad/acc writeback (chunk) or "O" act offload ((mb,
+    # chunk)); cpu_cur[s] = (chunk, start)
     gpu_cur: List[Optional[Tuple[int, float]]] = [None] * p
     gpu_end = [0.0] * p
-    h2d_cur: List[Optional[Tuple[str, int, float]]] = [None] * p
+    h2d_cur: List[Optional[Tuple[str, object, float]]] = [None] * p
     h2d_end = [0.0] * p
-    d2h_cur: List[Optional[Tuple[int, float]]] = [None] * p
+    d2h_cur: List[Optional[Tuple[str, object, float]]] = [None] * p
     d2h_end = [0.0] * p
     d2h_q: List[deque] = [deque() for _ in range(p)]  # (chunk, ready_time)
     cpu_cur: List[Optional[Tuple[int, float]]] = [None] * p
@@ -367,6 +462,16 @@ def simulate_pipeline_offload(
     acc_res: List[set] = [set() for _ in range(p)]
     acc_dirty: List[set] = [set() for _ in range(p)]
     acc_touched: List[set] = [set() for _ in range(p)]
+
+    # activation packet state per stage: key (mb, chunk) -> "gpu" (resident
+    # dirty) | "gpu_clean" (resident + valid RAM copy) | "offloading" |
+    # "reloading" | "ram"; absent = no live packet
+    act_state: List[Dict[Tuple[int, int], str]] = [{} for _ in range(p)]
+    act_timelines: List[List[Tuple[float, int]]] = [
+        [(0.0, 0)] for _ in range(p)
+    ]
+    n_act_off = [0] * p
+    n_act_rel = [0] * p
 
     spans: List[Dict[str, List[Tuple[Tuple, Span]]]] = [
         {"gpu": [], "h2d": [], "d2h": [], "cpu": []} for _ in range(p)
@@ -394,7 +499,8 @@ def simulate_pipeline_offload(
         if len(acc_res[s]) < acc_slots:
             return True
         in_use = running_b_chunk(s)
-        cleaning = d2h_cur[s][0] if d2h_cur[s] is not None else None
+        cleaning = (d2h_cur[s][1] if d2h_cur[s] is not None
+                    and d2h_cur[s][0] == "G" else None)
         victim, victim_nu = None, float(need_pos)
         for r in acc_res[s]:
             if r == in_use or r == cleaning or r in acc_dirty[s]:
@@ -406,6 +512,80 @@ def simulate_pipeline_offload(
             return False
         acc_res[s].discard(victim)
         return True
+
+    def act_occupied(s: int) -> int:
+        return sum(1 for st in act_state[s].values() if st != "ram")
+
+    def record_act(s: int, t: float) -> None:
+        act_timelines[s].append((t, act_occupied(s)))
+
+    def act_in_use(s: int) -> Optional[Tuple[int, int]]:
+        """Packet key the current gpu op is writing (F) or reading (B)."""
+        if gpu_cur[s] is None:
+            return None
+        _, mb, c = itins[s][gpu_cur[s][0]]
+        return (mb, c)
+
+    def act_make_room(s: int, need_pos: int) -> bool:
+        """A slot is free, or a CLEAN packet (valid RAM copy) with next use
+        beyond ``need_pos`` can be dropped for free."""
+        if act_occupied(s) < n_act_slots[s]:
+            return True
+        busy = act_in_use(s)
+        victim, victim_nu = None, float(need_pos)
+        for key, st in act_state[s].items():
+            if st != "gpu_clean" or key == busy:
+                continue
+            nu = next_act_use(s, key, comp_idx[s])
+            if nu > victim_nu:
+                victim, victim_nu = key, nu
+        if victim is None:
+            return False
+        act_state[s][victim] = "ram"  # free drop: RAM copy already valid
+        record_act(s, now)
+        return True
+
+    def act_offload_victim(
+        s: int, need_pos: float
+    ) -> Optional[Tuple[int, int]]:
+        """Farthest-next-B-use DIRTY resident packet beyond ``need_pos``."""
+        busy = act_in_use(s)
+        victim, victim_nu = None, float(need_pos)
+        for key, st in act_state[s].items():
+            if st != "gpu" or key == busy:
+                continue
+            nu = next_act_use(s, key, comp_idx[s])
+            if nu > victim_nu:
+                victim, victim_nu = key, nu
+        return victim
+
+    def act_need_pos(s: int) -> Optional[int]:
+        """Itinerary position of the earliest op TRULY blocked on an act
+        slot: a B whose packet sits in RAM, or an F that must create a
+        packet after accounting for slots that intervening Bs free."""
+        free = n_act_slots[s] - act_occupied(s)
+        if free > 0:
+            return None
+        if gpu_cur[s] is not None:
+            rk, rmb, rc = itins[s][gpu_cur[s][0]]
+            rst = act_state[s].get((rmb, rc))
+            if rk == "B" and rst is not None and rst != "ram":
+                free += 1  # the running B frees its slot at its end
+        for pos in range(comp_idx[s], n_ops[s]):
+            k, mb, c = itins[s][pos]
+            key = (mb, c)
+            st = act_state[s].get(key)
+            if k == "B":
+                if st == "ram":
+                    return pos  # its reload needs a slot
+                if st is not None:
+                    free += 1   # on-GPU packet frees its slot at B end
+            elif (key not in act_state[s]
+                    and act_bpos[s].get(key, -1) > pos):
+                if free <= 0:
+                    return pos
+                free -= 1
+        return None
 
     def dep_ready(s: int, i: int) -> Optional[float]:
         """Earliest time the cross-stage dependency of itinerary op ``i`` on
@@ -438,24 +618,38 @@ def simulate_pipeline_offload(
                         acc_dirty[s].add(c)  # GPU add landed in the acc
                     else:
                         d2h_q[s].append((c, gpu_end[s]))
+                if kind == "B" and act_on and (mb, c) in act_state[s]:
+                    del act_state[s][(mb, c)]  # packet consumed, slot freed
+                    record_act(s, now)
                 gpu_cur[s] = None
             if h2d_cur[s] is not None and h2d_end[s] <= now + _EPS:
                 lk, c, st = h2d_cur[s]
-                spans[s]["h2d"].append(((lk, c), (st, h2d_end[s])))
+                if lk == "R":
+                    spans[s]["h2d"].append(((lk,) + c, (st, h2d_end[s])))
+                    act_state[s][c] = "gpu_clean"  # RAM copy stays valid
+                    record_act(s, now)
+                else:
+                    spans[s]["h2d"].append(((lk, c), (st, h2d_end[s])))
+                    if lk == "L":
+                        resident[s].add(c)
+                    else:  # "A": acc reload landed
+                        acc_res[s].add(c)
+                        peak_acc[s] = max(peak_acc[s], len(acc_res[s]))
                 h2d_cur[s] = None
-                if lk == "L":
-                    resident[s].add(c)
-                else:  # "A": acc reload landed
-                    acc_res[s].add(c)
-                    peak_acc[s] = max(peak_acc[s], len(acc_res[s]))
             if d2h_cur[s] is not None and d2h_end[s] <= now + _EPS:
-                c, st = d2h_cur[s]
-                spans[s]["d2h"].append((("G", c), (st, d2h_end[s])))
+                dk, c, st = d2h_cur[s]
+                if dk == "O":
+                    spans[s]["d2h"].append(((dk,) + c, (st, d2h_end[s])))
+                    act_state[s][c] = "ram"  # slot freed
+                    record_act(s, now)
+                else:
+                    spans[s]["d2h"].append((("G", c), (st, d2h_end[s])))
+                    if stream:
+                        # value safe in RAM; stays resident
+                        acc_dirty[s].discard(c)
+                    elif tcpu > 0:
+                        cpu_q[s].append((c, d2h_end[s]))
                 d2h_cur[s] = None
-                if stream:
-                    acc_dirty[s].discard(c)  # value safe in RAM; stays resident
-                elif tcpu > 0:
-                    cpu_q[s].append((c, d2h_end[s]))
             if cpu_cur[s] is not None and cpu_end[s] <= now + _EPS:
                 c, st = cpu_cur[s]
                 spans[s]["cpu"].append((("C", c), (st, cpu_end[s])))
@@ -467,14 +661,15 @@ def simulate_pipeline_offload(
             # compute
             if gpu_cur[s] is None and comp_idx[s] < n_ops[s]:
                 i = comp_idx[s]
-                kind, _, c = itins[s][i]
+                kind, mb, c = itins[s][i]
                 dep = dep_ready(s, i)
                 ok = (c in resident[s] and dep is not None
                       and dep <= now + _EPS)
                 if ok and stream and kind == "B" and c not in pinned:
                     # the GPU add at the end of B needs the acc on device and
                     # not mid-writeback (the copy must not race the add)
-                    if (d2h_cur[s] is not None and d2h_cur[s][0] == c):
+                    if (d2h_cur[s] is not None
+                            and d2h_cur[s][:2] == ("G", c)):
                         ok = False
                     elif c in acc_res[s]:
                         pass
@@ -484,10 +679,23 @@ def simulate_pipeline_offload(
                         peak_acc[s] = max(peak_acc[s], len(acc_res[s]))
                     else:
                         ok = False  # wait for the acc reload / a free slot
+                makes_packet = False
+                if ok and act_on:
+                    key = (mb, c)
+                    if kind == "F":
+                        if act_bpos[s].get(key, -1) > i:
+                            makes_packet = act_make_room(s, i)
+                            ok = makes_packet
+                    else:  # B needs its packet on the GPU (if one was made)
+                        st_a = act_state[s].get(key)
+                        ok = st_a is None or st_a in ("gpu", "gpu_clean")
                 if ok:
                     gpu_cur[s] = (i, now)
                     gpu_end[s] = now + (tf if kind == "F" else tb)
                     comp_idx[s] += 1
+                    if makes_packet:
+                        act_state[s][(mb, c)] = "gpu"
+                        record_act(s, now)
                     progressed = True
 
             # cpu accumulate (writeback mode)
@@ -497,10 +705,22 @@ def simulate_pipeline_offload(
                 cpu_end[s] = now + tcpu
                 progressed = True
 
-            # d2h: per-microbatch grad packets (writeback mode) ...
+            # d2h: a PRESSURE act offload (an op is blocked on an act slot)
+            # outranks grads; grads outrank EAGER act offloads
+            if act_on and d2h_cur[s] is None:
+                need = act_need_pos(s)
+                if need is not None:
+                    v = act_offload_victim(s, need)
+                    if v is not None:
+                        act_state[s][v] = "offloading"
+                        d2h_cur[s] = ("O", v, now)
+                        d2h_end[s] = now + tact
+                        n_act_off[s] += 1
+                        progressed = True
+            # per-microbatch grad packets (writeback mode) ...
             if d2h_cur[s] is None and d2h_q[s] and d2h_q[s][0][1] <= now + _EPS:
                 c, _ = d2h_q[s].popleft()
-                d2h_cur[s] = (c, now)
+                d2h_cur[s] = ("G", c, now)
                 d2h_end[s] = now + td2h
                 progressed = True
             # ... or acc writebacks (stream mode): finals (past their last B)
@@ -519,16 +739,26 @@ def simulate_pipeline_offload(
                     if len(acc_res[s]) >= acc_slots and nu > best_nu:
                         best, best_nu = c, nu
                 if best is not None:
-                    d2h_cur[s] = (best, now)
+                    d2h_cur[s] = ("G", best, now)
                     d2h_end[s] = now + td2h
                     n_acc_wb[s] += 1
                     progressed = True
+            if act_on and d2h_cur[s] is None and act_policy == "eager":
+                # never offload a packet whose B is the current or next op
+                v = act_offload_victim(s, comp_idx[s] + 1)
+                if v is not None:
+                    act_state[s][v] = "offloading"
+                    d2h_cur[s] = ("O", v, now)
+                    d2h_end[s] = now + tact
+                    n_act_off[s] += 1
+                    progressed = True
 
             # prefetch: earliest unmet need on this stage — a weight load
-            # (any op) or, in stream mode, an evicted acc's reload (B ops)
+            # (any op), an evicted acc's reload (stream mode, B ops), or an
+            # offloaded activation's reload (tact > 0, B ops)
             if h2d_cur[s] is None:
                 for pos in range(comp_idx[s], n_ops[s]):
-                    kind, _, c = itins[s][pos]
+                    kind, mb, c = itins[s][pos]
                     if c not in resident[s]:
                         can_start = len(resident[s]) < capacity
                         if not can_start:
@@ -566,7 +796,18 @@ def simulate_pipeline_offload(
                             n_acc_loads[s] += 1
                             progressed = True
                             break
-                        continue  # slot-blocked: scan on for a weight load
+                        # acc slot-blocked: fall through, keep scanning
+                    if (act_on and kind == "B"
+                            and act_state[s].get((mb, c)) == "ram"):
+                        if act_make_room(s, pos):
+                            act_state[s][(mb, c)] = "reloading"
+                            h2d_cur[s] = ("R", (mb, c), now)
+                            h2d_end[s] = now + tact
+                            n_act_rel[s] += 1
+                            record_act(s, now)
+                            progressed = True
+                            break
+                        # act slot-blocked: scan on for other work
 
         if progressed:
             continue
@@ -602,7 +843,8 @@ def simulate_pipeline_offload(
         if not pending:
             state = {
                 s: dict(comp=f"{comp_idx[s]}/{n_ops[s]}",
-                        resident=sorted(resident[s]))
+                        resident=sorted(resident[s]),
+                        act=dict(act_state[s]))
                 for s in range(p)
             }
             raise RuntimeError(
@@ -618,12 +860,18 @@ def simulate_pipeline_offload(
         itins, spans, n_loads, peak_res, ref,
         grad_mode=grad_mode, tcpu=tcpu, acc_slots=acc_slots,
         n_acc_loads=n_acc_loads, n_acc_wb=n_acc_wb, peak_acc=peak_acc,
+        tact=tact,
+        act_slots=n_act_slots if act_on else [0] * p,
+        act_policy=act_policy, act_timelines=act_timelines,
+        n_act_offloads=n_act_off, n_act_reloads=n_act_rel,
+        baseline_peak_act=baseline_peak_act if act_on else [0] * p,
     )
 
 
 # ── ASCII Gantt ───────────────────────────────────────────────────────────────
 
-_ROW_CHAR = {"F": "F", "B": "b", "L": "L", "G": "G", "A": "A", "C": "C"}
+_ROW_CHAR = {"F": "F", "B": "b", "L": "L", "G": "G", "A": "A", "C": "C",
+             "O": "O", "R": "R"}
 
 
 def gantt(res: PipelineOffloadResult, width: int = 120) -> str:
@@ -656,12 +904,18 @@ def plot_gantt(
     results: List[Tuple[str, PipelineOffloadResult]],
     out_path: Optional[str] = None,
     show: bool = True,
+    scale: float = 1.0,
+    dpi: int = 130,
 ):
     """One subplot per result; 3 rows per stage (gpu / h2d / d2h).
 
     Compute bars are labeled ``F{mb}c{chunk}`` / ``B{mb}c{chunk}``, loads
     ``L{chunk}``, grad writebacks ``G{chunk}``. Idle gaps on the gpu rows are
     pipeline bubble + offload stall; idle on h2d rows is spare PCIe headroom.
+
+    ``scale`` multiplies the figure dimensions (fonts keep their point
+    size, so bars/labels get more room — use ~1.5-2 for busy schedules);
+    ``dpi`` controls the saved image resolution.
     """
     import matplotlib
     if not show:
@@ -670,18 +924,22 @@ def plot_gantt(
     from matplotlib.patches import Patch
 
     colors = {"F": "#0072B2", "B": "#E69F00", "L": "#009E73", "G": "#CC79A7",
-              "A": "#56B4E9", "C": "#D55E00"}
-    hatches = {"F": "", "B": "//", "L": "", "G": "", "A": "//", "C": ""}
+              "A": "#56B4E9", "C": "#D55E00",
+              "O": "#56B4E9", "R": "#F0E442"}
+    hatches = {"F": "", "B": "//", "L": "", "G": "", "A": "//", "C": "",
+               "O": "\\\\", "R": "\\\\"}
     kind_name = {"F": "forward", "B": "backward", "L": "H2D weight load",
                  "G": "D2H grad/acc writeback", "A": "H2D acc reload",
-                 "C": "CPU accumulate"}
+                 "C": "CPU accumulate", "O": "act offload (D2H)",
+                 "R": "act reload (H2D)"}
 
     n = len(results)
     max_ms = max((r.makespan for _, r in results), default=1.0)
     heights = [3 * r.p * 0.42 + 0.9 for _, r in results]
     fig, axes = plt.subplots(
         n, 1,
-        figsize=(min(48, max(12, max_ms * 0.22)), sum(heights)),
+        figsize=(scale * min(48, max(12, max_ms * 0.22)),
+                 scale * sum(heights)),
         sharex=True, squeeze=False,
         gridspec_kw={"height_ratios": heights},
     )
@@ -700,15 +958,16 @@ def plot_gantt(
                             color=colors[kind], hatch=hatches[kind],
                             edgecolor="white", linewidth=0.3)
                     if en - st >= res.makespan * 0.004:
-                        label = (f"{kind}{op[1]}c{op[2]}" if ch == "gpu"
+                        label = (f"{kind}{op[1]}c{op[2]}" if len(op) == 3
                                  else f"{kind}{op[1]}")
                         bbox = (
                             dict(facecolor=colors[kind], edgecolor="none",
                                  pad=0.4)
                             if hatches[kind] else None
                         )
+                        txt = "black" if kind == "R" else "white"
                         ax.text((st + en) / 2, y, label, ha="center",
-                                va="center", fontsize=5.5, color="white",
+                                va="center", fontsize=5.5, color=txt,
                                 weight="bold", bbox=bbox)
             if s < res.p - 1:  # separator between stages
                 ax.axhline(nrows - 1 - (3 * s + 2) - 0.5, color="#999",
@@ -724,7 +983,12 @@ def plot_gantt(
             f" (+{100 * res.overhead_vs_ref:.0f}%)"
             f"  loads={sum(res.n_loads)}/{sum(mt['naive_loads'])} naive"
             f"  W={res.window}+{len(res.pinned)}pin"
-            f"  peak_res={max(res.peak_resident)}",
+            f"  peak_res={max(res.peak_resident)}"
+            + (f"  act={max(res.peak_act(s) for s in range(res.p))}"
+               f"/{max(res.act_slots)} slots"
+               f" (base {max(res.baseline_peak_act)},"
+               f" O={sum(res.n_act_offloads)} R={sum(res.n_act_reloads)})"
+               if res.act_on else ""),
             loc="left", fontsize=10,
         )
     axes[-1, 0].set_xlabel("time")
@@ -739,7 +1003,7 @@ def plot_gantt(
     )
     fig.tight_layout()
     if out_path:
-        fig.savefig(out_path, dpi=130, bbox_inches="tight")
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
         print(f"wrote {out_path}")
     if show:
         plt.show()
@@ -781,6 +1045,13 @@ def report(name: str, res: PipelineOffloadResult, width: int = 120) -> str:
                 f"  accW={res.n_acc_wb[s]:3d}"
                 f"  peak_acc={res.peak_acc[s]}"
             )
+        if res.act_on:
+            line += (
+                f"  actO={res.n_act_offloads[s]:3d}"
+                f"  actR={res.n_act_reloads[s]:3d}"
+                f"  peak_act={res.peak_act(s)}/{res.act_slots[s]}"
+                f" (base {res.baseline_peak_act[s]})"
+            )
         out.append(line)
     out.append(gantt(res, width))
     return "\n".join(out)
@@ -816,10 +1087,26 @@ def main() -> int:
     ap.add_argument("--acc-slots", type=int, default=None,
                     help="grad accumulator residency slots per stage "
                          "(stream mode; default = window)")
+    ap.add_argument("--tact", type=float, default=0.0,
+                    help="activation packet transfer cost each way "
+                         "(0 = activation offload disabled)")
+    ap.add_argument("--act-slots", type=int, default=0,
+                    help="GPU activation slots per stage; 0 with --window = "
+                         "sweep over slot counts, 0 in the window sweep = "
+                         "unlimited")
+    ap.add_argument("--act-policy", choices=("eager", "lazy"),
+                    default="eager",
+                    help="eager = offload packets at birth when D2H is idle; "
+                         "lazy = only under slot pressure")
     ap.add_argument("--schedule", choices=sorted(_BUILDERS), default="1b1f")
     ap.add_argument("--width", type=int, default=120, help="ascii gantt width")
     ap.add_argument("--plot", type=str, nargs="?", const="", default=None,
                     help="render a matplotlib Gantt; optionally a .png path")
+    ap.add_argument("--plot-scale", type=float, default=1.0,
+                    help="multiply the Gantt figure size (fonts keep their "
+                         "point size; ~1.5-2 declutters busy schedules)")
+    ap.add_argument("--plot-dpi", type=int, default=130,
+                    help="resolution of the saved Gantt image")
     args = ap.parse_args()
 
     p, m, L = args.p, args.m, args.chunks
@@ -828,12 +1115,53 @@ def main() -> int:
     kw = dict(tf=args.tf, tb=args.tb, th2d=args.th2d, td2h=args.td2h,
               comm=args.comm, pinned=pinned, grad_mode=args.grad_mode,
               tcpu=args.tcpu, acc_slots=args.acc_slots)
+    if args.tact > 0:
+        kw.update(tact=args.tact, act_policy=args.act_policy,
+                  act_slots=(None if args.act_slots <= 0
+                             else args.act_slots))
     print(
         f"schedule={args.schedule} p={p} m={m} chunks={L} "
         f"tf={args.tf} tb={args.tb} th2d={args.th2d} td2h={args.td2h} "
         f"comm={args.comm} pin={args.pin} grad_mode={args.grad_mode}"
-        f" tcpu={args.tcpu} acc_slots={args.acc_slots}\n"
+        f" tcpu={args.tcpu} acc_slots={args.acc_slots}"
+        + (f" tact={args.tact} act_policy={args.act_policy}"
+           if args.tact > 0 else "")
+        + "\n"
     )
+
+    # activation-slot sweep: --window given, --tact > 0, --act-slots 0
+    if args.window > 0 and args.tact > 0 and args.act_slots <= 0:
+        base = simulate_pipeline_offload(
+            rank_ops, L, args.window, **{**kw, "act_slots": None})
+        peak0 = max(base.baseline_peak_act)
+        print(f"  act-slot sweep (W={args.window}, no-offload peak = "
+              f"{peak0} packets on the worst stage):")
+        print(f"  {'slots':>5}  {'makespan':>9}  {'overhead':>8}  "
+              f"{'gpu% (per stage)':<20}  {'offl':>5}  {'reld':>5}  "
+              f"{'peakA':>5}")
+        rows_a = []
+        for slots in range(1, max(2, peak0 + 1)):
+            res = simulate_pipeline_offload(
+                rank_ops, L, args.window, **{**kw, "act_slots": slots})
+            rows_a.append((slots, res))
+            gpu_utils = "/".join(f"{100 * res.util(s, 'gpu'):.0f}"
+                                 for s in range(res.p))
+            print(f"  {slots:>5}  {res.makespan:>9.1f}  "
+                  f"{100 * res.overhead_vs_ref:>7.1f}%  {gpu_utils:<20}  "
+                  f"{sum(res.n_act_offloads):>5}  "
+                  f"{sum(res.n_act_reloads):>5}  "
+                  f"{max(res.peak_act(s) for s in range(res.p)):>5}")
+        if args.plot is not None:
+            out = args.plot or None
+            picks = sorted({1, max(1, peak0 // 2), peak0})
+            plot_gantt(
+                [(f"{args.schedule} p={p} m={m} L={L} W={args.window} "
+                  f"act_slots={sl}", r)
+                 for sl, r in rows_a if sl in picks],
+                out_path=out, show=(out is None),
+                scale=args.plot_scale, dpi=args.plot_dpi,
+            )
+        return 0
 
     if args.window > 0:
         res = simulate_pipeline_offload(rank_ops, L, args.window, **kw)
@@ -843,6 +1171,7 @@ def main() -> int:
             plot_gantt(
                 [(f"{args.schedule} p={p} m={m} L={L} W={args.window}", res)],
                 out_path=out, show=(out is None),
+                scale=args.plot_scale, dpi=args.plot_dpi,
             )
         return 0
 
@@ -850,17 +1179,22 @@ def main() -> int:
     rows = []
     for w in range(1, L + 1):
         rows.append((w, simulate_pipeline_offload(rank_ops, L, w, **kw)))
+    act_hdr = (f"  {'offl':>5}  {'reld':>5}  {'peakA':>5}"
+               if args.tact > 0 else "")
     print(f"  {'W':>3}  {'makespan':>9}  {'overhead':>8}  {'gpu% (per stage)':<20}"
-          f"  {'h2d%max':>7}  {'loads':>6}  {'naive':>6}  {'peak':>4}")
+          f"  {'h2d%max':>7}  {'loads':>6}  {'naive':>6}  {'peak':>4}{act_hdr}")
     for w, res in rows:
         gpu_utils = "/".join(f"{100 * res.util(s, 'gpu'):.0f}"
                              for s in range(res.p))
+        act = (f"  {sum(res.n_act_offloads):>5}  {sum(res.n_act_reloads):>5}"
+               f"  {max(res.peak_act(s) for s in range(res.p)):>5}"
+               if args.tact > 0 else "")
         print(f"  {w:>3}  {res.makespan:>9.1f}  "
               f"{100 * res.overhead_vs_ref:>7.1f}%  {gpu_utils:<20}  "
               f"{100 * max(res.util(s, 'h2d') for s in range(res.p)):>7.0f}"
               f"  {sum(res.n_loads):>6}  "
               f"{sum(res.naive_loads(s) for s in range(res.p)):>6}  "
-              f"{max(res.peak_resident):>4}")
+              f"{max(res.peak_resident):>4}{act}")
     if args.plot is not None:
         out = args.plot or None
         picks = sorted({1, max(1, L // 2), L})
@@ -868,6 +1202,7 @@ def main() -> int:
             [(f"{args.schedule} p={p} m={m} L={L} W={w}", res)
              for w, res in rows if w in picks],
             out_path=out, show=(out is None),
+            scale=args.plot_scale, dpi=args.plot_dpi,
         )
     return 0
 

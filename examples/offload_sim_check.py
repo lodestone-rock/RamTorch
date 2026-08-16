@@ -17,6 +17,15 @@ Checks:
   4. Sweep report: minimum window W for zero steady-state stall as a function
      of th2d/tf, forward-only and training — the table that sizes real
      deployments.
+  5. Activation offloading (both sims): the off-toggle (tact=0) is
+     result-identical to not passing the knobs at all; lazy policy with
+     unlimited slots moves zero bytes and zero time; span-level invariants
+     under fuzz (every B runs with its packet on the GPU — the last transfer
+     for a packet before its B is never an un-reloaded offload; occupancy
+     never exceeds act_slots; offload count covers the forced-roundtrip
+     lower bound; channels stay serial); deadlock-free stress grid incl.
+     act_slots=1 thrash, for the single-GPU sim and all three pipeline
+     schedules x grad modes.
 
 Run:  PYTHONPATH=. python examples/offload_sim_check.py
 """
@@ -66,8 +75,9 @@ def check_invariants(res, itin, mem) -> list:
                 errs.append(f"{ch} spans overlap at index {i}")
                 break
     nb = sum(1 for k, _ in itin if k == "B")
-    if res.td2h > 0 and len(res.spans["d2h"]) != nb:
-        errs.append(f"{len(res.spans['d2h'])} writebacks, expected {nb}")
+    n_g = sum(1 for (k, _), _ in res.spans["d2h"] if k == "G")
+    if res.td2h > 0 and n_g != nb:
+        errs.append(f"{n_g} grad writebacks, expected {nb}")
     if res.makespan < res.compute_bound - EPS:
         errs.append(f"makespan {res.makespan} < compute bound {res.compute_bound}")
     if res.makespan < res.transfer_bound - EPS:
@@ -235,11 +245,213 @@ def min_window_sweep(n: int = 10) -> bool:
     return ok
 
 
+# ── 5. activation offloading ──────────────────────────────────────────────────
+
+def act_span_invariants(res, tag: str) -> list:
+    """Span-level invariants when activation offload is on (single-GPU sim)."""
+    errs = []
+    if res.peak_act > res.act_slots:
+        errs.append(f"{tag} peak_act {res.peak_act} > slots {res.act_slots}")
+    if res.n_act_offloads < res.min_act_roundtrips:
+        errs.append(f"{tag} offloads {res.n_act_offloads} < forced "
+                    f"lower bound {res.min_act_roundtrips}")
+    # per-layer transfer completions, chronological
+    events: dict = {}
+    for (k, l), (_, en) in res.spans["h2d"]:
+        if k == "R":
+            events.setdefault(l, []).append((en, "R"))
+    for (k, l), (_, en) in res.spans["d2h"]:
+        if k == "O":
+            events.setdefault(l, []).append((en, "O"))
+    for evs in events.values():
+        evs.sort()
+    # every B must run with its packet on the GPU: the last completed
+    # transfer for that layer before B start must not be an offload
+    # (clean re-drops are invisible but always followed by a visible R)
+    for (kind, l), (bst, _) in res.spans["gpu"]:
+        if kind != "B":
+            continue
+        last = None
+        for t, tag_ev in events.get(l, ()):
+            if t <= bst + EPS:
+                last = tag_ev
+            else:
+                break
+        if last == "O":
+            errs.append(f"{tag} B{l}@{bst}: packet left in RAM")
+            break
+    return errs
+
+
+def act_single_checks() -> bool:
+    ok = True
+    itin = train_itinerary(8, steps=2)
+
+    # off-toggle: tact=0 must be result-identical to omitting the knobs
+    a = simulate_offload(itin, 8, 3)
+    b = simulate_offload(itin, 8, 3, tact=0.0, act_slots=None,
+                         act_policy="lazy")
+    if a.metrics() != b.metrics() or a.spans != b.spans:
+        ok = False
+        print("  [act off-toggle] tact=0 differs from knobs omitted")
+    if any(k in a.metrics() for k in ("tact", "peak_act")):
+        ok = False
+        print("  [act off-toggle] act keys leaked into disabled metrics")
+
+    # lazy + unlimited slots: zero traffic, zero time cost
+    c = simulate_offload(itin, 8, 3, tact=0.7, act_slots=None,
+                         act_policy="lazy")
+    if c.n_act_offloads or c.n_act_reloads:
+        ok = False
+        print(f"  [act lazy-unlimited] moved bytes: O={c.n_act_offloads} "
+              f"R={c.n_act_reloads}")
+    if abs(c.makespan - a.makespan) > EPS:
+        ok = False
+        print(f"  [act lazy-unlimited] makespan {c.makespan} != {a.makespan}")
+
+    # fuzz + stress: no deadlock, invariants hold, incl. act_slots=1 thrash
+    total = bad = 0
+    for n in (2, 4, 6, 10):
+        for w in (1, 2, n):
+            for steps in (1, 2):
+                itin = train_itinerary(n, steps=steps)
+                for tact in (0.2, 0.8, 2.5):
+                    for slots in (1, 2, None):
+                        for pol in ("eager", "lazy"):
+                            total += 1
+                            tag = (f"[act n={n} W={w} steps={steps} "
+                                   f"tact={tact} slots={slots} {pol}]")
+                            try:
+                                res = simulate_offload(
+                                    itin, n, w, tact=tact, act_slots=slots,
+                                    act_policy=pol)
+                                errs = check_invariants(res, itin, w)
+                                errs += act_span_invariants(res, tag)
+                            except Exception as e:  # noqa: BLE001
+                                errs = [f"{tag} exception: {e}"]
+                            if errs:
+                                bad += 1
+                                print("  " + "; ".join(errs[:3]))
+    print(f"[act single-GPU] off-toggle + lazy anchors "
+          f"{'OK' if ok else 'MISMATCH'}; fuzz {total - bad}/{total}")
+    return ok and bad == 0
+
+
+def act_pipeline_checks() -> bool:
+    from ramtorch.pipeline_offload_simulator import (
+        expand_rank_ops,
+        simulate_pipeline_offload,
+    )
+    from ramtorch.schedule_simulator import (
+        gpipe_ops,
+        onef1b_ops,
+        staggered_1f1b_ops,
+    )
+    builders = {"1b1f": staggered_1f1b_ops, "gpipe": gpipe_ops,
+                "1f1b": onef1b_ops}
+    ok = True
+
+    # off-toggle identity + lazy-unlimited anchor on one config per schedule
+    for name, build in builders.items():
+        rank_ops = build(3, 5)
+        a = simulate_pipeline_offload(rank_ops, 4, 2)
+        b = simulate_pipeline_offload(rank_ops, 4, 2, tact=0.0,
+                                      act_slots=None, act_policy="lazy")
+        if a.metrics() != b.metrics() or a.spans != b.spans:
+            ok = False
+            print(f"  [pipe act off-toggle {name}] tact=0 differs")
+        c = simulate_pipeline_offload(rank_ops, 4, 2, tact=0.6,
+                                      act_slots=None, act_policy="lazy")
+        if sum(c.n_act_offloads) or sum(c.n_act_reloads):
+            ok = False
+            print(f"  [pipe act lazy-unlimited {name}] moved bytes")
+        if abs(c.makespan - a.makespan) > EPS:
+            ok = False
+            print(f"  [pipe act lazy-unlimited {name}] "
+                  f"makespan {c.makespan} != {a.makespan}")
+
+    # fuzz + stress grid
+    total = bad = 0
+    for name, build in builders.items():
+        for p, m, L in ((2, 3, 3), (3, 5, 4), (4, 8, 4)):
+            rank_ops = build(p, m)
+            itins, _, _ = expand_rank_ops(rank_ops, L)
+            for w in (1, 2):
+                for tact in (0.3, 1.5):
+                    for slots in (1, 2, None):
+                        for gm in ("writeback", "stream"):
+                            total += 1
+                            tag = (f"[pipe act {name} p={p} m={m} L={L} "
+                                   f"W={w} tact={tact} slots={slots} {gm}]")
+                            try:
+                                res = simulate_pipeline_offload(
+                                    rank_ops, L, w, tact=tact,
+                                    act_slots=slots, act_policy="eager",
+                                    grad_mode=gm)
+                                errs = pipe_act_invariants(res, itins, tag)
+                            except Exception as e:  # noqa: BLE001
+                                errs = [f"{tag} exception: {e}"]
+                            if errs:
+                                bad += 1
+                                print("  " + "; ".join(errs[:3]))
+    print(f"[act pipeline] anchors {'OK' if ok else 'MISMATCH'}; "
+          f"fuzz {total - bad}/{total}")
+    return ok and bad == 0
+
+
+def pipe_act_invariants(res, itins, tag: str) -> list:
+    errs = []
+    for s in range(res.p):
+        gpu = res.spans[s]["gpu"]
+        if len(gpu) != len(itins[s]):
+            errs.append(f"{tag} s{s}: {len(gpu)}/{len(itins[s])} ops ran")
+            continue
+        for i, (op, _) in enumerate(gpu):
+            if op != itins[s][i]:
+                errs.append(f"{tag} s{s} op {i} out of order")
+                break
+        if res.peak_act(s) > res.act_slots[s]:
+            errs.append(f"{tag} s{s}: peak_act {res.peak_act(s)} > "
+                        f"slots {res.act_slots[s]}")
+        for ch in ("gpu", "h2d", "d2h"):
+            spans = res.spans[s][ch]
+            for i in range(1, len(spans)):
+                if spans[i][1][0] < spans[i - 1][1][1] - EPS:
+                    errs.append(f"{tag} s{s} {ch} spans overlap")
+                    break
+        # last transfer for a packet before its B must not be an offload
+        events: dict = {}
+        for op, (_, en) in res.spans[s]["h2d"]:
+            if op[0] == "R":
+                events.setdefault((op[1], op[2]), []).append((en, "R"))
+        for op, (_, en) in res.spans[s]["d2h"]:
+            if op[0] == "O":
+                events.setdefault((op[1], op[2]), []).append((en, "O"))
+        for evs in events.values():
+            evs.sort()
+        for (kind, mb, c), (bst, _) in gpu:
+            if kind != "B":
+                continue
+            last = None
+            for t, tg in events.get((mb, c), ()):
+                if t <= bst + EPS:
+                    last = tg
+                else:
+                    break
+            if last == "O":
+                errs.append(f"{tag} s{s} B mb{mb}c{c}@{bst}: "
+                            f"packet left in RAM")
+                break
+    return errs
+
+
 def main() -> int:
     ok = fuzz()
     ok &= corner_cases()
     ok &= user_scenario()
     ok &= min_window_sweep()
+    ok &= act_single_checks()
+    ok &= act_pipeline_checks()
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

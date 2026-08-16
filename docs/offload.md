@@ -135,6 +135,8 @@ For a runnable streamed-eval loop with accuracy + peak-memory reporting, see
 | `keep_activations` | `False` | Backward strategy: `False` (recompute), `True` (keep), or `"checkpoint"` (see below). |
 | `grad_accum` | `"stream"` | Where streamed chunks accumulate grads. `"stream"`: on the GPU in `acc_slots` bounded slots, spilling/reloading over the copy streams like weights — zero CPU math, grad PCIe traffic per *step* when slots suffice. `"cpu"` (legacy): per-microbatch D2H packets added into pinned CPU buffers by the writeback thread. |
 | `acc_slots` | `window` | GPU slots for `"stream"` accumulators. `acc_slots ≥` streamed-chunk count keeps every accumulator resident between flushes; smaller values trade PCIe traffic for memory (one extra chunk-sized GPU buffer per slot). |
+| `offload_activations` | `False` | Stream saved activations to pinned CPU RAM between a chunk's forward and its backward (`saved_tensors_hooks` packets). Requires `keep_activations=True` or `"checkpoint"`. Bit-exact. See "Activation offload" below. |
+| `act_slots` | `2` | Resident activation packets before the lazy offload kicks in. Higher = more GPU memory, less PCIe traffic. |
 
 ### `keep_activations` — the three backward strategies
 
@@ -207,6 +209,63 @@ Measured on the same study config (light `d×d` kept + heavy 4x expansion
 marked): keep with no marks 2222 MiB → keep with marks **814 MiB** →
 `"checkpoint"` (everything) 702 MiB — and the marked run stays bit-identical
 to an ordinary unmarked full-resident model, dropout included.
+
+### Activation offload — stream saved activations like weights
+
+`offload_activations=True` gives keep mode a third option beyond
+"keep everything" and "recompute": between a chunk's forward and its
+backward, its saved activations live in **pinned CPU RAM** instead of GPU
+memory, riding the same D2H/H2D copy streams the weights use.
+
+```python
+model = OffloadModel(blocks, device="cuda:0", keep_activations=True,
+                     offload_activations=True, act_slots=2)
+```
+
+How it works (design validated in the simulator and the hook probe first):
+
+* Each chunk forward runs under `torch.autograd.graph.saved_tensors_hooks`;
+  the pack hook collects everything autograd saves into a per-chunk
+  **packet** (engine weights pass through untouched — they already stream —
+  and duplicate saves of the same tensor cross PCIe once).
+* The policy is **lazy**: nothing moves until more than `act_slots` packets
+  are resident. The victim is the packet whose backward is *farthest away*
+  (the itinerary is known, so this is exact Belady, the same rule the weight
+  window uses). A packet reloaded and re-evicted without changing doesn't
+  pay a second D2H (clean re-drop).
+* Reloads are prefetched **one backward ahead** on the H2D stream, ordered
+  purely by CUDA events — no host syncs; pinned staging buffers are pooled
+  and reused across steps.
+* **Bit-exact**: the unpack hook returns the same values, dropout masks
+  included. The parity suite (`examples/offload_streaming_check.py`,
+  section 8) asserts exact-equality of losses, grads, and multi-step
+  weights vs the same config with the feature off.
+* **Never NVMe.** Activation packets go to RAM only.
+
+What it saves: the packets hold what the *graph alone* holds. In keep mode
+that is every chunk's internal activations — usually the bulk (a 4x-MLP or
+attention block saves several times its boundary). Chunk-**boundary**
+tensors stay on the GPU either way (the engine's backward cache needs them
+as autograd roots/leaves), which is also why combining it with
+`"checkpoint"` saves ~nothing: checkpoint's graph holds only boundary
+copies. Use it with `keep_activations=True`.
+
+Measured (12 x [2048→8192 GELU 8192→2048] chunks, batch 2048, W=2, RTX PRO
+6000, `examples/offload_act_bench.py`; timing taken on a contended GPU —
+treat it as indicative):
+
+| mode | act | peak GPU | step | act traffic/step |
+|---|---|---|---|---|
+| keep | off | 2529 MiB | ~200 ms | 0 |
+| keep | `act_slots=2` | **1537 MiB** | ~260 ms | 1.4 GiB |
+| `"checkpoint"` | off | 1250 MiB | ~220 ms | 0 |
+| `"checkpoint"` | `act_slots=2` | 1282 MiB | ~220 ms | 160 MiB |
+
+Rule of thumb: **keep + `offload_activations`** when keep-mode activations
+don't fit but you want one forward per step (dropout-safe, no recompute);
+plain `"checkpoint"` when PCIe is the scarcer resource. `act_slots=2`
+(default) keeps one packet in compute and one in flight; raise it if you
+have memory to spare and want the traffic gone.
 
 ---
 
