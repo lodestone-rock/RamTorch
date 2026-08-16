@@ -34,11 +34,25 @@ example (`mnist_pipeline_offload.py`) the traffic largely hides behind compute
 and pipeline bubbles — check the `--profile` trace in Perfetto to see the H2D
 loads overlapping the F/B spans.
 
+ACTIVATION OFFLOADING (--act-offload, needs --offload)
+------------------------------------------------------
+On top of weight streaming, `--act-offload` streams each (microbatch, chunk)
+forward's saved activations to pinned CPU RAM until that chunk's backward
+(engine `saved_tensors_hooks` packets, lazy policy, reloads prefetched one
+backward ahead of the stage schedule). This matters in a pipeline: a stage
+holds up to `p` in-flight microbatches' activations, and the packet cap
+replaces that with `--act-slots` packets (default 2) per stage. Bit-exact;
+attention blocks save several times their boundary size internally, so the
+memory cut is real here. Pairs with the default keep mode (checkpoint-mode
+packets are boundary-only — little to gain).
+
 Run:
     python examples/mnist_pipeline_big_transformer_manual.py
     python examples/mnist_pipeline_big_transformer_manual.py --steps 200 --devices cuda:1 cuda:3
     python examples/mnist_pipeline_big_transformer_manual.py \
         --devices cuda:0 cuda:1 cuda:2 cuda:3 --offload --window 2 --profile
+    python examples/mnist_pipeline_big_transformer_manual.py \
+        --devices cuda:1 cuda:3 --offload --act-offload --act-slots 2
 """
 
 from __future__ import annotations
@@ -255,6 +269,15 @@ def main() -> int:
     ap.add_argument("--acc-slots", type=int, default=None,
                     help="GPU slots for streamed grad accumulators "
                          "(default: same as --window)")
+    ap.add_argument("--act-offload", action="store_true",
+                    help="also stream saved ACTIVATIONS to pinned CPU RAM "
+                         "between each (microbatch, chunk) forward and its "
+                         "backward — caps per-stage activation residency at "
+                         "--act-slots packets instead of in-flight-"
+                         "microbatches x chunks. Bit-exact; needs --offload")
+    ap.add_argument("--act-slots", type=int, default=2,
+                    help="resident activation packets per offloaded stage "
+                         "before the lazy offload kicks in (default 2)")
     # ── Profiling (bounded to a small step window so files stay small) ──
     ap.add_argument("--profile", action="store_true",
                     help="capture a kineto profile + op-level Perfetto trace "
@@ -290,6 +313,13 @@ def main() -> int:
     if args.offload and args.chunks:
         raise SystemExit("--offload already implies chunked stages; "
                          "pass only one of --offload / --chunks")
+    if args.act_offload and not args.offload:
+        raise SystemExit("--act-offload requires --offload (activation "
+                         "packets ride the offload engine's copy streams)")
+    if args.act_offload and args.offload_mode != "keep":
+        print("note: --act-offload with --offload-mode checkpoint moves "
+              "only boundary packets (little memory to gain — see "
+              "docs/offload.md, 'Activation offload'); still bit-exact")
     if args.offload or args.chunks:
         # Flat chunk_modules path: dice the whole model into ONE ordered chunk
         # list; the Pipeline splits it across the devices (chunks_per_stage
@@ -303,7 +333,10 @@ def main() -> int:
         n_params = sum(p.numel() for m in chunks for p in m.parameters())
         kind = "offloaded" if args.offload else "resident chunked"
         extra = (f" (window={args.window} pin={args.pin} "
-                 f"mode={args.offload_mode})" if args.offload else "")
+                 f"mode={args.offload_mode}"
+                 + (f" act-slots={args.act_slots}" if args.act_offload
+                    else "")
+                 + ")" if args.offload else "")
         print(f"model: {n_params/1e6:.1f}M params, {len(chunks)} chunks -> "
               f"{n_stages} {kind} stages {counts}{extra}")
         pipe = Pipeline(
@@ -315,6 +348,8 @@ def main() -> int:
                                       else "checkpoint"),
             offload_grad_accum=args.grad_accum,
             offload_acc_slots=args.acc_slots,
+            offload_activations=args.act_offload,
+            offload_act_slots=args.act_slots,
         )
     else:
         stages = build_stages(args.dim, args.depth, args.heads, args.patch,
@@ -412,9 +447,14 @@ def main() -> int:
         print("  offload engine stats per stage:")
         for i, st in enumerate(pipe.stages):
             s = st.engine.stats
+            act = (f", act packets={s['act_offloads']} out/"
+                   f"{s['act_reloads']} back "
+                   f"({s['act_bytes_offloaded'] / 2**20 / step:.1f} MiB/step)"
+                   if args.act_offload else "")
             print(f"    stage {i}: H2D loads={s['loads']} "
                   f"({s['loads']/step:.1f}/step), acquire stall="
-                  f"{s['acquire_wait_s']:.2f}s ({s['acquire_wait_s']/step*1e3:.1f} ms/step)")
+                  f"{s['acquire_wait_s']:.2f}s "
+                  f"({s['acquire_wait_s']/step*1e3:.1f} ms/step){act}")
         for d in args.devices:
             peak = torch.cuda.max_memory_allocated(d) / 2**20
             print(f"    {d}: peak GPU memory {peak:.0f} MiB")

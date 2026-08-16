@@ -75,6 +75,7 @@ Gotchas
 
 from __future__ import annotations
 
+import contextlib
 import threading
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -110,6 +111,17 @@ class OffloadStage(Stage):
                        ``"checkpoint"`` (recompute-level memory, dropout-safe).
                        Engine recompute mode (``False``) is rejected — see the
                        module docstring.
+    offload_activations : stream saved activations to pinned CPU RAM
+                       (engine ``saved_tensors_hooks`` packets, keyed
+                       ``(mb, chunk)`` here). The pipeline's in-flight
+                       microbatches multiply activation residency by up to
+                       ``p``; with this on it is bounded by ``act_slots``
+                       packets instead of ``m x chunks``. Lazy policy,
+                       Belady eviction by each packet's backward position
+                       in THIS stage's op schedule, one-packet reload
+                       prefetch across F/B op boundaries. Never NVMe.
+    act_slots        : resident activation packets before pressure offloads
+                       kick in (default 2).
 
     Total GPU weight memory per stage ~= ``window + pin`` chunks (plus
     activations per the backward strategy).
@@ -129,6 +141,8 @@ class OffloadStage(Stage):
         keep_activations: Union[bool, str] = True,
         grad_accum: str = "stream",
         acc_slots: Optional[int] = None,
+        offload_activations: bool = False,
+        act_slots: int = 2,
     ):
         # Deliberately NOT calling Stage.__init__: it moves the module onto
         # the stage device, but an offloaded stage's masters must go to CPU
@@ -159,11 +173,20 @@ class OffloadStage(Stage):
             keep_activations=keep_activations,
             grad_accum=grad_accum,
             acc_slots=acc_slots,
+            offload_activations=offload_activations,
+            act_slots=act_slots,
         )
         # ``module`` is what Pipeline.infer's worker calls directly; the
         # engine's streamed forward (inference ring) drops in unchanged.
         self.module = self.engine
         self._use_checkpoint = keep_activations == "checkpoint"
+        self._act_on = bool(offload_activations)
+        # (mb, chunk) -> backward position in this stage's expanded op list,
+        # and each key's successor in global backward order (reload prefetch
+        # across F/B op boundaries). Built by begin_step, read only by the
+        # stage's relay worker during the step.
+        self._act_bpos: Dict[Tuple[int, int], int] = {}
+        self._act_bnext: Dict[Tuple[int, int], Tuple[int, int]] = {}
 
         self.params: List[nn.Parameter] = list(self.engine.parameters())
         # Grad accumulators live in the engine (CPU pinned for streamed
@@ -192,14 +215,19 @@ class OffloadStage(Stage):
         n = eng.n
         itin: List[int] = []
         kinds: List[str] = []
+        act_bpos: Dict[Tuple[int, int], int] = {}
         for op in ops:
             kind = op[0]
             if kind == "F":
                 itin.extend(range(n))
                 kinds.extend("F" * n)
             elif kind == "B":
+                base = len(itin)
                 itin.extend(range(n - 1, -1, -1))
                 kinds.extend("B" * n)
+                # activation packets rank/prefetch by backward position
+                for j, ci in enumerate(range(n - 1, -1, -1)):
+                    act_bpos[(op[1], ci)] = base + j
         with eng._cv:
             eng._check_error()
             # any previous itinerary is fully consumed by now (or belongs to
@@ -213,6 +241,11 @@ class OffloadStage(Stage):
         with self._lock:
             self._mb_chunks.clear()
             self._inp_tuple.clear()
+            order = sorted(act_bpos, key=act_bpos.__getitem__)
+            self._act_bpos = act_bpos
+            self._act_bnext = {
+                k: order[j + 1] for j, k in enumerate(order[:-1])
+            }
 
     # ------------------------------------------------------------------
     def forward_one_chunk(self, mb_index: int, x):
@@ -239,7 +272,16 @@ class OffloadStage(Stage):
                     t.requires_grad_(
                         t.is_floating_point() and (i > 0 or not self.is_first)
                     )
-                with torch.enable_grad(), self._autocast_ctx():
+                key = (mb_index, i)
+                bpos = self._act_bpos.get(key)
+                # no announced backward (shouldn't happen in training) ->
+                # nothing will consume the packet: skip the hooks
+                act_ctx = (
+                    eng._act_ctx(key, bpos, tensors)
+                    if self._act_on and bpos is not None
+                    else contextlib.nullcontext()
+                )
+                with torch.enable_grad(), self._autocast_ctx(), act_ctx:
                     if self._use_checkpoint:
                         raw = torch.utils.checkpoint.checkpoint(
                             lambda *a, _i=i, _ts=tensors:
@@ -251,6 +293,8 @@ class OffloadStage(Stage):
                 outs = eng._as_tuple(raw)
                 per_chunk.append((inps, outs, raw, tensors))
                 hs = tuple(t.detach() for t in outs)
+                if self._act_on:
+                    eng._act_settle()
             eng._release()
 
         # per-arg needs_grad mask of the stage OUTPUT (the last chunk's),
@@ -338,6 +382,11 @@ class OffloadStage(Stage):
         for i in range(n - 1, -1, -1):
             with record_function(f"B{i} mb{mb_index}"):
                 eng._acquire(i)  # refills evicted weight storage
+                if self._act_on:
+                    key = (mb_index, i)
+                    nxt = self._act_bnext.get(key)
+                    eng._act_stage_backward(
+                        key, (nxt,) if nxt is not None else ())
                 inps, outs, raw_out, tensors = per_chunk[i]
                 if i == n - 1 and seed_loss is not None:
                     # seed from the precomputed graph-connected loss; the
@@ -354,6 +403,8 @@ class OffloadStage(Stage):
                     )
                 eng._accumulate(eng._state[i], named)
                 per_chunk[i] = None  # free this chunk's graph/activations
+                if self._act_on:
+                    eng._act_discard((mb_index, i))
             eng._release()
 
         if self.tracer:
@@ -376,6 +427,10 @@ class OffloadStage(Stage):
         """Engine flush: accumulated grads -> ``.grad`` on the masters (CPU
         pinned for streamed chunks, GPU for pinned chunks), then residency is
         invalidated so the next step reloads post-optimizer weights."""
+        if self._act_on:
+            # every announced backward has run by flush time — a lingering
+            # packet means a scheduling bug
+            self.engine._act_assert_drained()
         self.engine.flush_grads(scale=scale)
 
     def zero_grad_acc(self):
@@ -391,6 +446,10 @@ class OffloadStage(Stage):
             self._cache.clear()
             self._mb_chunks.clear()
             self._inp_tuple.clear()
+        # leftover packets can only exist after an aborted step — drop them
+        # (their pinned buffers return to the pool) so the next step is clean
+        for key in list(self.engine._act_store):
+            self.engine._act_discard(key)
 
     def close(self):
         """Stop the engine's loader/writeback threads (idempotent)."""

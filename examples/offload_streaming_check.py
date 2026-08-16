@@ -18,6 +18,14 @@ Checks (on CPU always, and on CUDA when available):
      stage workers.
   7. Grad bypass (grad_outputs=): callable + tensor forms vs a reference
      loss backward; .loss raises; loss_fn+grad_outputs raises ValueError.
+  8. Activation offload (offload_activations=True): BIT-exact vs the same
+     config with it off — keep + checkpoint x act_slots 1/2, 3-step
+     optimizer cycling, dropout mask preservation, tuple intermediates,
+     window=1 + acc_slots=1 + act_slots=1 combined thrash. Also byte-exact
+     traffic accounting on a known architecture, which doubles as the
+     probe's "hooks never pack weights" counter (one leaked weight would
+     inflate act_bytes_offloaded detectably). Recompute mode + activation
+     offload must be rejected.
 
 On CUDA, also reports peak GPU memory of a streamed step vs the full-resident
 reference (the point of the whole exercise).
@@ -352,6 +360,136 @@ def check_grad_bypass(device: str) -> list:
     return errs
 
 
+def _train_run(device, chunks, *, keep, act, act_slots=2, window=2,
+               acc_slots=None, steps=3, dim=32, lr=0.05):
+    """3 SGD steps on an OffloadModel; returns (losses, grads, weights,
+    infer output, stats) — everything an exact-parity comparison needs."""
+    model = OffloadModel(copy.deepcopy(chunks), device=device, window=window,
+                         keep_activations=keep, acc_slots=acc_slots,
+                         offload_activations=act, act_slots=act_slots)
+    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    torch.manual_seed(2)
+    x, y = torch.randn(8, dim), torch.randn(8, dim)
+    losses, grads = [], {}
+    for s in range(steps):
+        torch.manual_seed(20 + s)  # identical dropout draws across runs
+        res = model.step(x, targets=y, loss_fn=nn.functional.mse_loss)
+        losses.append(res.loss.detach().cpu().clone())
+        model.flush_grads()
+        if s == 0:
+            grads = {nme: p.grad.detach().cpu().clone()
+                     for nme, p in model.chunks.named_parameters()}
+        opt.step()
+        opt.zero_grad(set_to_none=False)
+    weights = {nme: p.detach().cpu().clone()
+               for nme, p in model.chunks.named_parameters()}
+    with torch.no_grad():
+        infer = model(x).detach().cpu().clone()
+    stats = dict(model.stats)
+    model.close()
+    return losses, grads, weights, infer, stats
+
+
+def _exact(name, a, b, errs):
+    if not torch.equal(a, b):
+        errs.append(f"{name}: NOT bit-exact (max err "
+                    f"{(a - b).abs().max().item():.3e})")
+
+
+def check_act_offload(device: str) -> list:
+    """Activation offload: bit-exact parity vs the same config with it off."""
+    errs: list = []
+    n, dim = 6, 32
+
+    def compare(tag, base, test):
+        for s, (bl, tl) in enumerate(zip(base[0], test[0])):
+            _exact(f"{tag} loss step{s}", bl, tl, errs)
+        for nme in base[1]:
+            _exact(f"{tag} grad {nme}", base[1][nme], test[1][nme], errs)
+        for nme in base[2]:
+            _exact(f"{tag} weight {nme}", base[2][nme], test[2][nme], errs)
+        _exact(f"{tag} infer", base[3], test[3], errs)
+
+    # keep/checkpoint x act_slots 1 (thrash) / 2, 3-step optimizer cycling
+    for keep in (True, "checkpoint"):
+        chunks = make_chunks(n, dim, seed=17)
+        base = _train_run(device, chunks, keep=keep, act=False)
+        for slots in (1, 2):
+            nb = len(errs)
+            test = _train_run(device, chunks, keep=keep, act=True,
+                              act_slots=slots)
+            compare(f"act[{_MODE_LABEL[keep]} slots={slots}]", base, test)
+            # traffic accounting doubles as the no-weights-packed counter:
+            # Linear+GELU saves exactly 2 activations per chunk in keep mode
+            # (linear input + gelu input) and 1 in checkpoint mode (the
+            # boundary input); lazy policy offloads (n - slots) packets per
+            # step. A single packed weight would add dim*dim*4 bytes.
+            saves = 2 if keep is True else 1
+            steps = 3
+            want_moves = steps * (n - slots)
+            want_bytes = want_moves * saves * 8 * dim * 4
+            if test[4]["act_offloads"] != want_moves:
+                errs.append(f"act[{_MODE_LABEL[keep]} slots={slots}]: "
+                            f"{test[4]['act_offloads']} offloads, expected "
+                            f"{want_moves} (lazy policy)")
+            if test[4]["act_bytes_offloaded"] != want_bytes:
+                errs.append(f"act[{_MODE_LABEL[keep]} slots={slots}]: "
+                            f"{test[4]['act_bytes_offloaded']} bytes moved, "
+                            f"expected {want_bytes} — a non-activation "
+                            f"tensor (weight?) got packed")
+            status = "OK" if len(errs) == nb else "MISMATCH"
+            print(f"[{device} act-offload {_MODE_LABEL[keep]} "
+                  f"slots={slots}] {status}")
+
+    # combined thrash: minimal weight window + acc slot + act slot
+    for keep in (True, "checkpoint"):
+        nb = len(errs)
+        chunks = make_chunks(n, dim, seed=18)
+        base = _train_run(device, chunks, keep=keep, act=False,
+                          window=1, acc_slots=1)
+        test = _train_run(device, chunks, keep=keep, act=True, act_slots=1,
+                          window=1, acc_slots=1)
+        compare(f"act-thrash[{_MODE_LABEL[keep]}]", base, test)
+        status = "OK" if len(errs) == nb else "MISMATCH"
+        print(f"[{device} act-thrash {_MODE_LABEL[keep]} W=1 acc=1 act=1] "
+              f"{status}")
+
+    # dropout masks must survive the offload/reload round trip
+    for keep in (True, "checkpoint"):
+        nb = len(errs)
+        torch.manual_seed(19)
+        dchunks = [
+            nn.Sequential(nn.Linear(dim, dim), nn.Dropout(p=0.5), nn.GELU())
+            for _ in range(n)
+        ]
+        base = _train_run(device, dchunks, keep=keep, act=False)
+        test = _train_run(device, dchunks, keep=keep, act=True, act_slots=1)
+        compare(f"act-dropout[{_MODE_LABEL[keep]}]", base, test)
+        status = "OK" if len(errs) == nb else "MISMATCH"
+        print(f"[{device} act-dropout {_MODE_LABEL[keep]}] {status}")
+
+    # tuple intermediates (multi-save chunks, int passthrough)
+    for keep in (True, "checkpoint"):
+        nb = len(errs)
+        torch.manual_seed(23)
+        tchunks = ([_SplitHead(dim)] + [_TwoStream(dim) for _ in range(3)]
+                   + [_MergeTail(dim)])
+        base = _train_run(device, tchunks, keep=keep, act=False)
+        test = _train_run(device, tchunks, keep=keep, act=True, act_slots=1)
+        compare(f"act-tuple[{_MODE_LABEL[keep]}]", base, test)
+        status = "OK" if len(errs) == nb else "MISMATCH"
+        print(f"[{device} act-tuple {_MODE_LABEL[keep]}] {status}")
+
+    # recompute mode has nothing to offload — must refuse loudly
+    try:
+        OffloadModel(make_chunks(2, dim, seed=25), device=device,
+                     keep_activations=False, offload_activations=True)
+        errs.append("recompute + offload_activations was not rejected")
+    except ValueError:
+        pass
+    return errs
+
+
 def check_load_accounting(device: str) -> list:
     errs: list = []
     n, dim = 6, 32
@@ -434,7 +572,7 @@ def main() -> int:
                 ok &= not errs
         errs = (check_load_accounting(device) + check_dropout_keep(device)
                 + check_multi_arg(device) + check_autocast(device)
-                + check_grad_bypass(device))
+                + check_grad_bypass(device) + check_act_offload(device))
         for e in errs:
             print(f"    {e}")
         ok &= not errs

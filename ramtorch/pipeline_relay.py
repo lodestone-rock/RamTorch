@@ -770,6 +770,19 @@ class Pipeline:
                      ``offload_window``). >= streamed chunks per stage keeps
                      every acc GPU-resident for the whole step (one spill per
                      chunk at flush time).
+    offload_activations :
+                     stream offloaded stages' saved activations to pinned CPU
+                     RAM (``saved_tensors_hooks`` packets keyed per
+                     (microbatch, chunk)). Bounds per-stage activation
+                     residency at ``offload_act_slots`` packets instead of
+                     in-flight-microbatches x chunks. Lazy simulator-validated
+                     policy: offload only under slot pressure, evict the
+                     packet whose backward is farthest in the stage schedule,
+                     prefetch reloads one backward ahead. Bit-exact; never
+                     touches NVMe.
+    offload_act_slots :
+                     resident activation packets per offloaded stage before
+                     pressure offloads kick in (default 2).
     devices        : one device per stage (default: cuda:i round-robin / CPU)
     fake_compute   : None | "replace" | {"fwd": s|[s...], "bwd": s|[s...]}
     overlap        : per-stage worker threads (True) or sequential debug (False)
@@ -809,6 +822,8 @@ class Pipeline:
         offload_keep_activations: Union[bool, str] = True,
         offload_grad_accum: str = "stream",
         offload_acc_slots: Optional[int] = None,
+        offload_activations: bool = False,
+        offload_act_slots: int = 2,
     ):
         self.model = model
         self.overlap = overlap
@@ -863,6 +878,8 @@ class Pipeline:
                         keep_activations=offload_keep_activations,
                         grad_accum=offload_grad_accum,
                         acc_slots=offload_acc_slots,
+                        offload_activations=offload_activations,
+                        act_slots=offload_act_slots,
                     ))
                 else:
                     if chunked[i]:
