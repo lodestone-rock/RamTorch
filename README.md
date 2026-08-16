@@ -70,48 +70,39 @@ model.close()
 
 ### A few PCIe GPUs — pipeline across them
 
-`PipelineModel` auto-splits your model and gives you a normal-looking `nn.Module`:
-
-```python
-import torch
-from ramtorch import PipelineModel
-
-model = MyModel()                                   # any nn.Module
-example = torch.randn(16, *input_shape)             # one microbatch (tracer)
-
-pipe = PipelineModel(model, example, devices=["cuda:0", "cuda:1"])
-
-logits = pipe.forward(images)                       # inference (any batch size)
-
-opt = torch.optim.Adam(pipe.parameters(), lr=1e-3)  # training
-for x, y in train_loader:
-    result = pipe.step(x, targets=y,
-                       schedule="staggered_1b1f",   # or "gpipe" / "1f1b"
-                       n_microbatches=4,
-                       loss_fn=torch.nn.CrossEntropyLoss())
-    result.flush_grads()
-    opt.step(); opt.zero_grad()
-```
-
-For **complex architectures** (attention, dynamic reshapes, control flow), `torch.export` (which `PipelineModel` uses) can fail — so partition the stages yourself and bypass the tracer with `Pipeline(stage_modules=[...])`:
+The easiest way: dice your model into an ordered list of chunk modules (same convention as `OffloadModel`) and hand the flat list to `Pipeline` — it splits the chunks across your GPUs for you, no tracer involved:
 
 ```python
 import itertools, torch
 from ramtorch import Pipeline
 
-stage0 = EmbedAndFirstBlocks(...)     # nn.Module: image -> tokens
-stage1 = RemainingBlocksAndHead(...)  # nn.Module: tokens -> logits
+chunks = [Embed(...), *[Block(...) for _ in range(24)], Head(...)]  # your dicing
 
-pipe = Pipeline(stage_modules=[stage0, stage1], devices=["cuda:0", "cuda:1"])
-opt = torch.optim.Adam(itertools.chain(*(s.parameters() for s in (stage0, stage1))), lr=1e-3)
+pipe = Pipeline(chunk_modules=chunks, devices=["cuda:0", "cuda:1"],
+                offload=False)                    # resident stages; offload=True streams weights
+opt = torch.optim.Adam(itertools.chain(*(s.params for s in pipe.stages)), lr=1e-3)
 
 for x, y in train_loader:
-    result = pipe.step(x, targets=y, schedule="staggered_1b1f",
-                       n_microbatches=4, loss_fn=loss_fn)
+    result = pipe.step(x, targets=y,
+                       schedule="staggered_1b1f",   # or "gpipe" / "1f1b"
+                       n_microbatches=4,
+                       loss_fn=torch.nn.CrossEntropyLoss())
     result.flush_grads(); opt.step(); opt.zero_grad()
 ```
 
-Guide: **[docs/pipeline_parallel.md](docs/pipeline_parallel.md)** · Examples: `examples/mnist_pipeline_example.py` (auto-split MLP), `examples/mnist_pipeline_big_transformer_manual.py` (manual ~85M transformer).
+For **simple models**, `PipelineModel` auto-splits with `torch.export` and gives you a normal-looking `nn.Module` (`pipe.parameters()` works directly, `pipe.forward(images)` infers any batch size):
+
+```python
+from ramtorch import PipelineModel
+
+pipe = PipelineModel(model, example_input, devices=["cuda:0", "cuda:1"])
+logits = pipe.forward(images)                       # inference (any batch size)
+result = pipe.step(x, targets=y, n_microbatches=4, loss_fn=loss_fn)  # training
+```
+
+For **complex architectures** the tracer can fail — the chunk-list form above already bypasses it, or partition whole stages yourself with `Pipeline(stage_modules=[stage0, stage1], ...)`.
+
+Guide: **[docs/pipeline_parallel.md](docs/pipeline_parallel.md)** · Examples: `examples/mnist_pipeline_example.py` (auto-split MLP), `examples/mnist_pipeline_big_transformer_manual.py` (~85M transformer, chunk-diced).
 
 ---
 
@@ -213,14 +204,14 @@ GPU weight memory per streamed stage ≈ `(window + pin)` chunks. Bit-identical 
 
 - **Inference batch size**: traced stages specialize to the example microbatch's batch size; `forward()` chunks and pads arbitrary batches (emitting a silence-able `PipelinePaddingWarning`).
 - **Numerics**: microbatch grad accumulation is *mean-of-microbatch-means*, bit-identical to sequential grad accumulation (differs from a single full-batch backward only by normal fp32 reduction-order noise).
-- **`PipelineModel` vs `Pipeline`**: `PipelineModel` (traced auto-split) is convenient for simple models; `Pipeline(stage_modules=...)` is the recommended, robust path for real architectures.
+- **Which pipeline API**: `Pipeline(chunk_modules=[...])` (flat chunk list) is the least code and the recommended default; `PipelineModel` (traced auto-split) is convenient for simple models; `Pipeline(stage_modules=...)` gives full manual stage control for exotic architectures.
 
 ---
 
 ## Which feature should I reach for?
 
 - **Model fits on one GPU but barely / OOMs** → `OffloadModel`, tune `window`/`pin` with the simulator.
-- **Model too big for one GPU, you have 2+ PCIe GPUs on one node** → `PipelineModel` (simple) or `Pipeline(stage_modules=...)` (complex). Per-GPU memory drops by ~`1/num_gpus`.
+- **Model too big for one GPU, you have 2+ PCIe GPUs on one node** → `Pipeline(chunk_modules=[...])` (recommended) or `PipelineModel` (simple auto-split). Per-GPU memory drops by ~`1/num_gpus`.
 - **Even a pipeline stage doesn't fit its GPU** → pass that stage as a *list of chunks* (`Pipeline` + weight streaming): per-GPU weight memory drops to ~`(offload_window + offload_pin)` chunks. Check the regime with `python -m ramtorch.pipeline_offload_simulator` first — compute-bound stages hide the traffic (~0.4% simulated overhead), transfer-bound ones pay real slowdown for the memory.
 - **Multi-node cluster with fast interconnect** → you probably want FSDP/DeepSpeed/Megatron instead; RamTorch targets single-node PCIe.
 
