@@ -33,6 +33,11 @@ Checks (on CPU always, and on CUDA when available):
      the hard reset is observable (pre-retier accumulation is discarded) and
      complete; optimizer state follows its params (fused + non-fused);
      rejections (bad indices, pending itinerary, closed model, NVMe chunks).
+ 10. Inference costs no gradient state: grad accumulators (a param-sized
+     buffer per chunk, PINNED host RAM for streamed chunks) are allocated on
+     a chunk's first backward, so construction + any number of forwards
+     allocate none — on CUDA the GPU holds only the pinned masters — while a
+     training step allocates exactly one per param in the right tier.
 
 On CUDA, also probes what retiering costs in GPU memory (resident bytes vs
 the analytic per-chunk cost, free-on-unpin, a 5-cycle leak check and step-peak
@@ -543,10 +548,15 @@ def _retier_run(device, chunks, *, pin, retier=None, retier_at=0, keep=True,
 def _assert_wiped(model, moved, tag, errs):
     """A retier is a hard reset: nothing transient may survive it."""
     for st in model._state:
+        # unmoved chunks keep their (zeroed) accumulators; moved ones had
+        # theirs freed and will reallocate in the new tier on next backward
         for nme, acc in st.grad_acc.items():
             if acc.count_nonzero().item():
                 errs.append(f"{tag}: chunk{st.idx}.{nme} accumulator not "
                             "zeroed by the retier")
+        if st.idx in moved and st.grad_acc:
+            errs.append(f"{tag}: moved chunk{st.idx} kept its accumulator "
+                        "instead of freeing it")
         if st.acc_where != "empty" or st.acc_gpu is not None:
             errs.append(f"{tag}: chunk{st.idx} acc_where={st.acc_where} "
                         f"acc_gpu={st.acc_gpu is not None} after the retier")
@@ -814,6 +824,97 @@ def check_retier(device: str) -> list:
     return errs
 
 
+def check_inference_alloc(device: str) -> list:
+    """Inference must not pay for gradient state.
+
+    Grad accumulators are a full param-sized buffer per chunk (on the GPU for
+    pinned chunks, in PINNED host RAM for streamed ones), so allocating them
+    eagerly doubled an inference deployment's footprint for buffers no forward
+    ever reads. They are allocated on a chunk's first backward instead.
+    """
+    errs: list = []
+    n, dim = 6, 64
+    mse = nn.functional.mse_loss
+
+    def n_accs(m):
+        return sum(len(st.grad_acc) for st in m._state)
+
+    for pin in (0, 2, n):
+        for ga in ("stream", "cpu"):
+            tag = f"inference-alloc[pin={pin} ga={ga}]"
+            model = OffloadModel(make_chunks(n, dim, seed=71), device=device,
+                                 window=2, pin=pin, keep_activations=True,
+                                 grad_accum=ga)
+            x, y = torch.randn(4, dim), torch.randn(4, dim)
+            if n_accs(model):
+                errs.append(f"{tag}: {n_accs(model)} accumulators allocated "
+                            "at construction")
+            with torch.no_grad():
+                model(x)
+            model(x)                       # grad-enabled inference forward
+            if n_accs(model):
+                errs.append(f"{tag}: forward allocated accumulators")
+            if any(st.staging is not None or st.flush_bufs
+                   for st in model._state):
+                errs.append(f"{tag}: forward allocated staging/flush buffers")
+            # flushing without a backward leaves .grad alone (no zero grads)
+            model.zero_grad_acc()
+            model.flush_grads()
+            if n_accs(model):
+                errs.append(f"{tag}: zero_grad_acc/flush_grads allocated "
+                            "accumulators")
+            if any(p.grad is not None for p in model.parameters()):
+                errs.append(f"{tag}: flush without a backward set .grad")
+            # ... and a training step allocates exactly one per param
+            model.step(x, targets=y, loss_fn=mse)
+            model.flush_grads()
+            want = len(list(model.chunks.named_parameters()))
+            if n_accs(model) != want:
+                errs.append(f"{tag}: {n_accs(model)} accumulators after a "
+                            f"step, expected {want}")
+            if any(p.grad is None for p in model.parameters()):
+                errs.append(f"{tag}: a param has no .grad after step+flush")
+            for st in model._state:
+                for nme, acc in st.grad_acc.items():
+                    p = dict(st.module.named_parameters())[nme]
+                    if acc.device != p.device:
+                        errs.append(f"{tag}: chunk{st.idx}.{nme} accumulator "
+                                    f"on {acc.device}, param on {p.device}")
+                    if (not st.gpu_pinned and model._cuda
+                            and acc.is_pinned() != (ga == "stream")):
+                        errs.append(f"{tag}: chunk{st.idx}.{nme} accumulator "
+                                    f"is_pinned={acc.is_pinned()} in {ga} mode")
+            model.close()
+
+    if device.startswith("cuda"):
+        # measured: an inference-only model holds ONLY the pinned masters
+        pin = 3
+        del model      # the loop's last model is still holding GPU blocks
+        torch.cuda.synchronize(device)
+        base = torch.cuda.memory_allocated(device)
+        model = OffloadModel(make_chunks(n, 512, seed=72), device=device,
+                             window=2, pin=pin, keep_activations=True)
+        masters = sum(model._state[i].nbytes() for i in model.pinned_layers)
+        torch.cuda.synchronize(device)
+        got = torch.cuda.memory_allocated(device) - base
+        if abs(got - masters) > masters // 8:
+            errs.append(f"inference-alloc[cuda]: {got / 2**20:.2f} MiB on the "
+                        f"GPU after construction, expected ~"
+                        f"{masters / 2**20:.2f} MiB of masters alone")
+        x, y = torch.randn(4, 512), torch.randn(4, 512)
+        model.step(x, targets=y, loss_fn=mse)
+        model.flush_grads()
+        torch.cuda.synchronize(device)
+        after = torch.cuda.memory_allocated(device) - base
+        model.close()
+        print(f"[{device} inference-alloc] pinned masters "
+              f"{masters / 2**20:.2f} MiB, GPU after ctor "
+              f"{got / 2**20:.2f} MiB, after one trained step "
+              f"{after / 2**20:.2f} MiB")
+    print(f"[{device} inference-alloc] {'OK' if not errs else 'MISMATCH'}")
+    return errs
+
+
 def probe_retier_memory(device: str):
     """Measure what retiering does to GPU memory (CUDA only).
 
@@ -829,11 +930,11 @@ def probe_retier_memory(device: str):
 
     model = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
                          pin=0, keep_activations=True)
-    # weights + buffers + the GPU grad accumulator of one chunk
-    per_chunk = model._state[0].nbytes() + sum(
-        p.numel() * p.element_size()
-        for p in model._state[0].module.parameters()
-    )
+    # masters of one chunk (weights + buffers). Accumulators are allocated on
+    # first backward, so phase 1 below — which retiers WITHOUT stepping — sees
+    # the masters alone; phase 2's step peaks include the accumulator and the
+    # persistent .grad buffer a flushed pinned chunk keeps.
+    per_chunk = model._state[0].nbytes()
     slack = per_chunk // 4
 
     def allocated():
@@ -849,8 +950,8 @@ def probe_retier_memory(device: str):
 
     levels = (0, n // 2, n)
     # phase 1 — resident cost, measured BEFORE any step so the only GPU
-    # tenants are the pinned masters and their accumulators (a flush would
-    # add a persistent .grad buffer per pinned chunk, measured in phase 2)
+    # tenants are the pinned masters (a backward adds the accumulator and a
+    # flush a persistent .grad buffer per pinned chunk — phase 2 territory)
     resident = []
     base_alloc = allocated()
     for pin in levels:
@@ -895,7 +996,7 @@ def probe_retier_memory(device: str):
     model.close()
 
     print(f"[retier memory n={n} dim={dim}] chunk={per_chunk / 2**20:.2f} MiB "
-          f"(weights+acc), baseline {base_alloc / 2**20:.1f} MiB")
+          f"(masters), baseline {base_alloc / 2**20:.1f} MiB")
     for pin, res, peak in zip(levels, resident, peaks):
         print(f"    pin={pin}: +{res / 2**20:6.2f} MiB resident, "
               f"step peak {peak / 2**20:6.1f} MiB")
@@ -988,7 +1089,7 @@ def main() -> int:
         errs = (check_load_accounting(device) + check_dropout_keep(device)
                 + check_multi_arg(device) + check_autocast(device)
                 + check_grad_bypass(device) + check_act_offload(device)
-                + check_retier(device))
+                + check_retier(device) + check_inference_alloc(device))
         for e in errs:
             print(f"    {e}")
         ok &= not errs

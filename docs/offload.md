@@ -118,10 +118,45 @@ logits = model(x)          # weights stream through the window as usual
   support needed (all compute runs on the calling thread).
 * **`offload_checkpoint` marks are a no-op** under `no_grad`, so a model
   annotated for selective checkpointing runs unchanged at inference.
+* **Inference costs no gradient state.** Grad accumulators are a full
+  param-sized buffer per chunk — on the GPU for pinned chunks, in *pinned*
+  (non-pageable) host RAM for streamed ones — so they are allocated on a
+  chunk's **first backward**, not at construction. An inference-only model
+  holds nothing but its masters plus the window: measured, 8 chunks of
+  512x512 with `pin=3` occupy 3.01 MiB of GPU (exactly the pinned masters)
+  after construction and any number of forwards, versus 9.02 MiB once a
+  training step has run (masters + accumulators + `.grad` buffers).
+  Consequence: `flush_grads()` on a model that never backpropagated leaves
+  `.grad` as `None` instead of writing zeros.
 
 For a runnable streamed-eval loop with accuracy + peak-memory reporting, see
 `examples/mnist_offload_example.py` (its eval phase) and
 `examples/offload_quickstart.py`.
+
+### Sizing an inference deployment
+
+`examples/offload_inference_memory.py` sweeps the offload percentage on one
+model — retiering in place with [`set_pinned`](#changing-the-tier-at-runtime)
+between passes — and reports, per config, GPU bytes at rest, GPU peak during a
+forward, pinned host RAM, streamed weight bytes per pass, and latency.
+Measured on an H100, 8 chunks x 32 MiB (256 MiB of weights), batch 256, `W=2`,
+with the CUDA context's fixed scratch (~41 MiB of cuBLAS workspaces) excluded:
+
+| offloaded | GPU at rest | GPU peak | host pinned | H2D/pass | ms/pass |
+|---|---|---|---|---|---|
+| 100% | 0 MiB | 66 MiB | 256 MiB | 256 MiB | 13.0 |
+| 62% | 96 MiB | 170 MiB | 160 MiB | 160 MiB | 7.0 |
+| 38% | 160 MiB | 234 MiB | 96 MiB | 64 MiB | 3.4 |
+| 0% | 256 MiB | 266 MiB | 0 MiB | 0 MiB | 2.2 |
+
+Reading it: GPU-at-rest is *exactly* the pinned masters (no gradient state at
+all), rest + host-pinned is constant, and peak adds the window plus the live
+chunk's activations. The knee is where `window + pin >= n` — the streamed
+chunks all fit the window at once, so from the second pass on nothing crosses
+PCIe and you are back to resident speed (2.2 ms) at a window's worth of extra
+memory. The fully resident `nn.Sequential` baseline peaks at 267 MiB / 1.9 ms,
+so full streaming buys 4x less GPU memory for ~6x the latency here — a ratio
+that improves with bigger chunks, where compute has more to hide behind.
 
 ---
 
@@ -133,7 +168,7 @@ For a runnable streamed-eval loop with accuracy + peak-memory reporting, see
 | `pin` | `0` | Number of **evenly-spaced** chunks pinned resident (never loaded/evicted). Eases PCIe pressure and steadies the schedule at the cost of their memory. `pin_layers=[...]` overrides with explicit indices. Reassignable after construction — see "Changing the tier at runtime". |
 | `nvme` | `0` | Number of chunks whose **masters live on disk** instead of CPU RAM (interleaved placement; `nvme_layers=[...]` overrides, `nvme_path=` required). Saves host RAM at the cost of slower loads for those chunks — see "The NVMe tier" below. |
 | `keep_activations` | `False` | Backward strategy: `False` (recompute), `True` (keep), or `"checkpoint"` (see below). |
-| `grad_accum` | `"stream"` | Where streamed chunks accumulate grads. `"stream"`: on the GPU in `acc_slots` bounded slots, spilling/reloading over the copy streams like weights — zero CPU math, grad PCIe traffic per *step* when slots suffice. `"cpu"` (legacy): per-microbatch D2H packets added into pinned CPU buffers by the writeback thread. |
+| `grad_accum` | `"stream"` | Where streamed chunks accumulate grads. `"stream"`: on the GPU in `acc_slots` bounded slots, spilling/reloading over the copy streams like weights — zero CPU math, grad PCIe traffic per *step* when slots suffice. `"cpu"` (legacy): per-microbatch D2H packets added into pinned CPU buffers by the writeback thread. Either way the accumulators appear on a chunk's first backward, so inference never pays for them. |
 | `acc_slots` | `window` | GPU slots for `"stream"` accumulators. `acc_slots ≥` streamed-chunk count keeps every accumulator resident between flushes; smaller values trade PCIe traffic for memory (one extra chunk-sized GPU buffer per slot). |
 | `offload_activations` | `False` | Stream saved activations to pinned CPU RAM between a chunk's forward and its backward (`saved_tensors_hooks` packets). Requires `keep_activations=True` or `"checkpoint"`. Bit-exact. See "Activation offload" below. |
 | `act_slots` | `2` | Resident activation packets before the lazy offload kicks in. Higher = more GPU memory, less PCIe traffic. |
@@ -321,20 +356,21 @@ disk-backed chunk in one scratch file written at construction, so moving a
 chunk on or off that mapping means rebuilding the model (`ValueError`).
 
 What it costs, measured (`probe_retier_memory` in
-`examples/offload_streaming_check.py`, 8 chunks of 512x512, so 2.00 MiB of
-weights + accumulator per chunk):
+`examples/offload_streaming_check.py`, 8 chunks of 512x512 = 1.00 MiB of
+masters per chunk):
 
 | pinned | GPU resident | step peak |
 |---|---|---|
 | 0 | +0.00 MiB | 24.4 MiB |
-| 4 | +8.02 MiB | 32.3 MiB |
-| 8 | +16.03 MiB | 41.3 MiB |
+| 4 | +4.01 MiB | 32.3 MiB |
+| 8 | +8.02 MiB | 42.3 MiB |
 | back to 0 | +0.00 MiB | 24.4 MiB |
 
-Pinning k chunks costs exactly k x (weights + GPU accumulator), unpinning
-gives all of it back, and five pin/unpin cycles leak nothing. A *flushed*
-pinned chunk additionally holds one param-sized `.grad` buffer, which is
-freed when the chunk is unpinned.
+Pinning k chunks costs exactly k chunks of masters, unpinning gives all of it
+back, and five pin/unpin cycles leak nothing. Once training starts each pinned
+chunk also holds a param-sized grad accumulator and (after a flush) a
+param-sized `.grad` buffer — both freed when the chunk is unpinned, both
+absent until the first backward (see "Inference costs no gradient state").
 
 ---
 

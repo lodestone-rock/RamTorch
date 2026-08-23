@@ -169,10 +169,10 @@ class Stage:
         self.losses: Dict[int, torch.Tensor] = {}   # mb_index -> scalar loss (last stage)
 
         self.params: List[nn.Parameter] = list(self.module.parameters())
-        # Explicit gradient accumulators (deterministic add order).
-        self.grad_acc: Dict[nn.Parameter, torch.Tensor] = {
-            p: torch.zeros_like(p) for p in self.params
-        }
+        # Explicit gradient accumulators (deterministic add order), allocated
+        # on this stage's first backward by _ensure_grad_acc: they are a full
+        # copy of the shard's params on its GPU, which inference never reads.
+        self.grad_acc: Dict[nn.Parameter, torch.Tensor] = {}
 
         self._lock = threading.Lock()
         self._cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
@@ -364,6 +364,7 @@ class Stage:
         # Single-tensor input -> single grad; tuple input -> tuple of grads.
         input_grad = input_grads if inp_is_tuple else input_grads[0]
         with self._lock:
+            self._ensure_grad_acc()
             for p, g in zip(self.params, param_grads):
                 if g is not None:
                     self.grad_acc[p] += g.detach()
@@ -379,8 +380,24 @@ class Stage:
         return None if self.is_first else input_grad
 
     # ------------------------------------------------------------------
+    def _ensure_grad_acc(self):
+        """Allocate the accumulators on first use (call under ``_lock``).
+
+        Lazy so an inference-only pipeline does not hold a shard-sized zero
+        buffer on every GPU. Allocated all at once on the first backward, so
+        a training run's layout is identical to eager allocation.
+        """
+        if not self.grad_acc:
+            with torch.no_grad():
+                self.grad_acc = {p: torch.zeros_like(p) for p in self.params}
+
     def flush_grads(self, scale: float = 1.0):
-        """Write accumulated grads into ``.grad`` (for optimizer compatibility) and reset."""
+        """Write accumulated grads into ``.grad`` (for optimizer compatibility) and reset.
+
+        A stage that never ran a backward has no accumulators, so its params
+        keep whatever ``.grad`` they had (``None``, normally) instead of
+        getting zeros.
+        """
         with self._lock:
             for p, acc in self.grad_acc.items():
                 p.grad = acc * scale

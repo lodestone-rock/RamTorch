@@ -11,7 +11,10 @@ evict, and ease PCIe traffic at the cost of their memory). Eviction is
 farthest-next-use (Belady — optimal, since the itinerary is known). Total GPU
 weight memory ~= ``window + pin`` chunks.
 
-Gradient accumulation for streamed chunks (``grad_accum=``):
+Gradient accumulation for streamed chunks (``grad_accum=``). Accumulators are
+allocated on a chunk's FIRST BACKWARD, so an inference-only model never pays
+for them (they are a full param-sized buffer per chunk — on the GPU for pinned
+chunks, in pinned host RAM for streamed ones):
 
 * ``"stream"`` (default): the accumulator itself streams like a weight. Each
   chunk's accumulated grad lives in exactly one place — "empty" (zeroed,
@@ -378,14 +381,19 @@ class _ChunkState:
     The two tiers are set up by :meth:`_become_pinned` /
     :meth:`_become_streamed`, which the ctor calls and
     :meth:`OffloadModel._retier` re-calls to move a chunk between them at
-    runtime. Both start from a clean slate (fresh zero accumulators, no
+    runtime. Both start from a clean slate (no accumulators, no
     residency-derived state), which is why a retier is defined as a hard
     reset — see :meth:`OffloadModel.set_pinned`.
+
+    ``grad_acc`` is allocated by :meth:`ensure_grad_acc` on the chunk's first
+    backward, NOT at construction: it is a full param-sized buffer per chunk
+    (on the GPU for pinned chunks, in usually-pinned host RAM for streamed
+    ones) that inference never reads.
     """
 
     def __init__(self, module: nn.Module, gpu_pinned: bool,
                  device: torch.device, use_cuda: bool, nvme: bool = False,
-                 idx: int = -1, pin_acc: bool = False):
+                 idx: int = -1):
         self.module = module
         self.gpu_pinned = gpu_pinned
         self.idx = idx
@@ -425,20 +433,54 @@ class _ChunkState:
         if gpu_pinned:
             self._become_pinned(device)
         else:
-            self._become_streamed(use_cuda, pin_acc)
+            self._become_streamed(use_cuda)
 
     # ── tier setup (shared by the ctor and runtime retiering) ──────────────
     def nbytes(self) -> int:
         """Master-weight footprint of this chunk (params + buffers)."""
         return sum(t.numel() * t.element_size() for t in self.tensors.values())
 
+    def ensure_grad_acc(self, pin_acc: bool) -> Dict[str, torch.Tensor]:
+        """Allocate this chunk's grad accumulators on first use.
+
+        Lazy because inference never accumulates: eager allocation doubled a
+        pinned chunk's GPU footprint and the streamed chunks' *pinned* host
+        footprint for buffers no forward ever reads. Allocated all-at-once per
+        chunk on its first backward, so once training starts the layout is
+        exactly what the eager version had.
+
+        Called from :meth:`OffloadModel._accumulate` on the compute thread
+        before any other thread can need it (the loader's acc reload and the
+        writeback thread's add both require a prior accumulate on this chunk).
+        """
+        if not self.grad_acc:
+            with torch.no_grad():
+                if self.gpu_pinned:
+                    # grads accumulate on the GPU next to the pinned weights
+                    self.grad_acc = {
+                        n: torch.zeros_like(p)
+                        for n, p in self.module.named_parameters()
+                    }
+                else:
+                    # stream mode transfers accs whole over PCIe: pin them so
+                    # the copies run at full speed ("cpu" mode keeps them
+                    # pageable and stages instead)
+                    self.grad_acc = {
+                        n: (torch.zeros_like(p, device="cpu").pin_memory()
+                            if pin_acc else torch.zeros_like(p, device="cpu"))
+                        for n, p in self.module.named_parameters()
+                    }
+        return self.grad_acc
+
     def _reset_tier_state(self) -> None:
         """Drop everything derived from the CURRENT tier.
 
         Called by both tier setters, so a runtime move starts as clean as
-        construction: no accumulated grads, no ``.grad``, no keep-mode graph
-        tensors, no staging or flush buffers sized for the old device.
+        construction: no accumulators (freed — the next backward reallocates
+        them in the new tier), no ``.grad``, no keep-mode graph tensors, no
+        staging or flush buffers sized for the old device.
         """
+        self.grad_acc = {}
         self.graph_tensors = None
         self.staging = None
         self.flush_bufs.clear()
@@ -457,14 +499,9 @@ class _ChunkState:
         self.tensors = dict(self.module.named_parameters()) | dict(
             self.module.named_buffers()
         )
-        # grads accumulate on the GPU next to the pinned weights
-        self.grad_acc = {
-            n: torch.zeros_like(p)
-            for n, p in self.module.named_parameters()
-        }
         self.gpu_pinned = True
 
-    def _become_streamed(self, use_cuda: bool, pin_acc: bool) -> None:
+    def _become_streamed(self, use_cuda: bool) -> None:
         """Streamed tier: master weights in CPU pinned memory.
 
         (nvme chunks skip the pinning — their masters are about to move onto
@@ -482,13 +519,6 @@ class _ChunkState:
         self.tensors = dict(self.module.named_parameters()) | dict(
             self.module.named_buffers()
         )
-        # stream mode transfers accs whole over PCIe: pin them so the copies
-        # run at full speed ("cpu" mode keeps them pageable and stages instead)
-        self.grad_acc = {
-            n: (torch.zeros_like(p, device="cpu").pin_memory() if pin_acc
-                else torch.zeros_like(p, device="cpu"))
-            for n, p in self.module.named_parameters()
-        }
         self.gpu_pinned = False
 
 
@@ -738,12 +768,13 @@ class OffloadModel(nn.Module):
 
         # register chunks so .parameters()/.state_dict() work
         self.chunks = nn.ModuleList(chunks)
-        # remembered so a runtime retier re-homes accumulators exactly as the
-        # ctor did (see _retier)
+        # whether streamed chunks' accumulators live in pinned host memory
+        # (stream mode transfers them whole over PCIe); read by
+        # _ChunkState.ensure_grad_acc on the first backward
         self._pin_acc = grad_accum == "stream" and self._cuda
         self._state = [
             _ChunkState(m, i in pinned_idx, self.device, self._cuda,
-                        nvme=i in nvme_idx, idx=i, pin_acc=self._pin_acc)
+                        nvme=i in nvme_idx, idx=i)
             for i, m in enumerate(self.chunks)
         ]
 
@@ -1750,20 +1781,24 @@ class OffloadModel(nn.Module):
         chunks: ``grad_accum="stream"`` adds on the GPU into a streamed
         accumulator (zero CPU math); ``"cpu"`` ships a per-microbatch packet
         to the writeback thread (D2H + CPU add — the legacy path).
+
+        This is also where the accumulators are born: they are allocated on
+        the chunk's first backward, so inference never pays for them, and
+        every other consumer (loader reload, writeback add, spill, flush) is
+        downstream of an accumulate on that chunk.
         """
+        if not named_grads:
+            return
+        acc = state.ensure_grad_acc(self._pin_acc)
+        state.acc_touched = True
         if state.gpu_pinned:
             # grads stay on the GPU next to the pinned weights
             with torch.no_grad():
                 for nme, g in named_grads.items():
-                    state.grad_acc[nme] += g.detach()
-            state.acc_touched = state.acc_touched or bool(named_grads)
-        elif not named_grads:
-            return
+                    acc[nme] += g.detach()
         elif self.grad_accum == "stream":
-            state.acc_touched = True
             self._acc_add(state, named_grads)
         else:
-            state.acc_touched = True
             if self._cuda:
                 ev = torch.cuda.Event()
                 # grads are ready on OUR device's compute stream (record on it
@@ -1985,6 +2020,11 @@ class OffloadModel(nn.Module):
         Streamed chunks get CPU grads on their CPU params; pinned chunks get
         GPU grads on their GPU params. With k accumulated ``step()`` calls,
         pass ``scale=1/k`` for the mean.
+
+        Chunks that never ran a backward have no accumulator (they are
+        allocated on first use so inference costs nothing), so their params
+        keep whatever ``.grad`` they had — flushing a model that never
+        backpropagated leaves ``.grad`` as ``None`` rather than writing zeros.
 
         The ``.grad`` tensors are persistent buffers reused across calls
         (CPU ones live in pinned memory). Recommended optimizer:
@@ -2261,7 +2301,7 @@ class OffloadModel(nn.Module):
             for st in self._state:
                 st.graph_tensors = None
             for i in sorted(to_unpin):
-                self._state[i]._become_streamed(self._cuda, self._pin_acc)
+                self._state[i]._become_streamed(self._cuda)
             for i in sorted(to_pin):
                 self._state[i]._become_pinned(self.device)
             self.pinned_layers = frozenset(

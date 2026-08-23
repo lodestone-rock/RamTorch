@@ -38,6 +38,10 @@ Checks (on CPU always, and on two CUDA devices when available):
      / broadcast set) and a pre-built optimizer keep working; per-stage GPU
      memory grows only on the retiered stage's device and 5 cycles do not
      leak; mixed and flat-chunk pipelines behave, resident ones refuse.
+ 11. infer() allocates no gradient state on either stage kind: a plain stage's
+     accumulators (a full copy of the shard on its GPU) and an offloaded
+     stage's (one buffer per chunk) appear on the first BACKWARD, so
+     construction and any number of forwards allocate none.
 
 Run:  PYTHONPATH=. python examples/pipeline_offload_check.py
 """
@@ -453,10 +457,15 @@ def _assert_stage_wiped(stage, info, errs):
     """A stage retier is a hard reset, like the engine's."""
     tag = f"stage{stage.stage_index}"
     eng = stage.engine
+    summary = info.get(stage.stage_index, {})
+    moved = set(summary.get("pinned", ())) | set(summary.get("unpinned", ()))
     for st in eng._state:
         if st.acc_touched or st.acc_gpu is not None or st.acc_where != "empty":
             errs.append(f"{tag} chunk{st.idx}: accumulator survived the "
                         "retier")
+        if st.idx in moved and st.grad_acc:
+            errs.append(f"{tag} chunk{st.idx}: moved chunk kept its "
+                        "accumulator instead of freeing it")
         if st.graph_tensors is not None:
             errs.append(f"{tag} chunk{st.idx}: graph tensors survived")
     if eng._act_store or eng._resident or eng._future:
@@ -609,6 +618,71 @@ def check_retier(devices, errs, m=4, dim=16, L=4):
     print(f"{tag} {'OK' if len(errs) == n_before else 'MISMATCH'}")
 
 
+def check_inference_alloc(devices, errs, m=4, dim=64, L=4):
+    """infer() must not allocate gradient state, on either stage kind.
+
+    Both stage kinds keep an explicit accumulator per param — a full copy of
+    the shard on a plain stage's GPU, one param-sized buffer per chunk (GPU
+    for pinned chunks, pinned host RAM for streamed ones) on an offloaded
+    stage. They are allocated on the stage's first backward, so an
+    inference-only pipeline holds none of it.
+
+    The assertions are structural (accumulator counts), deliberately: at this
+    file's toy dimensions GPU byte counts are dominated by the per-stream
+    cuBLAS workspaces (~9 MiB, allocated on the first GEMM of each pass) and
+    an offloaded stage's accumulators mostly live on the host anyway. The
+    byte-level measurement lives in ``offload_streaming_check.py``, where the
+    baseline is controllable.
+    """
+    tag = f"[{devices[0]}/{devices[-1]} inference-alloc]"
+    n_before = len(errs)
+    x = torch.randn(8, dim)
+    y = torch.randn(8, dim)
+
+    def accs(pipe):
+        return [sum(len(s.grad_acc) for s in st.engine._state)
+                if hasattr(st, "engine") else len(st.grad_acc)
+                for st in pipe.stages]
+
+    # plain resident, offloaded, and mixed topologies
+    specs = {
+        "plain": lambda s: [nn.Sequential(*s[0]), nn.Sequential(*s[1])],
+        "offloaded": lambda s: [s[0], s[1]],
+        "mixed": lambda s: [s[0], nn.Sequential(*s[1])],
+    }
+    for label, build in specs.items():
+        src = [make_chunks(L, dim, seed=81), make_chunks(L, dim, seed=82)]
+        pipe = Pipeline(stage_modules=build(src), devices=devices,
+                        offload_window=2, offload_pin=1)
+        if any(accs(pipe)):
+            errs.append(f"{tag} {label}: accumulators allocated at "
+                        f"construction ({accs(pipe)})")
+        pipe.infer(x, n_microbatches=m)
+        if any(accs(pipe)):
+            errs.append(f"{tag} {label}: infer() allocated accumulators "
+                        f"({accs(pipe)})")
+        pipe.flush_grads()          # no backward yet -> must stay a no-op
+        if any(accs(pipe)):
+            errs.append(f"{tag} {label}: flush_grads() allocated accumulators")
+        if any(p.grad is not None for st in pipe.stages for p in st.params):
+            errs.append(f"{tag} {label}: flush without a backward set .grad")
+        res = pipe.step(x, targets=y, schedule="staggered_1b1f",
+                        n_microbatches=m, loss_fn=F.mse_loss)
+        res.flush_grads()
+        want = [len(st.params) if not hasattr(st, "engine")
+                else sum(len(list(s.module.parameters()))
+                         for s in st.engine._state)
+                for st in pipe.stages]
+        if accs(pipe) != want:
+            errs.append(f"{tag} {label}: {accs(pipe)} accumulators after a "
+                        f"step, expected {want}")
+        if any(p.grad is None for st in pipe.stages for p in st.params):
+            errs.append(f"{tag} {label}: a param has no .grad after "
+                        "step+flush")
+        pipe.close()
+    print(f"{tag} {'OK' if len(errs) == n_before else 'MISMATCH'}")
+
+
 def check_rejections(errs):
     """Unsupported combos must refuse loudly."""
     n_before = len(errs)
@@ -712,6 +786,7 @@ def main() -> int:
         check_grad_bypass(devices, errs)
         check_flat_chunks(devices, errs)
         check_retier(devices, errs, L=L)
+        check_inference_alloc(devices, errs, L=L)
     check_rejections(errs)
 
     for e in errs[:30]:

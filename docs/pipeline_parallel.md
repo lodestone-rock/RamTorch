@@ -525,6 +525,21 @@ microbatch k while stage s computes k+1 — every GPU stays busy:
 logits = pipe.infer(images, n_microbatches=4)
 ```
 
+**Inference costs no gradient state.** Every stage keeps explicit gradient
+accumulators (a plain stage: one full copy of its shard on its GPU; an
+offloaded stage: one param-sized buffer per chunk, GPU for pinned chunks and
+pinned host RAM for streamed ones), and they are allocated on that stage's
+**first backward** rather than at construction. So an inference-only pipeline
+holds its weights and nothing else — for a plain pipeline that halves the
+per-GPU footprint versus eager allocation. Consequence: `flush_grads()` on a
+pipeline that never ran `step()` leaves `.grad` as `None` instead of writing
+zeros.
+
+To size an inference deployment, `examples/offload_inference_memory.py
+--pipeline cuda:0,cuda:1` sweeps `offload_pin` across the whole range with
+[`set_offload_pinned`](#changing-offload_pin-at-runtime) and reports per-stage
+GPU bytes at rest and at peak plus the latency at each point.
+
 ---
 
 ## Profiling & debugging

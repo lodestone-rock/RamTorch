@@ -204,6 +204,7 @@ GPU weight memory per streamed stage ≈ `(window + pin)` chunks. Bit-identical 
 
 - **Inference batch size**: traced stages specialize to the example microbatch's batch size; `forward()` chunks and pads arbitrary batches (emitting a silence-able `PipelinePaddingWarning`).
 - **Numerics**: microbatch grad accumulation is *mean-of-microbatch-means*, bit-identical to sequential grad accumulation (differs from a single full-batch backward only by normal fp32 reduction-order noise).
+- **Inference-only deployments carry no gradient state**: the per-stage / per-chunk grad accumulators are allocated on the first backward, so `infer()` holds weights and nothing else (`flush_grads()` without a backward therefore leaves `.grad` as `None`).
 - **Which pipeline API**: `Pipeline(chunk_modules=[...])` (flat chunk list) is the least code and the recommended default; `PipelineModel` (traced auto-split) is convenient for simple models; `Pipeline(stage_modules=...)` gives full manual stage control for exotic architectures.
 
 ---
