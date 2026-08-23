@@ -1045,6 +1045,72 @@ class Pipeline:
         for st in self.stages:
             st.flush_grads(scale=s)
 
+    def set_offload_pinned(self, pinned, *, optimizers=(),
+                           force: bool = False) -> dict:
+        """Reassign which chunks stay GPU-resident on the offloaded stages.
+
+        The broadcasting form of :meth:`OffloadStage.set_pinned` — call it
+        BETWEEN steps (``step()`` joins its stage workers before returning, so
+        right after a clean step plus ``flush_grads()``/``optimizer.step()`` is
+        the moment). ``pinned`` may be:
+
+        * an ``int`` (count) or a ``set``/``frozenset`` of indices — applied to
+          EVERY offloaded stage (plain resident stages are skipped, so mixed
+          pipelines are fine),
+        * a ``list``/``tuple`` aligned with ``self.stages`` — one spec per
+          stage (a count, an index list, or ``None`` to leave it alone),
+        * a ``dict`` ``{stage_index: spec}``.
+
+        NB a list is ALWAYS per-stage, so ``[3, 2, 2, 0]`` means "stage 0 pins
+        3 chunks, stage 1 pins 2, ...". To broadcast explicit indices use a
+        set (``{0, 4}``) or the per-stage form (``[[0, 4], [0, 4]]``).
+
+        Hard reset per stage: grad accumulators, ``.grad`` and activation
+        packets are discarded. Pass ``optimizers=`` (typically the one built
+        from ``st.params``) so per-param state follows the moved params.
+
+        Returns ``{stage_index: summary}``.
+        """
+        from .pipeline_offload import OffloadStage
+
+        offloaded = [i for i, st in enumerate(self.stages)
+                     if isinstance(st, OffloadStage)]
+        if not offloaded:
+            raise ValueError(
+                "this pipeline has no offloaded stages to retier (build it "
+                "with chunked stage_modules / chunk_modules and offload=True)"
+            )
+        if isinstance(pinned, dict):
+            spec = {int(k): v for k, v in pinned.items()}
+            bad = sorted(k for k in spec if k not in offloaded)
+            if bad:
+                raise ValueError(
+                    f"stage(s) {bad} are not offloaded stages; offloaded "
+                    f"stages are {offloaded}"
+                )
+        elif isinstance(pinned, (list, tuple)):
+            # per-stage form: entries are themselves specs (count / index
+            # list / None). Sets broadcast instead (see the docstring).
+            if len(pinned) != len(self.stages):
+                raise ValueError(
+                    f"per-stage pinned list has {len(pinned)} entries but the "
+                    f"pipeline has {len(self.stages)} stages"
+                )
+            spec = {i: v for i, v in enumerate(pinned) if v is not None}
+            bad = sorted(k for k in spec if k not in offloaded)
+            if bad:
+                raise ValueError(
+                    f"stage(s) {bad} are not offloaded stages; pass None for "
+                    f"them (offloaded stages are {offloaded})"
+                )
+        else:
+            spec = {i: pinned for i in offloaded}
+        return {
+            i: self.stages[i].set_pinned(
+                spec[i], optimizers=optimizers, force=force)
+            for i in sorted(spec)
+        }
+
     def close(self):
         """Release stage background resources (offloaded stages' loader and
         writeback threads). Idempotent; plain stages no-op."""

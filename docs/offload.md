@@ -130,7 +130,7 @@ For a runnable streamed-eval loop with accuracy + peak-memory reporting, see
 | Knob | Default | What it does |
 |---|---|---|
 | `window` | `2` | Streaming slots on the GPU. `window=1` never overlaps a load with compute; `window≥2` lets the loader run ahead. Total weight memory ≈ `window + pin` chunks. |
-| `pin` | `0` | Number of **evenly-spaced** chunks pinned resident (never loaded/evicted). Eases PCIe pressure and steadies the schedule at the cost of their memory. `pin_layers=[...]` overrides with explicit indices. |
+| `pin` | `0` | Number of **evenly-spaced** chunks pinned resident (never loaded/evicted). Eases PCIe pressure and steadies the schedule at the cost of their memory. `pin_layers=[...]` overrides with explicit indices. Reassignable after construction — see "Changing the tier at runtime". |
 | `nvme` | `0` | Number of chunks whose **masters live on disk** instead of CPU RAM (interleaved placement; `nvme_layers=[...]` overrides, `nvme_path=` required). Saves host RAM at the cost of slower loads for those chunks — see "The NVMe tier" below. |
 | `keep_activations` | `False` | Backward strategy: `False` (recompute), `True` (keep), or `"checkpoint"` (see below). |
 | `grad_accum` | `"stream"` | Where streamed chunks accumulate grads. `"stream"`: on the GPU in `acc_slots` bounded slots, spilling/reloading over the copy streams like weights — zero CPU math, grad PCIe traffic per *step* when slots suffice. `"cpu"` (legacy): per-microbatch D2H packets added into pinned CPU buffers by the writeback thread. |
@@ -266,6 +266,75 @@ don't fit but you want one forward per step (dropout-safe, no recompute);
 plain `"checkpoint"` when PCIe is the scarcer resource. `act_slots=2`
 (default) keeps one packet in compute and one in flight; raise it if you
 have memory to spare and want the traffic gone.
+
+---
+
+## Changing the tier at runtime
+
+`pin` is not frozen at construction. Between steps you can move chunks
+between the GPU-resident tier and the streamed CPU tier — the way to trade
+GPU memory for PCIe traffic while a job is running (a bigger batch arrives,
+another process wants the card, a profiling pass says you have headroom):
+
+```python
+model.set_pinned(3, optimizers=[opt])           # count, evenly spaced (like pin=)
+model.set_pinned([0, 5, 11], optimizers=[opt])  # explicit set (declarative)
+model.pin_chunks([7], optimizers=[opt])         # incremental: less offloading
+model.unpin_chunks([0, 5], optimizers=[opt])    # incremental: more offloading
+model.pinned_layers, model.streamed_layers      # complementary frozensets
+```
+
+Each call returns a summary for your logs:
+
+```python
+{"pinned": [7], "unpinned": [], "bytes_moved": 33554432, "grads_discarded": False}
+```
+
+**A retier is a hard reset.** Master weights move with their values intact
+and optimizer state follows them; *everything else transient is discarded* —
+grad accumulators are zeroed, `.grad` is cleared on the moved params,
+activation packets are dropped, resident GPU weight copies are invalidated.
+So the call site is right after a completed step:
+
+```python
+model.step(x, targets=y, loss_fn=loss_fn)
+model.flush_grads()
+opt.step(); opt.zero_grad()
+model.set_pinned(k, optimizers=[opt])   # <- here
+```
+
+Retiering mid-accumulation silently throws the partial gradient away;
+`"grads_discarded": True` in the summary tells you it happened. It is also
+refused outright while a step is in flight (a pending itinerary or a live
+activation packet raises `RuntimeError`); `force=True` bypasses that to
+recover from an *aborted* step, discarding its state.
+
+**Pass `optimizers=`.** A tier change moves `p.data` to another device while
+keeping the same `nn.Parameter` objects — param groups and `state_dict()` keys
+stay valid, but per-param state (`exp_avg`, momentum buffers, ...) would be
+left behind on the old device, and `AdamW(fused=True)` then dies with a device
+mismatch. Passing the optimizer(s) migrates that state (the `step` tensor
+follows the `fused`/`capturable` rule torch enforces) and verifies the result.
+
+NVMe-tier chunks cannot be retiered: `NvmeTensorStore` lays out every
+disk-backed chunk in one scratch file written at construction, so moving a
+chunk on or off that mapping means rebuilding the model (`ValueError`).
+
+What it costs, measured (`probe_retier_memory` in
+`examples/offload_streaming_check.py`, 8 chunks of 512x512, so 2.00 MiB of
+weights + accumulator per chunk):
+
+| pinned | GPU resident | step peak |
+|---|---|---|
+| 0 | +0.00 MiB | 24.4 MiB |
+| 4 | +8.02 MiB | 32.3 MiB |
+| 8 | +16.03 MiB | 41.3 MiB |
+| back to 0 | +0.00 MiB | 24.4 MiB |
+
+Pinning k chunks costs exactly k x (weights + GPU accumulator), unpinning
+gives all of it back, and five pin/unpin cycles leak nothing. A *flushed*
+pinned chunk additionally holds one param-sized `.grad` buffer, which is
+freed when the chunk is unpinned.
 
 ---
 

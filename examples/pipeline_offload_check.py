@@ -30,6 +30,14 @@ Checks (on CPU always, and on two CUDA devices when available):
      pipeline across {staggered_1b1f, gpipe, 1f1b} x {keep, checkpoint} x
      act_slots {1, 2}, plus W=1 + acc_slots=1 + act_slots=1 combined thrash
      and the mixed offloaded+plain topology.
+ 10. Runtime tier reassignment (Pipeline.set_offload_pinned): retiering a
+     stage mid-training is BIT-exact vs a pipeline built with the final pin
+     from the start ({staggered_1b1f, gpipe} x {keep, checkpoint}, before
+     step 0 and between steps, with activation offload, pin-all/pin-none);
+     the hard reset is complete per stage; spec forms (dict / per-stage list
+     / broadcast set) and a pre-built optimizer keep working; per-stage GPU
+     memory grows only on the retiered stage's device and 5 cycles do not
+     leak; mixed and flat-chunk pipelines behave, resident ones refuse.
 
 Run:  PYTHONPATH=. python examples/pipeline_offload_check.py
 """
@@ -401,6 +409,206 @@ def check_flat_chunks(devices, errs, m=4, dim=16):
     print(f"{tag} {'OK' if len(errs) == n_before else 'MISMATCH'}")
 
 
+def _pipe_traj(spec, devices, errs, *, pin, retier=None, retier_at=0,
+               mode=True, schedule="staggered_1b1f", window=2, m=4, dim=16,
+               steps=3, act=False):
+    """Train a pipeline for a few steps, optionally retiering mid-flight.
+
+    Returns (losses, first-step grads, final weights, infer output) — the
+    tier is a memory placement, so a pipeline that retiers into ``retier``
+    must produce exactly this, bit for bit, whether it started there or moved.
+    """
+    pipe = Pipeline(stage_modules=spec, devices=devices,
+                    offload_window=window, offload_pin=pin,
+                    offload_keep_activations=mode,
+                    offload_activations=act, offload_act_slots=1)
+    params = [p for _, p in named_params(spec)]
+    opt = torch.optim.SGD(params, lr=0.05, momentum=0.9)
+    torch.manual_seed(5)
+    x = torch.randn(8, dim)
+    y = torch.randint(0, 4, (8,))
+    losses, grads = [], {}
+    for s in range(steps):
+        if retier is not None and s == retier_at:
+            info = pipe.set_offload_pinned(retier, optimizers=[opt])
+            for st in pipe.stages:
+                if hasattr(st, "engine"):
+                    _assert_stage_wiped(st, info, errs)
+        res = pipe.step(x, targets=y, schedule=schedule, n_microbatches=m,
+                        loss_fn=F.cross_entropy)
+        losses.append(res.loss.detach().cpu().clone())
+        res.flush_grads()
+        if s == 0:
+            grads = {n: p.grad.detach().cpu().clone()
+                     for n, p in named_params(spec)}
+        opt.step()
+        opt.zero_grad(set_to_none=False)
+    weights = {n: p.detach().cpu().clone() for n, p in named_params(spec)}
+    infer = pipe.infer(x, n_microbatches=m).detach().cpu().clone()
+    pipe.close()
+    return losses, grads, weights, infer
+
+
+def _assert_stage_wiped(stage, info, errs):
+    """A stage retier is a hard reset, like the engine's."""
+    tag = f"stage{stage.stage_index}"
+    eng = stage.engine
+    for st in eng._state:
+        if st.acc_touched or st.acc_gpu is not None or st.acc_where != "empty":
+            errs.append(f"{tag} chunk{st.idx}: accumulator survived the "
+                        "retier")
+        if st.graph_tensors is not None:
+            errs.append(f"{tag} chunk{st.idx}: graph tensors survived")
+    if eng._act_store or eng._resident or eng._future:
+        errs.append(f"{tag}: packets/residency/itinerary survived the retier")
+    if list(stage.params) != list(eng.parameters()):
+        errs.append(f"{tag}: st.params is stale after the retier")
+    if stage.pinned_layers != eng.pinned_layers:
+        errs.append(f"{tag}: pinned_layers passthrough disagrees")
+
+
+def check_retier(devices, errs, m=4, dim=16, L=4):
+    """Runtime tier reassignment on offloaded stages (set_offload_pinned)."""
+    tag = f"[{devices[0]}/{devices[-1]} retier]"
+    n_before = len(errs)
+
+    def spec():
+        src = [make_chunks(L, dim, seed=s) for s in range(2)]
+        torch.manual_seed(100)
+        src[1].append(nn.Linear(dim, 4))
+        return [copy.deepcopy(src[0]), copy.deepcopy(src[1])]
+
+    def compare(label, base, test):
+        for s, (bl, tl) in enumerate(zip(base[0], test[0])):
+            check_close(f"{tag} {label} loss step{s}", bl, tl, errs, exact=True)
+        for nme in base[1]:
+            check_close(f"{tag} {label} grad {nme}", base[1][nme],
+                        test[1][nme], errs, exact=True)
+        for nme in base[2]:
+            check_close(f"{tag} {label} weight {nme}", base[2][nme],
+                        test[2][nme], errs, exact=True)
+        check_close(f"{tag} {label} infer", base[3], test[3], errs, exact=True)
+
+    # 1. schedules x backward modes: retiering into pin=2 == starting there,
+    #    both before the first step and between steps
+    for schedule, mode in itertools.product(
+            ("staggered_1b1f", "gpipe"), (True, "checkpoint")):
+        base = _pipe_traj(spec(), devices, errs, pin=2, mode=mode,
+                          schedule=schedule)
+        for at in (0, 1):
+            test = _pipe_traj(spec(), devices, errs, pin=1, retier=2,
+                              retier_at=at, mode=mode, schedule=schedule)
+            compare(f"{schedule}/{MODE_LABEL[mode]} at={at}", base, test)
+
+    # 2. with activation offload on, and pinning everything / nothing
+    base = _pipe_traj(spec(), devices, errs, pin=2, act=True)
+    test = _pipe_traj(spec(), devices, errs, pin=1, retier=2, retier_at=1,
+                      act=True)
+    compare("act-offload", base, test)
+    for target in (0, L):
+        base = _pipe_traj(spec(), devices, errs, pin=target)
+        test = _pipe_traj(spec(), devices, errs, pin=2, retier=target)
+        compare(f"-> pin={target}", base, test)
+
+    # 3. spec forms: dict, per-stage list, broadcast set; a pre-built
+    #    optimizer must keep working (params are the same objects)
+    off = spec()
+    pipe = Pipeline(stage_modules=off, devices=devices, offload_window=2,
+                    offload_pin=1)
+    opt = torch.optim.SGD([p for _, p in named_params(off)], lr=0.05,
+                          momentum=0.9)
+    torch.manual_seed(5)
+    x = torch.randn(8, dim)
+    y = torch.randint(0, 4, (8,))
+    # NB a count is spread evenly, so 2 of stage 0's 4 chunks is {0, 2}
+    for form, want in (({0: [0, 2]}, ([0, 2], [0])),
+                       ([2, [1]], ([0, 2], [1])),
+                       ({0, 3}, ([0, 3], [0, 3]))):
+        pipe.set_offload_pinned(form, optimizers=[opt])
+        got = [sorted(st.pinned_layers) for st in pipe.stages]
+        if got != [list(want[0]), list(want[1])]:
+            errs.append(f"{tag} spec {form!r} -> pinned {got}, expected "
+                        f"{[list(want[0]), list(want[1])]}")
+        res = pipe.step(x, targets=y, schedule="staggered_1b1f",
+                        n_microbatches=m, loss_fn=F.cross_entropy)
+        res.flush_grads()
+        opt.step()
+        opt.zero_grad(set_to_none=False)
+    # per-stage memory: pinning on stage 0 must not touch stage 1's GPU
+    if devices[0] != devices[-1] and devices[0].startswith("cuda"):
+        pipe.set_offload_pinned(0)
+        for d in set(devices):
+            torch.cuda.synchronize(d)
+        before = {d: torch.cuda.memory_allocated(d) for d in set(devices)}
+        pipe.set_offload_pinned({0: L})
+        for d in set(devices):
+            torch.cuda.synchronize(d)
+        after = {d: torch.cuda.memory_allocated(d) for d in set(devices)}
+        if after[devices[0]] <= before[devices[0]]:
+            errs.append(f"{tag} pinning stage 0 did not grow {devices[0]}")
+        if after[devices[-1]] != before[devices[-1]]:
+            errs.append(f"{tag} pinning stage 0 changed {devices[-1]} by "
+                        f"{after[devices[-1]] - before[devices[-1]]} bytes")
+        # 5 cycles must not leak on either device
+        pipe.set_offload_pinned(0)
+        for d in set(devices):
+            torch.cuda.synchronize(d)
+        cycle_base = {d: torch.cuda.memory_allocated(d) for d in set(devices)}
+        for _ in range(5):
+            pipe.set_offload_pinned({0: 2, 1: 2})
+            res = pipe.step(x, targets=y, schedule="staggered_1b1f",
+                            n_microbatches=m, loss_fn=F.cross_entropy)
+            res.flush_grads()
+            pipe.set_offload_pinned(0)
+        for d in set(devices):
+            torch.cuda.synchronize(d)
+        for d in set(devices):
+            leaked = torch.cuda.memory_allocated(d) - cycle_base[d]
+            if leaked > 2**20:
+                errs.append(f"{tag} 5 cycles leaked {leaked / 2**20:.2f} MiB "
+                            f"on {d}")
+    pipe.close()
+
+    # 4. mixed pipeline: the broadcast form skips the plain stage
+    mixed = spec()
+    mixed[1] = nn.Sequential(*mixed[1])
+    mpipe = Pipeline(stage_modules=mixed, devices=devices, offload_window=2)
+    info = mpipe.set_offload_pinned(2)
+    if list(info) != [0]:
+        errs.append(f"{tag} mixed: broadcast touched stages {list(info)}, "
+                    "expected only the offloaded one")
+    for bad in ({1: 2}, [2, 2]):
+        try:
+            mpipe.set_offload_pinned(bad)
+            errs.append(f"{tag} mixed: spec {bad!r} naming a plain stage was "
+                        "not rejected")
+        except ValueError:
+            pass
+    res = mpipe.step(x, targets=y, schedule="staggered_1b1f",
+                     n_microbatches=m, loss_fn=F.cross_entropy)
+    res.flush_grads()
+    mpipe.close()
+
+    # 5. flat chunk_modules pipelines retier the same way; resident
+    #    (offload=False) ones have no engine to retier
+    flat = Pipeline(chunk_modules=make_chunks(8, dim, seed=61),
+                    devices=devices, offload_window=2)
+    flat.set_offload_pinned([1, 2])
+    if [sorted(st.pinned_layers) for st in flat.stages] != [[0], [0, 2]]:
+        errs.append(f"{tag} flat-chunks retier landed on "
+                    f"{[sorted(st.pinned_layers) for st in flat.stages]}")
+    flat.close()
+    resident = Pipeline(chunk_modules=make_chunks(4, dim, seed=62),
+                        devices=devices, offload=False)
+    try:
+        resident.set_offload_pinned(1)
+        errs.append(f"{tag} resident pipeline accepted set_offload_pinned")
+    except ValueError:
+        pass
+    resident.close()
+    print(f"{tag} {'OK' if len(errs) == n_before else 'MISMATCH'}")
+
+
 def check_rejections(errs):
     """Unsupported combos must refuse loudly."""
     n_before = len(errs)
@@ -503,6 +711,7 @@ def main() -> int:
         check_autocast(devices, errs)
         check_grad_bypass(devices, errs)
         check_flat_chunks(devices, errs)
+        check_retier(devices, errs, L=L)
     check_rejections(errs)
 
     for e in errs[:30]:

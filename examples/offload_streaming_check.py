@@ -26,15 +26,26 @@ Checks (on CPU always, and on CUDA when available):
      probe's "hooks never pack weights" counter (one leaked weight would
      inflate act_bytes_offloaded detectably). Recompute mode + activation
      offload must be rejected.
+  9. Runtime tier reassignment (set_pinned / pin_chunks / unpin_chunks): a
+     model that retiers is BIT-exact vs one built with the final tier from
+     the start (before step 0 and mid-trajectory, all backward modes, both
+     grad_accum paths, with activation offload, extremes and round trips);
+     the hard reset is observable (pre-retier accumulation is discarded) and
+     complete; optimizer state follows its params (fused + non-fused);
+     rejections (bad indices, pending itinerary, closed model, NVMe chunks).
 
-On CUDA, also reports peak GPU memory of a streamed step vs the full-resident
-reference (the point of the whole exercise).
+On CUDA, also probes what retiering costs in GPU memory (resident bytes vs
+the analytic per-chunk cost, free-on-unpin, a 5-cycle leak check and step-peak
+monotonicity) and reports peak GPU memory of a streamed step vs the
+full-resident reference (the point of the whole exercise).
 
 Run:  PYTHONPATH=. python examples/offload_streaming_check.py
 """
 
 import copy
+import os
 import sys
+import tempfile
 
 import torch
 import torch.nn as nn
@@ -490,6 +501,410 @@ def check_act_offload(device: str) -> list:
     return errs
 
 
+def _retier_run(device, chunks, *, pin, retier=None, retier_at=0, keep=True,
+                grad_accum="stream", act=False, window=2, steps=3, dim=32,
+                lr=0.05):
+    """Like :func:`_train_run`, with an optional tier change mid-trajectory.
+
+    The tier is a memory placement, not a math change, so a model that
+    retiers into ``retier`` must follow the SAME trajectory as one built with
+    that tier from the start — whether the move happens before step 0 or
+    between later steps. SGD keeps that comparison bit-exact (elementwise
+    fp32 ops are IEEE-identical on CPU and CUDA; fused AdamW would not be —
+    see docs/offload.md on fused CPU vs fused CUDA rounding).
+    """
+    model = OffloadModel(copy.deepcopy(chunks), device=device, window=window,
+                         pin_layers=sorted(pin), keep_activations=keep,
+                         grad_accum=grad_accum, offload_activations=act)
+    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    torch.manual_seed(2)
+    x, y = torch.randn(8, dim), torch.randn(8, dim)
+    losses, grads = [], {}
+    for s in range(steps):
+        if retier is not None and s == retier_at:
+            model.set_pinned(sorted(retier), optimizers=[opt])
+        torch.manual_seed(20 + s)
+        res = model.step(x, targets=y, loss_fn=nn.functional.mse_loss)
+        losses.append(res.loss.detach().cpu().clone())
+        model.flush_grads()
+        if s == 0:
+            grads = {nme: p.grad.detach().cpu().clone()
+                     for nme, p in model.chunks.named_parameters()}
+        opt.step()
+        opt.zero_grad(set_to_none=False)
+    weights = {nme: p.detach().cpu().clone()
+               for nme, p in model.chunks.named_parameters()}
+    with torch.no_grad():
+        infer = model(x).detach().cpu().clone()
+    model.close()
+    return losses, grads, weights, infer
+
+
+def _assert_wiped(model, moved, tag, errs):
+    """A retier is a hard reset: nothing transient may survive it."""
+    for st in model._state:
+        for nme, acc in st.grad_acc.items():
+            if acc.count_nonzero().item():
+                errs.append(f"{tag}: chunk{st.idx}.{nme} accumulator not "
+                            "zeroed by the retier")
+        if st.acc_where != "empty" or st.acc_gpu is not None:
+            errs.append(f"{tag}: chunk{st.idx} acc_where={st.acc_where} "
+                        f"acc_gpu={st.acc_gpu is not None} after the retier")
+        if st.acc_touched:
+            errs.append(f"{tag}: chunk{st.idx} still marked as accumulated")
+        if st.graph_tensors is not None:
+            errs.append(f"{tag}: chunk{st.idx} kept graph_tensors")
+    # buffers whose device/pinning depends on the tier are only stale for the
+    # chunks that actually moved; unmoved chunks keep theirs on purpose
+    for i in sorted(moved):
+        st = model._state[i]
+        if st.staging is not None or st.flush_bufs:
+            errs.append(f"{tag}: moved chunk{i} kept staging/flush buffers")
+        for nme, p in st.module.named_parameters():
+            if p.grad is not None:
+                errs.append(f"{tag}: chunk{i}.{nme}.grad survived the retier")
+    if model._act_store:
+        errs.append(f"{tag}: {len(model._act_store)} activation packet(s) "
+                    "survived the retier")
+    if model._resident:
+        errs.append(f"{tag}: {len(model._resident)} resident weight copies "
+                    "survived the retier")
+    if model._future or model._fpos:
+        errs.append(f"{tag}: itinerary not cleared "
+                    f"({len(model._future)} entries, fpos={model._fpos})")
+
+
+def _assert_tiers(model, tag, errs):
+    """Masters must physically live where their tier says."""
+    for st in model._state:
+        for nme, p in st.module.named_parameters():
+            if st.gpu_pinned:
+                if p.device != model.device:
+                    errs.append(f"{tag}: pinned chunk{st.idx}.{nme} on "
+                                f"{p.device}, expected {model.device}")
+            else:
+                if p.device.type != "cpu":
+                    errs.append(f"{tag}: streamed chunk{st.idx}.{nme} on "
+                                f"{p.device}, expected cpu")
+                elif model._cuda and not p.data.is_pinned():
+                    errs.append(f"{tag}: streamed chunk{st.idx}.{nme} master "
+                                "is not in pinned memory")
+
+
+def check_retier(device: str) -> list:
+    """Runtime tier reassignment: set_pinned / pin_chunks / unpin_chunks."""
+    errs: list = []
+    n, dim = 6, 32
+    P1, P2 = {0, 3}, {1, 4}
+    mse = nn.functional.mse_loss
+
+    def compare(tag, base, test):
+        for s, (bl, tl) in enumerate(zip(base[0], test[0])):
+            _exact(f"{tag} loss step{s}", bl, tl, errs)
+        for nme in base[1]:
+            _exact(f"{tag} grad {nme}", base[1][nme], test[1][nme], errs)
+        for nme in base[2]:
+            _exact(f"{tag} weight {nme}", base[2][nme], test[2][nme], errs)
+        _exact(f"{tag} infer", base[3], test[3], errs)
+
+    # 1. trajectory parity vs a model built directly at the final tier —
+    #    retiering before the first step and between later steps
+    for keep in (False, True, "checkpoint"):
+        for ga in ("stream", "cpu"):
+            nb = len(errs)
+            chunks = make_chunks(n, dim, seed=31)
+            base = _retier_run(device, chunks, pin=P2, keep=keep,
+                               grad_accum=ga)
+            for at in (0, 1):
+                test = _retier_run(device, chunks, pin=P1, retier=P2,
+                                   retier_at=at, keep=keep, grad_accum=ga)
+                compare(f"retier[{_MODE_LABEL[keep]} ga={ga} at={at}]",
+                        base, test)
+            status = "OK" if len(errs) == nb else "MISMATCH"
+            print(f"[{device} retier {_MODE_LABEL[keep]} ga={ga}] {status}")
+
+    # 2. extremes (offload everything / pin everything) + round trip
+    nb = len(errs)
+    chunks = make_chunks(n, dim, seed=32)
+    allp = set(range(n))
+    for target in (set(), allp):
+        base = _retier_run(device, chunks, pin=target)
+        test = _retier_run(device, chunks, pin=P1, retier=target)
+        compare(f"retier[-> {'all' if target else 'none'} pinned]", base, test)
+    base = _retier_run(device, chunks, pin=P1)
+    model = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
+                         pin_layers=sorted(P1), keep_activations=True)
+    opt = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
+    model.set_pinned(sorted(P2), optimizers=[opt])
+    model.set_pinned(sorted(P1), optimizers=[opt])
+    if set(model.pinned_layers) != P1:
+        errs.append(f"round trip landed on {sorted(model.pinned_layers)}, "
+                    f"expected {sorted(P1)}")
+    if set(model.streamed_layers) != allp - P1:
+        errs.append("streamed_layers is not the complement of pinned_layers")
+    _assert_tiers(model, "retier[round trip]", errs)
+    torch.manual_seed(2)
+    x, y = torch.randn(8, dim), torch.randn(8, dim)
+    losses = []
+    for s in range(3):
+        torch.manual_seed(20 + s)
+        losses.append(model.step(x, targets=y, loss_fn=mse)
+                      .loss.detach().cpu().clone())
+        model.flush_grads()
+        opt.step()
+        opt.zero_grad(set_to_none=False)
+    for s, (bl, tl) in enumerate(zip(base[0], losses)):
+        _exact(f"retier[round trip] loss step{s}", bl, tl, errs)
+    for nme, p in model.chunks.named_parameters():
+        _exact(f"retier[round trip] weight {nme}", base[2][nme],
+               p.detach().cpu(), errs)
+    model.close()
+    print(f"[{device} retier extremes+round-trip] "
+          f"{'OK' if len(errs) == nb else 'MISMATCH'}")
+
+    # 3. with activation offload on (packets must be drained, not stranded)
+    nb = len(errs)
+    chunks = make_chunks(n, dim, seed=34)
+    for keep in (True, "checkpoint"):
+        base = _retier_run(device, chunks, pin=P2, keep=keep, act=True)
+        test = _retier_run(device, chunks, pin=P1, retier=P2, retier_at=1,
+                           keep=keep, act=True)
+        compare(f"retier[act {_MODE_LABEL[keep]}]", base, test)
+    print(f"[{device} retier act-offload] "
+          f"{'OK' if len(errs) == nb else 'MISMATCH'}")
+
+    # 4. the wipe is observable: pre-retier accumulation is discarded, so one
+    #    step after the retier == exactly one step's grads
+    nb = len(errs)
+    for ga in ("stream", "cpu"):
+        chunks = make_chunks(n, dim, seed=35)
+        a = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
+                         pin_layers=sorted(P1), keep_activations=True,
+                         grad_accum=ga, offload_activations=True)
+        torch.manual_seed(2)
+        x, y = torch.randn(8, dim), torch.randn(8, dim)
+        torch.manual_seed(21)
+        a.step(x, targets=y, loss_fn=mse)      # accumulation about to be lost
+        info = a.set_pinned(sorted(P2))
+        if not info["grads_discarded"]:
+            errs.append(f"retier[wipe ga={ga}]: grads_discarded was False "
+                        "after retiering mid-accumulation")
+        if info["pinned"] != sorted(P2) or info["unpinned"] != sorted(P1):
+            errs.append(f"retier[wipe ga={ga}]: summary {info} does not "
+                        "describe the move")
+        _assert_wiped(a, P1 | P2, f"retier[wipe ga={ga}]", errs)
+        _assert_tiers(a, f"retier[wipe ga={ga}]", errs)
+        torch.manual_seed(21)
+        a.step(x, targets=y, loss_fn=mse)
+        a.flush_grads()
+        got = {nme: p.grad.detach().cpu().clone()
+               for nme, p in a.chunks.named_parameters()}
+        a.close()
+
+        b = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
+                         pin_layers=sorted(P2), keep_activations=True,
+                         grad_accum=ga, offload_activations=True)
+        torch.manual_seed(21)
+        b.step(x, targets=y, loss_fn=mse)
+        b.flush_grads()
+        for nme, p in b.chunks.named_parameters():
+            _exact(f"retier[wipe ga={ga}] grad {nme}", p.grad.detach().cpu(),
+                   got[nme], errs)
+        b.close()
+    print(f"[{device} retier wipe] "
+          f"{'OK' if len(errs) == nb else 'MISMATCH'}")
+
+    # 5. optimizer continuity: state follows the params across the move
+    nb = len(errs)
+    chunks = make_chunks(n, dim, seed=36)
+    for fused in ((False, True) if device.startswith("cuda") else (False,)):
+        model = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
+                             pin_layers=sorted(P1), keep_activations=True)
+        before = [id(p) for p in model.parameters()]
+        keys_before = set(model.state_dict())
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=fused)
+        torch.manual_seed(2)
+        x, y = torch.randn(8, dim), torch.randn(8, dim)
+        for _ in range(2):
+            model.step(x, targets=y, loss_fn=mse)
+            model.flush_grads()
+            opt.step()
+            opt.zero_grad(set_to_none=False)
+        model.set_pinned(sorted(P2), optimizers=opt)   # bare optimizer too
+        if [id(p) for p in model.parameters()] != before:
+            errs.append(f"retier[opt fused={fused}]: parameter objects were "
+                        "replaced (param groups would go stale)")
+        if set(model.state_dict()) != keys_before:
+            errs.append(f"retier[opt fused={fused}]: state_dict keys changed")
+        for p, st in opt.state.items():
+            for key, val in st.items():
+                if not isinstance(val, torch.Tensor):
+                    continue
+                want = p.device
+                if key == "step" and not fused:
+                    want = torch.device("cpu")
+                if val.device != want:
+                    errs.append(f"retier[opt fused={fused}]: state['{key}'] "
+                                f"on {val.device}, param on {p.device}")
+        for _ in range(2):      # must keep training without a device error
+            model.step(x, targets=y, loss_fn=mse)
+            model.flush_grads()
+            opt.step()
+            opt.zero_grad(set_to_none=False)
+        model.close()
+    print(f"[{device} retier optimizer-state] "
+          f"{'OK' if len(errs) == nb else 'MISMATCH'}")
+
+    # 6. rejections
+    nb = len(errs)
+    model = OffloadModel(make_chunks(n, dim, seed=37), device=device,
+                         window=2, pin=2, keep_activations=True)
+    for bad in ([n], -1, [0, n + 1]):
+        try:
+            model.pin_chunks(bad)
+            errs.append(f"out-of-range chunk index {bad!r} was not rejected")
+        except ValueError:
+            pass
+    for bad in (True, [True]):
+        try:
+            model.set_pinned(bad)
+            errs.append(f"bool chunk spec {bad!r} was not rejected")
+        except TypeError:
+            pass
+    try:
+        model.set_pinned(-1)
+        errs.append("negative pin count was not rejected")
+    except ValueError:
+        pass
+    # mid-step guard: an announced-but-unconsumed itinerary must refuse
+    model._announce([0, 1], kinds=["F", "F"])
+    try:
+        model.set_pinned(0)
+        errs.append("retier with a pending itinerary was not rejected")
+    except RuntimeError:
+        pass
+    model.set_pinned(0, force=True)   # the documented recovery path
+    if model.pinned_layers:
+        errs.append("force=True retier did not apply")
+    model.step(torch.randn(4, dim), targets=torch.randn(4, dim), loss_fn=mse)
+    model.close()
+    try:
+        model.pin_chunks([0])
+        errs.append("retier on a closed model was not rejected")
+    except RuntimeError:
+        pass
+    # nvme chunks share one scratch-file layout -> not retierable
+    with tempfile.TemporaryDirectory() as tmp:
+        nv = OffloadModel(make_chunks(4, dim, seed=38), device=device,
+                          window=2, nvme=2,
+                          nvme_path=os.path.join(tmp, "w.bin"))
+        on_disk = sorted(nv.nvme_layers)
+        try:
+            nv.pin_chunks(on_disk[:1])
+            errs.append("retiering an NVMe chunk was not rejected")
+        except ValueError:
+            pass
+        free = [i for i in range(4) if i not in nv.nvme_layers]
+        nv.pin_chunks(free[:1])       # non-NVMe chunks stay retierable
+        if free[0] not in nv.pinned_layers:
+            errs.append("pinning a non-NVMe chunk of an NVMe model failed")
+        nv.close()
+    print(f"[{device} retier rejections] "
+          f"{'OK' if len(errs) == nb else 'MISMATCH'}")
+    return errs
+
+
+def probe_retier_memory(device: str):
+    """Measure what retiering does to GPU memory (CUDA only).
+
+    Pinning k chunks must cost k chunks of weights + accumulators and nothing
+    else, unpinning must give it all back, and repeated cycles must not leak
+    (a stranded accumulator / graph_tensors / resident copy would show up).
+    """
+    errs: list = []
+    n, dim, batch = 8, 512, 32
+    chunks = make_chunks(n, dim, seed=41)
+    x, y = torch.randn(batch, dim), torch.randn(batch, dim)
+    mse = nn.functional.mse_loss
+
+    model = OffloadModel(copy.deepcopy(chunks), device=device, window=2,
+                         pin=0, keep_activations=True)
+    # weights + buffers + the GPU grad accumulator of one chunk
+    per_chunk = model._state[0].nbytes() + sum(
+        p.numel() * p.element_size()
+        for p in model._state[0].module.parameters()
+    )
+    slack = per_chunk // 4
+
+    def allocated():
+        torch.cuda.synchronize(device)
+        return torch.cuda.memory_allocated(device)
+
+    def step_peak():
+        torch.cuda.reset_peak_memory_stats(device)
+        model.step(x, targets=y, loss_fn=mse)
+        model.flush_grads()
+        torch.cuda.synchronize(device)
+        return torch.cuda.max_memory_allocated(device)
+
+    levels = (0, n // 2, n)
+    # phase 1 — resident cost, measured BEFORE any step so the only GPU
+    # tenants are the pinned masters and their accumulators (a flush would
+    # add a persistent .grad buffer per pinned chunk, measured in phase 2)
+    resident = []
+    base_alloc = allocated()
+    for pin in levels:
+        model.set_pinned(pin)
+        want = len(model.pinned_layers) * per_chunk
+        got = allocated() - base_alloc
+        resident.append(got)
+        if abs(got - want) > slack:
+            errs.append(f"pin={pin}: {got / 2**20:.1f} MiB resident after the "
+                        f"retier, expected ~{want / 2**20:.1f} MiB")
+    # unpinning gives it all back
+    model.set_pinned(0)
+    back = allocated() - base_alloc
+    if abs(back) > slack:
+        errs.append(f"unpinning left {back / 2**20:.1f} MiB behind")
+
+    # phase 2 — step peaks must grow with the pin count and come back down
+    peaks = []
+    for pin in levels:
+        model.set_pinned(pin)
+        peaks.append(step_peak())
+    model.set_pinned(0)
+    if not peaks[0] < peaks[1] < peaks[2]:
+        errs.append(f"step peak is not monotonic in the pin count: {peaks}")
+    peak_back = step_peak()
+    if abs(peak_back - peaks[0]) > per_chunk:
+        errs.append(f"step peak after unpinning back is {peak_back / 2**20:.1f}"
+                    f" MiB vs {peaks[0] / 2**20:.1f} MiB originally")
+    # leak check: five full cycles must return to where they started. The
+    # baseline is taken HERE, after the warmup steps above, because cuBLAS
+    # allocates a per-stream workspace on first use (~8 MiB each) through the
+    # caching allocator, and memory_allocated counts it.
+    cycle_base = allocated()
+    for _ in range(5):
+        model.set_pinned(n // 2)
+        model.step(x, targets=y, loss_fn=mse)
+        model.flush_grads()
+        model.set_pinned(0)
+    leaked = allocated() - cycle_base
+    if abs(leaked) > slack:
+        errs.append(f"5 pin/unpin cycles leaked {leaked / 2**20:.2f} MiB")
+    model.close()
+
+    print(f"[retier memory n={n} dim={dim}] chunk={per_chunk / 2**20:.2f} MiB "
+          f"(weights+acc), baseline {base_alloc / 2**20:.1f} MiB")
+    for pin, res, peak in zip(levels, resident, peaks):
+        print(f"    pin={pin}: +{res / 2**20:6.2f} MiB resident, "
+              f"step peak {peak / 2**20:6.1f} MiB")
+    print(f"    after unpinning back: +{back / 2**20:.2f} MiB resident, "
+          f"step peak {peak_back / 2**20:.1f} MiB, "
+          f"5-cycle leak {leaked / 2**20:.2f} MiB")
+    return errs
+
+
 def check_load_accounting(device: str) -> list:
     errs: list = []
     n, dim = 6, 32
@@ -572,12 +987,17 @@ def main() -> int:
                 ok &= not errs
         errs = (check_load_accounting(device) + check_dropout_keep(device)
                 + check_multi_arg(device) + check_autocast(device)
-                + check_grad_bypass(device) + check_act_offload(device))
+                + check_grad_bypass(device) + check_act_offload(device)
+                + check_retier(device))
         for e in errs:
             print(f"    {e}")
         ok &= not errs
 
     if torch.cuda.is_available():
+        errs = probe_retier_memory("cuda:0")
+        for e in errs:
+            print(f"    {e}")
+        ok &= not errs
         memory_report("cuda:0")
 
     print("PASS" if ok else "FAIL")

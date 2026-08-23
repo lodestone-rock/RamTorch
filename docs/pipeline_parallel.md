@@ -420,6 +420,39 @@ plus serial host math, which stalls compute-bound configs. Chunks follow the `Of
 contract is unchanged, so mixing offloaded and resident stages, tuple stage
 boundaries, `autocast=`, `grad_outputs=`, and `infer()` all work as usual.
 
+### Changing `offload_pin` at runtime
+
+The pinned/streamed split is reassignable between steps, per stage or across
+the whole pipeline:
+
+```python
+pipe.set_offload_pinned(3, optimizers=[opt])                 # every offloaded stage
+pipe.set_offload_pinned([3, 2, None, 0], optimizers=[opt])   # aligned with pipe.stages
+pipe.set_offload_pinned({1: [0, 4]}, optimizers=[opt])       # by stage index
+pipe.stages[0].set_pinned(2, optimizers=[opt])               # or drive one stage
+```
+
+An `int` is a count spread evenly (like `offload_pin=`); a `set` of indices
+broadcasts; a `list`/`tuple` is **always** per stage (so `[3, 2]` means "stage
+0 pins 3, stage 1 pins 2" — use `{0, 4}` or `[[0, 4], [0, 4]]` to broadcast
+explicit indices). Plain resident stages are skipped by the broadcast forms
+and rejected when named explicitly. Returns `{stage_index: summary}`.
+
+Same contract as the single-GPU engine (see `offload.md`, "Changing the tier
+at runtime"): it is a **hard reset** — grad accumulators, `.grad` and
+activation packets are discarded, only masters and optimizer state carry over.
+Two pipeline-specific notes:
+
+- **Only between clean steps.** `step()` joins its stage workers before
+  returning, so right after `flush_grads()` + `opt.step()` is the moment. After
+  an *aborted* step the stale itinerary makes the retier refuse; recover with
+  `OffloadStage.clear()` (or `force=True`, discarding that step's state).
+- **Pass `optimizers=`.** The documented pipeline recipe builds the optimizer
+  from `itertools.chain(*(st.params for st in pipe.stages))` once, long before
+  any retier. Those `Parameter` objects survive the move (only `.data`
+  relocates), but their optimizer state has to be migrated with them or
+  `AdamW(fused=True)` will hit a device mismatch.
+
 ### Why this composes well
 
 The relay executor walks a **static per-stage op list**, so the entire step's
@@ -477,8 +510,8 @@ traffic when the shard *almost* fits.
   buffer-free norms (LayerNorm).
 - `fake_compute` is not supported with chunked (offloaded) stage entries.
 - Bit-parity with a full-resident pipeline (same op order) is asserted across
-  schedules × modes × windows × tuple boundaries × bf16 × grad-bypass in
-  `examples/pipeline_offload_check.py`.
+  schedules × modes × windows × tuple boundaries × bf16 × grad-bypass ×
+  runtime retiering in `examples/pipeline_offload_check.py`.
 
 ---
 

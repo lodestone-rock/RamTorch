@@ -107,6 +107,10 @@ class OffloadStage(Stage):
     stage_index, num_stages, device, tracer, autocast_dtype : as in Stage.
     window           : streaming GPU slots (>= 1; >= 2 overlaps load/compute).
     pin              : chunks pinned permanently on the GPU (evenly spaced).
+                       Reassignable between steps via :meth:`set_pinned` /
+                       :meth:`pin_chunks` / :meth:`unpin_chunks` (or
+                       ``Pipeline.set_offload_pinned`` for all stages at
+                       once) — a hard reset, see :meth:`set_pinned`.
     keep_activations : ``True`` (keep per-chunk graphs, default) or
                        ``"checkpoint"`` (recompute-level memory, dropout-safe).
                        Engine recompute mode (``False``) is rejected — see the
@@ -440,6 +444,53 @@ class OffloadStage(Stage):
         """Drop streamed GPU weight copies (see OffloadModel). Needed after a
         manual in-place master update that bypassed :meth:`flush_grads`."""
         self.engine.invalidate_residency()
+
+    # ── runtime tier changes (dynamic offloading) ─────────────────────────
+    # Thin delegation: the engine owns the tier, and an offloaded stage drives
+    # the very same residency machinery, so nothing schedule-side changes.
+    # Call these BETWEEN steps (the relay joins its workers before step()
+    # returns, so "after a clean step" is exactly the right moment) — the
+    # engine refuses while an itinerary is pending.
+    @property
+    def pinned_layers(self) -> frozenset:
+        """Chunk indices held permanently on this stage's GPU."""
+        return self.engine.pinned_layers
+
+    @property
+    def streamed_layers(self) -> frozenset:
+        """Chunk indices streamed from CPU RAM (the offloaded set)."""
+        return self.engine.streamed_layers
+
+    def set_pinned(self, pinned, *, optimizers=(), force: bool = False) -> dict:
+        """Reassign which of this stage's chunks stay GPU-resident.
+
+        ``pinned`` is a count (evenly spaced, like the ``pin`` argument) or an
+        explicit iterable of chunk indices. Hard reset: grad accumulators,
+        ``.grad`` and activation packets are discarded, so call it right after
+        ``flush_grads()`` + ``optimizer.step()``. Pass ``optimizers=`` so
+        per-param state follows the moved params —  pipeline optimizers are
+        typically built from ``st.params`` long before any retier.
+        """
+        return self._apply_retier(
+            self.engine.set_pinned, pinned, optimizers, force)
+
+    def pin_chunks(self, chunks, *, optimizers=(), force: bool = False) -> dict:
+        """Pin chunk indices on this stage's GPU (see :meth:`set_pinned`)."""
+        return self._apply_retier(
+            self.engine.pin_chunks, chunks, optimizers, force)
+
+    def unpin_chunks(self, chunks, *, optimizers=(),
+                     force: bool = False) -> dict:
+        """Offload chunk indices back to CPU RAM (see :meth:`set_pinned`)."""
+        return self._apply_retier(
+            self.engine.unpin_chunks, chunks, optimizers, force)
+
+    def _apply_retier(self, fn, arg, optimizers, force) -> dict:
+        info = fn(arg, optimizers=optimizers, force=force)
+        # the Parameter objects survive a retier (only .data moves), so this
+        # is a cheap refresh that keeps `st.params`-built optimizers valid
+        self.params = list(self.engine.parameters())
+        return info
 
     def clear(self):
         with self._lock:

@@ -115,7 +115,7 @@ Weights live in CPU **pinned** memory. A **loader thread** prefetches upcoming c
 ### The three knobs
 
 - **`window`** (default `2`): streaming slots on the GPU. `window=1` never overlaps a load with compute; `window≥2` lets the loader run ahead. Total weight memory ≈ `window + pin` chunks.
-- **`pin`** (default `0`): evenly-spaced chunks pinned resident. `pin_layers=[...]` overrides with explicit indices.
+- **`pin`** (default `0`): evenly-spaced chunks pinned resident. `pin_layers=[...]` overrides with explicit indices. Reassignable between steps — `model.set_pinned(k, optimizers=[opt])` / `pin_chunks` / `unpin_chunks` (and `pipe.set_offload_pinned(...)` for pipelines) trade GPU memory for PCIe traffic mid-run; it is a hard reset (grads and activations are discarded), see [docs/offload.md](docs/offload.md).
 - **`keep_activations`**: backward strategy —
   - `False` (*recompute*, default): forward runs under `no_grad` caching only chunk-boundary activations; backward reloads each chunk and recomputes its forward (per-chunk gradient checkpointing). Cheapest memory, but forward runs twice and **dropout would resample**.
   - `True` (*keep*): forward builds each chunk's graph and keeps its activations, so backward skips the recompute. Weights still stream (their storage is freed on eviction and refilled before backward — the FSDP resharding trick). Fastest, works with dropout, costs activation memory for all chunks.

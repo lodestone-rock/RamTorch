@@ -247,6 +247,64 @@ def _check_nvme_unlocked() -> None:
         print(_NVME_WARNING, flush=True)
 
 
+def _migrate_opt_state(optimizers, params: Sequence[nn.Parameter],
+                       new_device: torch.device) -> int:
+    """Move the optimizer state of ``params`` onto ``new_device``.
+
+    A tier change (:meth:`OffloadModel.set_pinned`) reassigns ``p.data`` to a
+    different device while keeping the same :class:`~torch.nn.Parameter`
+    objects, so param groups stay valid but per-param state (``exp_avg``,
+    momentum buffers, ...) is left behind on the old device — where
+    ``AdamW(fused=True)`` would fail with a device mismatch.
+
+    The ``"step"`` entry is special: torch asserts *"If capturable=False,
+    state_steps should not be CUDA tensors"*, while ``fused=True`` /
+    ``capturable=True`` want it on the param's device. So ``step`` follows the
+    owning group's flags and every other tensor follows the param.
+
+    Returns the number of state tensors moved.
+    """
+    if not params:
+        return 0
+    if isinstance(optimizers, torch.optim.Optimizer):
+        optimizers = [optimizers]
+    optimizers = list(optimizers or ())
+    if not optimizers:
+        return 0
+    wanted = {id(p) for p in params}
+    cpu = torch.device("cpu")
+    moved = 0
+    for opt in optimizers:
+        for group in opt.param_groups:
+            step_on_device = bool(group.get("fused") or group.get("capturable"))
+            for p in group["params"]:
+                if id(p) not in wanted:
+                    continue
+                st = opt.state.get(p)
+                if not st:
+                    continue
+                for key, val in list(st.items()):
+                    if not isinstance(val, torch.Tensor):
+                        continue
+                    tgt = new_device if (key != "step" or step_on_device) else cpu
+                    if val.device != tgt:
+                        st[key] = val.to(tgt)
+                        moved += 1
+                # verify: a leftover mismatch would surface much later as an
+                # opaque kernel-level device error
+                for key, val in st.items():
+                    if not isinstance(val, torch.Tensor):
+                        continue
+                    tgt = new_device if (key != "step" or step_on_device) else cpu
+                    if val.device != tgt:
+                        raise RuntimeError(
+                            f"could not migrate optimizer state "
+                            f"{type(opt).__name__}.state[...]['{key}'] from "
+                            f"{val.device} to {tgt} after retiering a chunk"
+                        )
+    return moved
+
+
 def offload_checkpoint(module: nn.Module, *args, **kwargs):
     """Gradient-checkpoint ``module(*args, **kwargs)`` inside a chunk forward.
 
@@ -315,7 +373,15 @@ class OffloadStepResult:
 
 
 class _ChunkState:
-    """Per-chunk storage: CPU master tensors, grad accumulators, staging."""
+    """Per-chunk storage: CPU master tensors, grad accumulators, staging.
+
+    The two tiers are set up by :meth:`_become_pinned` /
+    :meth:`_become_streamed`, which the ctor calls and
+    :meth:`OffloadModel._retier` re-calls to move a chunk between them at
+    runtime. Both start from a clean slate (fresh zero accumulators, no
+    residency-derived state), which is why a retier is defined as a hard
+    reset — see :meth:`OffloadModel.set_pinned`.
+    """
 
     def __init__(self, module: nn.Module, gpu_pinned: bool,
                  device: torch.device, use_cuda: bool, nvme: bool = False,
@@ -323,6 +389,16 @@ class _ChunkState:
         self.module = module
         self.gpu_pinned = gpu_pinned
         self.idx = idx
+        # nvme masters start as plain CPU tensors here; OffloadModel rehomes
+        # them onto the file mapping right after all states are built (the
+        # store lays out every nvme chunk in one file, so it needs them all)
+        self.nvme = nvme
+        self.param_names = frozenset(n for n, _ in module.named_parameters())
+        # persistent .grad buffers for flush_grads (CPU ones pinned so a
+        # streaming optimizer can H2D them at full PCIe speed)
+        self.flush_bufs: Dict[str, torch.Tensor] = {}
+        self.tensors: Dict[str, torch.Tensor] = {}
+        self.grad_acc: Dict[str, torch.Tensor] = {}
         # streamed-accumulator (grad_accum="stream") state, guarded by the
         # engine's _cv: the accumulated value lives in EXACTLY one place —
         #   "empty": zero (nothing accumulated since the last flush/zero)
@@ -335,54 +411,85 @@ class _ChunkState:
         # the compute stream has not synchronized with yet
         self.acc_ev = None
         self.acc_fresh = False
-        # nvme masters start as plain CPU tensors here; OffloadModel rehomes
-        # them onto the file mapping right after all states are built (the
-        # store lays out every nvme chunk in one file, so it needs them all)
-        self.nvme = nvme
-        self.param_names = frozenset(n for n, _ in module.named_parameters())
+        # "something was accumulated since the last flush/zero" — tracked for
+        # both grad_accum paths ("cpu" mode never leaves acc_where), so a
+        # retier can report the gradient it is about to discard
+        self.acc_touched = False
         # keep_activations mode: stable GPU tensor objects referenced by the
         # autograd graph; eviction frees their storage, reload refills it
         self.graph_tensors: Optional[Dict[str, torch.Tensor]] = None
-
-        # persistent .grad buffers for flush_grads (CPU ones pinned so a
-        # streaming optimizer can H2D them at full PCIe speed)
-        self.flush_bufs: Dict[str, torch.Tensor] = {}
+        # pinned D2H staging buffers, allocated lazily at first backward
+        # (grad_accum="cpu" packet path only)
+        self.staging: Optional[Dict[str, torch.Tensor]] = None
 
         if gpu_pinned:
-            module.to(device)
-            self.tensors: Dict[str, torch.Tensor] = dict(
-                module.named_parameters()
-            ) | dict(module.named_buffers())
-            # grads accumulate on the GPU next to the pinned weights
-            self.grad_acc: Dict[str, torch.Tensor] = {
-                n: torch.zeros_like(p) for n, p in module.named_parameters()
-            }
-            self.staging = None
-            return
+            self._become_pinned(device)
+        else:
+            self._become_streamed(use_cuda, pin_acc)
 
-        # streamed chunk: master weights in CPU pinned memory (nvme chunks
-        # skip the pinning — they are about to move onto the file mapping)
-        for p in module.parameters():
+    # ── tier setup (shared by the ctor and runtime retiering) ──────────────
+    def nbytes(self) -> int:
+        """Master-weight footprint of this chunk (params + buffers)."""
+        return sum(t.numel() * t.element_size() for t in self.tensors.values())
+
+    def _reset_tier_state(self) -> None:
+        """Drop everything derived from the CURRENT tier.
+
+        Called by both tier setters, so a runtime move starts as clean as
+        construction: no accumulated grads, no ``.grad``, no keep-mode graph
+        tensors, no staging or flush buffers sized for the old device.
+        """
+        self.graph_tensors = None
+        self.staging = None
+        self.flush_bufs.clear()
+        self.acc_gpu = None
+        self.acc_ev = None
+        self.acc_fresh = False
+        self.acc_where = "empty"
+        self.acc_touched = False
+        for p in self.module.parameters():
+            p.grad = None
+
+    def _become_pinned(self, device: torch.device) -> None:
+        """GPU-resident tier: masters live on the device, never streamed."""
+        self._reset_tier_state()
+        self.module.to(device)
+        self.tensors = dict(self.module.named_parameters()) | dict(
+            self.module.named_buffers()
+        )
+        # grads accumulate on the GPU next to the pinned weights
+        self.grad_acc = {
+            n: torch.zeros_like(p)
+            for n, p in self.module.named_parameters()
+        }
+        self.gpu_pinned = True
+
+    def _become_streamed(self, use_cuda: bool, pin_acc: bool) -> None:
+        """Streamed tier: master weights in CPU pinned memory.
+
+        (nvme chunks skip the pinning — their masters are about to move onto
+        the file mapping.)
+        """
+        self._reset_tier_state()
+        for p in self.module.parameters():
             p.data = p.data.detach().cpu()
-            if use_cuda and not nvme:
+            if use_cuda and not self.nvme:
                 p.data = p.data.pin_memory()
-        for b in module.buffers():
+        for b in self.module.buffers():
             b.data = b.data.detach().cpu()
-            if use_cuda and not nvme:
+            if use_cuda and not self.nvme:
                 b.data = b.data.pin_memory()
-        self.tensors = dict(module.named_parameters()) | dict(
-            module.named_buffers()
+        self.tensors = dict(self.module.named_parameters()) | dict(
+            self.module.named_buffers()
         )
         # stream mode transfers accs whole over PCIe: pin them so the copies
         # run at full speed ("cpu" mode keeps them pageable and stages instead)
         self.grad_acc = {
             n: (torch.zeros_like(p, device="cpu").pin_memory() if pin_acc
                 else torch.zeros_like(p, device="cpu"))
-            for n, p in module.named_parameters()
+            for n, p in self.module.named_parameters()
         }
-        # pinned D2H staging buffers, allocated lazily at first backward
-        # (grad_accum="cpu" packet path only)
-        self.staging: Optional[Dict[str, torch.Tensor]] = None
+        self.gpu_pinned = False
 
 
 class _Resident:
@@ -483,7 +590,9 @@ class OffloadModel(nn.Module):
                  compute — see the simulator's window sweep).
     pin        : number of chunks pinned permanently on the GPU, evenly
                  spaced (``pin_layers`` overrides). Total weight memory is
-                 ~``window + pin`` chunks.
+                 ~``window + pin`` chunks. Reassignable between steps via
+                 :meth:`set_pinned` / :meth:`pin_chunks` /
+                 :meth:`unpin_chunks` (a hard reset — see :meth:`set_pinned`).
     pin_layers : explicit chunk indices to pin (overrides ``pin``).
     nvme       : number of chunks whose masters live on disk instead of CPU
                  RAM, interleaved evenly among the chunks (``nvme_layers``
@@ -629,10 +738,12 @@ class OffloadModel(nn.Module):
 
         # register chunks so .parameters()/.state_dict() work
         self.chunks = nn.ModuleList(chunks)
-        pin_acc = grad_accum == "stream" and self._cuda
+        # remembered so a runtime retier re-homes accumulators exactly as the
+        # ctor did (see _retier)
+        self._pin_acc = grad_accum == "stream" and self._cuda
         self._state = [
             _ChunkState(m, i in pinned_idx, self.device, self._cuda,
-                        nvme=i in nvme_idx, idx=i, pin_acc=pin_acc)
+                        nvme=i in nvme_idx, idx=i, pin_acc=self._pin_acc)
             for i, m in enumerate(self.chunks)
         ]
 
@@ -684,7 +795,7 @@ class OffloadModel(nn.Module):
         self.stats = {"loads": 0, "nvme_loads": 0, "acquire_wait_s": 0.0,
                       "acc_loads": 0, "acc_evictions": 0,
                       "act_offloads": 0, "act_reloads": 0,
-                      "act_bytes_offloaded": 0}
+                      "act_bytes_offloaded": 0, "retiers": 0}
         # (track, name, start_us, dur_us) spans from the worker threads,
         # collected only while step(profile_path=...) is active — kineto
         # cannot see record_function on threads it did not enter from
@@ -1645,11 +1756,14 @@ class OffloadModel(nn.Module):
             with torch.no_grad():
                 for nme, g in named_grads.items():
                     state.grad_acc[nme] += g.detach()
+            state.acc_touched = state.acc_touched or bool(named_grads)
         elif not named_grads:
             return
         elif self.grad_accum == "stream":
+            state.acc_touched = True
             self._acc_add(state, named_grads)
         else:
+            state.acc_touched = True
             if self._cuda:
                 ev = torch.cuda.Event()
                 # grads are ready on OUR device's compute stream (record on it
@@ -1898,6 +2012,7 @@ class OffloadModel(nn.Module):
                 torch.mul(acc, scale, out=buf)
                 named[nme].grad = buf
                 acc.zero_()
+            state.acc_touched = False
             if not state.gpu_pinned:
                 state.acc_where = "empty"  # next cycle zero-inits on GPU
         self.invalidate_residency()
@@ -1965,6 +2080,211 @@ class OffloadModel(nn.Module):
                             t.untyped_storage().resize_(0)
             self._cv.notify_all()
 
+    # ── runtime tier changes (dynamic offloading) ──────────────────────────
+    # Which chunks are offloaded is a construction-time split (pinned chunks
+    # keep their masters on the GPU, everything else streams from CPU pinned
+    # RAM), but nothing in the engine caches it: every hot path branches on
+    # state.gpu_pinned at call time. So the tier can be reassigned between
+    # steps by relocating a chunk's masters and rebuilding its accumulators.
+    @property
+    def streamed_layers(self) -> frozenset:
+        """Chunk indices whose masters stream from CPU (the offloaded set)."""
+        return frozenset(
+            i for i in range(self.n) if i not in self.pinned_layers
+        )
+
+    def set_pinned(self, pinned: Union[int, Sequence[int]], *,
+                   optimizers=(), force: bool = False) -> dict:
+        """Reassign which chunks are GPU-resident (declarative form).
+
+        ``pinned`` is either a COUNT (evenly spaced, exactly like the ``pin``
+        constructor argument) or an explicit iterable of chunk indices; the
+        complement becomes the streamed/offloaded set. Fewer pinned chunks =
+        more offloading = less GPU memory and more PCIe traffic.
+
+        **This is a hard reset.** Master weights move (values intact) and
+        optimizer state follows them, but ALL transient training state is
+        discarded: grad accumulators are zeroed, ``.grad`` is cleared on every
+        moved param, activation packets are dropped and resident GPU weight
+        copies are invalidated. Call it right after
+        ``flush_grads()`` + ``optimizer.step()``; calling it mid-accumulation
+        silently throws the partial gradient away (the returned
+        ``"grads_discarded"`` flag reports when that happened).
+
+        ``optimizers``: the optimizer(s) whose state should follow the moved
+        params (a tier change moves ``p.data`` to another device, which would
+        otherwise leave ``exp_avg`` & co. behind — ``AdamW(fused=True)`` then
+        fails with a device mismatch). The ``nn.Parameter`` objects themselves
+        are preserved, so param groups never need rebuilding.
+
+        Must be called between steps: a pending itinerary or live activation
+        packet raises :class:`RuntimeError` (pass ``force=True`` to recover
+        after an *aborted* step). NVMe-tier chunks cannot be retiered (their
+        masters share one scratch-file layout written at construction).
+
+        Returns a summary dict: ``{"pinned": [...], "unpinned": [...],
+        "bytes_moved": N, "grads_discarded": bool}``.
+        """
+        if isinstance(pinned, bool):
+            raise TypeError("pinned must be a count or an iterable of indices")
+        if isinstance(pinned, int):
+            if pinned < 0:
+                raise ValueError(f"pinned count must be >= 0, got {pinned}")
+            want = evenly_pinned(self.n, min(pinned, self.n))
+        else:
+            want = self._check_chunk_idx(pinned)
+        return self._retier(want - self.pinned_layers,
+                            self.pinned_layers - want,
+                            optimizers=optimizers, force=force)
+
+    def pin_chunks(self, chunks: Union[int, Sequence[int]], *,
+                   optimizers=(), force: bool = False) -> dict:
+        """Pin the given chunk indices on the GPU (stop offloading them).
+
+        Hard reset like :meth:`set_pinned` — see it for the full contract.
+        Already-pinned indices are ignored.
+        """
+        idx = self._check_chunk_idx(chunks)
+        return self._retier(idx - self.pinned_layers, frozenset(),
+                            optimizers=optimizers, force=force)
+
+    def unpin_chunks(self, chunks: Union[int, Sequence[int]], *,
+                     optimizers=(), force: bool = False) -> dict:
+        """Offload the given chunk indices (masters back to CPU pinned RAM).
+
+        The "evict a pinned chunk" operation, and the way to raise the
+        offloaded count. Hard reset like :meth:`set_pinned` — see it for the
+        full contract. Already-streamed indices are ignored.
+        """
+        idx = self._check_chunk_idx(chunks)
+        return self._retier(frozenset(), idx & self.pinned_layers,
+                            optimizers=optimizers, force=force)
+
+    def _check_chunk_idx(self, chunks: Union[int, Sequence[int]]) -> frozenset:
+        """Normalize a chunk-index argument (int or iterable) + range check."""
+        items = [chunks] if isinstance(chunks, int) else list(chunks)
+        if any(isinstance(i, bool) for i in items):
+            raise TypeError("chunk indices must be ints, not bool")
+        idx = frozenset(int(i) for i in items)
+        bad = sorted(i for i in idx if not 0 <= i < self.n)
+        if bad:
+            raise ValueError(f"chunk indices out of range [0, {self.n}): {bad}")
+        return idx
+
+    def _retier(self, to_pin: frozenset, to_unpin: frozenset, *,
+                optimizers=(), force: bool = False) -> dict:
+        """Move chunks between the pinned and streamed tiers (hard reset).
+
+        Quiescence protocol (order matters — the writeback thread also takes
+        ``_cv``, so everything that can block on it happens before the lock):
+        drain writebacks, refuse if a step is in flight, drop activation
+        packets and zero the accumulators, device-synchronize (the masters are
+        live DMA sources), then under ``_cv`` wait out the loader, purge
+        residency, and run the per-chunk tier setters.
+        """
+        to_pin, to_unpin = frozenset(to_pin), frozenset(to_unpin)
+        overlap = to_pin & to_unpin
+        if overlap:
+            raise ValueError(
+                f"chunks {sorted(overlap)} cannot be pinned and unpinned "
+                "in the same call"
+            )
+        moving = to_pin | to_unpin
+        summary = {
+            "pinned": sorted(to_pin),
+            "unpinned": sorted(to_unpin),
+            "bytes_moved": 0,
+            "grads_discarded": False,
+        }
+        if not moving:
+            return summary
+        on_nvme = sorted(moving & self.nvme_layers)
+        if on_nvme:
+            raise ValueError(
+                f"chunks {on_nvme} are on the NVMe tier and cannot be "
+                "retiered: their masters share one scratch-file layout "
+                "written at construction. Rebuild the model to change the "
+                "NVMe placement."
+            )
+        if self._closed:
+            raise RuntimeError("cannot retier a closed OffloadModel")
+        self._check_error()
+
+        # ── 1. quiesce the grad path, then check we are between steps ──────
+        self._wb_drain()
+        self._check_error()
+        with self._cv:
+            pending = len(self._future) - self._fpos
+            busy = self._in_use is not None
+        if not force and (pending > 0 or busy or self._act_store):
+            raise RuntimeError(
+                "retiering must happen between steps: "
+                f"{pending} chunk visit(s) of the announced itinerary are "
+                f"still pending, in_use={self._in_use}, "
+                f"{len(self._act_store)} live activation packet(s). Call it "
+                "after step()/flush_grads() returns; pass force=True to "
+                "recover from an aborted step (its state is discarded)."
+            )
+
+        # ── 2. wipe the transient state (documented hard-reset semantics) ──
+        # NB deliberately does NOT look at .grad: after the normal
+        # flush_grads() + optimizer.step() cycle every .grad is populated but
+        # already consumed, so including it would make the flag always True.
+        # It reports UNFLUSHED accumulation — the state you actually lose.
+        summary["grads_discarded"] = bool(self._act_store) or any(
+            st.acc_touched for st in self._state
+        )
+        for key in list(self._act_store):
+            self._act_discard(key)
+        self._act_in_use = None
+        self.zero_grad_acc()
+        if self._cuda:
+            # the masters are the source/target of in-flight copies and we are
+            # about to free them; retiering is rare, so pay for a full sync
+            torch.cuda.synchronize(self.device)
+
+        # ── 3. relocate under the lock (the loader takes _cv to start) ─────
+        summary["bytes_moved"] = sum(self._state[i].nbytes() for i in moving)
+        with self._cv:
+            while ((self._in_flight is not None
+                    or self._acc_in_flight is not None
+                    or self._acc_evicting) and self._error is None):
+                self._cv.wait()
+            self._check_error()
+            # a stale itinerary (aborted step under force=) would misdirect
+            # the prefetcher after the tiers change
+            del self._future[:]
+            del self._future_kinds[:]
+            self._fpos = 0
+            self._in_use = None
+            self._resident.clear()
+            for st in self._state:
+                st.graph_tensors = None
+            for i in sorted(to_unpin):
+                self._state[i]._become_streamed(self._cuda, self._pin_acc)
+            for i in sorted(to_pin):
+                self._state[i]._become_pinned(self.device)
+            self.pinned_layers = frozenset(
+                (self.pinned_layers | to_pin) - to_unpin
+            )
+            self._cv.notify_all()
+
+        # ── 4. the optimizer's per-param state follows its param ──────────
+        _migrate_opt_state(
+            optimizers,
+            [p for i in sorted(to_pin)
+             for p in self._state[i].module.parameters()],
+            self.device,
+        )
+        _migrate_opt_state(
+            optimizers,
+            [p for i in sorted(to_unpin)
+             for p in self._state[i].module.parameters()],
+            torch.device("cpu"),
+        )
+        self.stats["retiers"] += 1
+        return summary
+
     def zero_grad_acc(self):
         if self.grad_accum == "stream":
             with self._cv:
@@ -1983,6 +2303,7 @@ class OffloadModel(nn.Module):
         for state in self._state:
             for acc in state.grad_acc.values():
                 acc.zero_()
+            state.acc_touched = False
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def close(self):
