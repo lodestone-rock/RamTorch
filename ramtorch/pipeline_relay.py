@@ -41,8 +41,10 @@ topological order, for debugging.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
+import weakref
 from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -58,7 +60,7 @@ from .pipeline import (
     _build_staggered_1b1f_rank_ops,
 )
 
-__all__ = ["run_pipeline_relay", "Pipeline"]
+__all__ = ["run_pipeline_relay", "Pipeline", "InferBatch"]
 
 
 def _normalize_autocast(autocast) -> Optional[torch.dtype]:
@@ -129,8 +131,29 @@ class _Mailbox:
         self._value = value
         self._ready.set()
 
+    def put_from_any_device(self, value):
+        """Like :meth:`put`, but records each CUDA tensor's event on the
+        current stream of THAT TENSOR'S device. Use when the producing thread's
+        current device may differ from the tensor's (e.g. a caller thread
+        submitting inputs it just computed on the last stage's GPU)."""
+        tensors = (
+            [t for t in value if isinstance(t, torch.Tensor)]
+            if isinstance(value, (tuple, list))
+            else [value]
+        )
+        for t in tensors:
+            if t is not None and t.is_cuda:
+                with torch.cuda.device(t.device):
+                    ev = torch.cuda.Event()
+                    ev.record()  # caller's current stream on t's device
+                self._cuda_events.append(ev)
+        self._value = value
+        self._ready.set()
+
     def release(self):
         """Wake any blocked :meth:`get` with no value (used on abort)."""
+        if self._ready.is_set():
+            return  # already delivered — never clobber a real value
         self._value = None
         self._ready.set()
 
@@ -469,6 +492,24 @@ def _run_sequential(
 
 # ── Forward-only (inference) engine ───────────────────────────────────────────
 
+def _infer_forward_one(stage, x):
+    """Run one stage forward for inference.
+
+    ``no_grad`` is entered HERE, on the worker thread: grad mode is
+    thread-local, so the ``@torch.no_grad()`` decorator on ``Pipeline.infer()``
+    (caller thread) does NOT cover worker forwards. ``x`` may be a single
+    tensor or a tuple of tensors (multi-input stage); non-tensor tuple
+    elements pass through untouched.
+    """
+    dev = stage.device
+    with torch.no_grad(), stage._autocast_ctx():
+        if isinstance(x, (tuple, list)):
+            return stage.module(
+                *[t.to(dev) if isinstance(t, torch.Tensor) else t for t in x]
+            )
+        return stage.module(x.to(dev))
+
+
 class _InferWorker(threading.Thread):
     """
     One thread per stage for forward-only pipelined inference.
@@ -505,13 +546,7 @@ class _InferWorker(threading.Thread):
                 if self.abort.is_set():
                     return
                 t0 = self.tracer._ts() if self.tracer else 0.0
-                # ``x`` may be a single tensor or a tuple of tensors (multi-input
-                # stage). Move each to the device and unpack into the module call.
-                with self.stage._autocast_ctx():
-                    if isinstance(x, (tuple, list)):
-                        out = self.stage.module(*[t.to(dev) for t in x])
-                    else:
-                        out = self.stage.module(x.to(dev))
+                out = _infer_forward_one(self.stage, x)
                 if self.tracer:
                     self.tracer.record_cpu(
                         f"F mb{mb}", "fwd", f"stage {s}", t0, self.tracer._ts()
@@ -526,32 +561,16 @@ class _InferWorker(threading.Thread):
             self._on_error(self)
 
 
-def _run_inference(
-    stages: List[Stage],
-    data,
-    *,
-    n_microbatches: int,
-    trace_path: Optional[str],
-    profile_path: Optional[str] = None,
-):
+def _prepare_infer_input(stages, data, n_microbatches):
+    """Normalize an inference input into per-microbatch inputs.
+
+    Shared by the synchronous (:func:`_run_inference`) and streaming
+    (:class:`_InferSession`) paths. Returns ``(mbs, was_prediced, pad_rows)``:
+    ``mbs[mb]`` is the input for microbatch ``mb`` (on the first stage's
+    device), ``was_prediced`` marks nested pre-diced inputs (mirrored in the
+    output), and ``pad_rows`` is how many padding rows were added to reach a
+    multiple of ``n_microbatches`` (0 for pre-diced inputs).
     """
-    Forward-only GPipe-style pipelined inference (no backward, no grad).
-
-    Splits ``data`` into microbatches and relays them through the stages with one
-    worker thread per stage, so stages stay busy on different microbatches
-    concurrently.
-
-    ``data`` accepts the same forms as :meth:`Pipeline.step` (tensor, flat tuple,
-    or nested pre-diced tuple). The OUTPUT mirrors the input shape: a nested
-    pre-diced input yields a nested tuple of per-microbatch outputs (so a
-    downstream consumer can start on microbatch 0 without waiting for the rest);
-    a tensor or flat-tuple input yields a single concatenated tensor (dim 0).
-
-    If the batch size is not divisible by ``n_microbatches``, the input is padded
-    up to the next multiple (by repeating rows) before sharding and the padding is
-    sliced off the output afterward — so any batch size works.
-    """
-    p = len(stages)
     # Detect whether the input was pre-diced (nested) so we can mirror it in the
     # output. _shard_input normalizes all forms into per-microbatch inputs.
     was_prediced = (
@@ -583,6 +602,65 @@ def _run_inference(
             data = type(data)(_pad_to_multiple(e) for e in data)
 
     mbs, _ = _shard_input(data, n_microbatches, stages[0].device)
+    return mbs, was_prediced, pad_rows
+
+
+def _gather_infer_outputs(last_outputs, m, was_prediced, pad_rows):
+    """Assemble the return value of an inference run from per-microbatch
+    last-stage outputs, mirroring the input form (see :func:`_run_inference`)."""
+    if was_prediced:
+        # Mirror the pre-diced input: return per-microbatch outputs as a nested
+        # tuple (independent tensors), so downstream can start on mb0 eagerly.
+        # A stage returning a tuple output yields a per-microbatch tuple here.
+        return tuple(last_outputs[i] for i in range(m))
+
+    def _concat_arg(vals):
+        # Concatenate one output position across microbatches (dim 0), then
+        # slice off any padding rows added for divisibility.
+        out = torch.cat(vals, dim=0)
+        if pad_rows > 0:
+            out = out[: out.shape[0] - pad_rows]
+        return out
+
+    first = last_outputs[0]
+    if isinstance(first, (tuple, list)):
+        # Multi-output stage: concatenate each output arg independently.
+        n_args = len(first)
+        return tuple(
+            _concat_arg([last_outputs[i][j] for i in range(m)])
+            for j in range(n_args)
+        )
+    # Single-tensor output: single concatenated tensor (dim 0).
+    return _concat_arg([last_outputs[i] for i in range(m)])
+
+
+def _run_inference(
+    stages: List[Stage],
+    data,
+    *,
+    n_microbatches: int,
+    trace_path: Optional[str],
+    profile_path: Optional[str] = None,
+):
+    """
+    Forward-only GPipe-style pipelined inference (no backward, no grad).
+
+    Splits ``data`` into microbatches and relays them through the stages with one
+    worker thread per stage, so stages stay busy on different microbatches
+    concurrently.
+
+    ``data`` accepts the same forms as :meth:`Pipeline.step` (tensor, flat tuple,
+    or nested pre-diced tuple). The OUTPUT mirrors the input shape: a nested
+    pre-diced input yields a nested tuple of per-microbatch outputs (so a
+    downstream consumer can start on microbatch 0 without waiting for the rest);
+    a tensor or flat-tuple input yields a single concatenated tensor (dim 0).
+
+    If the batch size is not divisible by ``n_microbatches``, the input is padded
+    up to the next multiple (by repeating rows) before sharding and the padding is
+    sliced off the output afterward — so any batch size works.
+    """
+    p = len(stages)
+    mbs, was_prediced, pad_rows = _prepare_infer_input(stages, data, n_microbatches)
     m = len(mbs)
 
     tracer = PerfettoTracer() if trace_path else None
@@ -642,30 +720,235 @@ def _run_inference(
     if tracer is not None:
         tracer.export(trace_path)
 
-    if was_prediced:
-        # Mirror the pre-diced input: return per-microbatch outputs as a nested
-        # tuple (independent tensors), so downstream can start on mb0 eagerly.
-        # A stage returning a tuple output yields a per-microbatch tuple here.
-        return tuple(last_outputs[i] for i in range(m))
+    return _gather_infer_outputs(last_outputs, m, was_prediced, pad_rows)
 
-    def _concat_arg(vals):
-        # Concatenate one output position across microbatches (dim 0), then
-        # slice off any padding rows added for divisibility.
-        out = torch.cat(vals, dim=0)
-        if pad_rows > 0:
-            out = out[: out.shape[0] - pad_rows]
+
+# ── Asynchronous (streaming) inference ────────────────────────────────────────
+#
+# ``Pipeline.infer()`` is a full barrier: it spawns worker threads, joins them,
+# and synchronizes every device before returning. In an ITERATIVE inference
+# loop (e.g. diffusion denoising, where each microbatch is an independent
+# sample) that barrier drains the pipeline between iterations — every stage
+# idles while the last stage finishes the tail, then the pipeline refills.
+# The streaming engine below keeps ONE persistent worker per stage fed by FIFO
+# queues, so the next iteration's microbatches flow in right behind the
+# previous one's: stage 0 starts iteration k+1's first microbatch the moment it
+# finishes its share of iteration k, and per-microbatch results stream back to
+# the caller (``InferBatch.wait_mb``) as they complete instead of in one batch
+# at the end.
+
+class _AsyncInferWorker(threading.Thread):
+    """
+    One persistent thread per stage for streaming inference.
+
+    Pops ``(handle, mb, mailbox)`` items from its input queue forever (``None``
+    is the shutdown sentinel), runs the stage forward, and hands the output to
+    the next stage's queue inside a FRESH ``_Mailbox`` — so the CUDA-event
+    cross-stream handshake and the put-exactly-once invariant of the
+    synchronous relay are preserved per handoff. The last stage delivers into
+    the owning :class:`InferBatch`'s per-microbatch result mailbox instead.
+    """
+
+    def __init__(self, stage, in_q, out_q, session):
+        super().__init__(
+            daemon=True, name=f"infer-stream-stage-{stage.stage_index}"
+        )
+        self.stage = stage
+        self.in_q = in_q
+        self.out_q = out_q  # None on the last stage
+        self.session = session
+
+    def run(self):
+        dev = self.stage.device
+        try:
+            if dev.type == "cuda":
+                torch.cuda.set_device(dev)
+            while True:
+                item = self.in_q.get()
+                if item is None or self.session.abort.is_set():
+                    return
+                handle, mb, box = item
+                x = box.get()
+                out = _infer_forward_one(self.stage, x)
+                if self.out_q is not None:
+                    next_box = _Mailbox()
+                    next_box.put(out)  # CUDA events on this worker's stream
+                    self.out_q.put((handle, mb, next_box))
+                else:
+                    handle._deliver(mb, out)
+        except BaseException as e:  # noqa: BLE001
+            self.session._fail(e)
+
+
+class _InferSession:
+    """
+    Persistent streaming-inference state for one ``Pipeline``: one worker
+    thread per stage plus the FIFO queues connecting them.
+
+    ``qs[s]`` feeds stage ``s``; stage ``s``'s output goes to ``qs[s+1]`` (or,
+    on the last stage, to the result mailbox of the item's owning handle).
+    FIFO order per queue makes the (batch, microbatch) sequence unambiguous
+    without tagging the tensors themselves, and consecutive submits — even
+    from different iterations of an outer loop — simply concatenate into one
+    continuous op stream per stage. Queues are unbounded: a stage may run
+    ahead exactly as it can within one synchronous ``infer()`` call.
+
+    Offloaded stages are safe here because each stage's worker invokes the
+    engine's ``forward`` SERIALLY (one item at a time), which is the same
+    access pattern as the per-call workers of ``infer()``.
+    """
+
+    def __init__(self, stages: List[Stage]):
+        self.stages = stages
+        self.last_device = stages[-1].device
+        self.abort = threading.Event()
+        self.error: Optional[BaseException] = None
+        self._live: "weakref.WeakSet[InferBatch]" = weakref.WeakSet()
+        self._live_lock = threading.Lock()
+        self._closed = False
+        p = len(stages)
+        self._qs = [queue.Queue() for _ in range(p)]
+        self._workers = [
+            _AsyncInferWorker(
+                stages[s],
+                self._qs[s],
+                self._qs[s + 1] if s + 1 < p else None,
+                self,
+            )
+            for s in range(p)
+        ]
+        for w in self._workers:
+            w.start()
+
+    def _register(self, handle: "InferBatch"):
+        with self._live_lock:
+            self._live.add(handle)
+
+    def _submit(self, handle: "InferBatch", mb: int, value):
+        if self._closed:
+            raise RuntimeError("the streaming inference session is closed")
+        self._raise_if_failed()
+        box = _Mailbox()
+        # The caller's current device may differ from the tensor's (e.g. a
+        # scheduler update computed on the last stage's GPU), so record the
+        # handoff events per tensor device.
+        box.put_from_any_device(value)
+        self._qs[0].put((handle, mb, box))
+
+    def _fail(self, exc: BaseException):
+        if self.error is None:
+            self.error = exc
+        self.abort.set()
+        with self._live_lock:
+            live = list(self._live)
+        for h in live:
+            h._abort()
+
+    def _raise_if_failed(self):
+        if self.error is not None:
+            raise RuntimeError("a streaming inference worker failed") from self.error
+
+    def close(self):
+        """Stop the worker threads (after draining queued work). Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
+        for q in self._qs:
+            q.put(None)
+        for w in self._workers:
+            w.join()
+
+
+class InferBatch:
+    """
+    Handle for one asynchronously-running inference batch.
+
+    Returned by :meth:`Pipeline.infer_submit` (whole batch submitted at once)
+    and :meth:`Pipeline.infer_open` (microbatches trickled in via
+    :meth:`submit_mb`). Results stream back per microbatch:
+
+    * :meth:`wait_mb` blocks until microbatch ``i``'s output is ready and
+      returns it. Outputs complete in microbatch order (the inter-stage
+      queues are FIFO), so waiting in order is never wasteful.
+    * :meth:`result` waits for ALL microbatches and applies
+      :meth:`Pipeline.infer`'s return convention: nested pre-diced input (or
+      an ``infer_open`` batch) -> nested tuple of per-microbatch outputs;
+      tensor / flat-tuple input -> one concatenated tensor (dim 0) with any
+      divisibility padding sliced off.
+
+    The tensors handed to the caller are ordered after the producing worker's
+    stream ON THE LAST STAGE'S DEVICE, so they are safe to consume immediately
+    from the calling thread regardless of its current device.
+    """
+
+    def __init__(self, session, n_microbatches, was_prediced, pad_rows, open_):
+        self._session = session
+        self.n_microbatches = n_microbatches
+        self._was_prediced = was_prediced
+        self._pad_rows = pad_rows
+        self._open = open_
+        self._boxes = [_Mailbox() for _ in range(n_microbatches)]
+        self._submitted = [False] * n_microbatches
+        session._register(self)
+
+    # ── producer side (open batches only) ─────────────────────────────────
+    def submit_mb(self, mb: int, value):
+        """Feed microbatch ``mb``'s input (a tensor, or a tuple unpacked as
+        positional args into the stage-0 module). Stage 0 starts on it as soon
+        as it reaches the front of its queue — it does NOT wait for the rest
+        of the batch."""
+        if not self._open:
+            raise RuntimeError(
+                "submit_mb is only valid on a batch from Pipeline.infer_open()"
+            )
+        if not 0 <= mb < self.n_microbatches:
+            raise IndexError(
+                f"microbatch index {mb} out of range for "
+                f"n_microbatches={self.n_microbatches}"
+            )
+        if self._submitted[mb]:
+            raise RuntimeError(f"microbatch {mb} was already submitted")
+        self._submitted[mb] = True
+        self._session._submit(self, mb, value)
+
+    # ── consumer side ─────────────────────────────────────────────────────
+    def _deliver(self, mb: int, out):
+        self._boxes[mb].put(out)
+
+    def wait_mb(self, mb: int):
+        """Block until microbatch ``mb``'s output is ready and return it."""
+        if not 0 <= mb < self.n_microbatches:
+            raise IndexError(
+                f"microbatch index {mb} out of range for "
+                f"n_microbatches={self.n_microbatches}"
+            )
+        self._session._raise_if_failed()
+        dev = self._session.last_device
+        box = self._boxes[mb]
+        if dev.type == "cuda":
+            # Wait the producer's events on the caller's current stream OF THE
+            # OUTPUT'S DEVICE — the caller's current device may be a different
+            # GPU, and a bare get() would order the wrong stream.
+            with torch.cuda.device(dev):
+                out = box.get()
+        else:
+            out = box.get()
+        if out is None:  # mailbox released by an abort, never a real output
+            self._session._raise_if_failed()
+            raise RuntimeError("streaming inference aborted")
         return out
 
-    first = last_outputs[0]
-    if isinstance(first, (tuple, list)):
-        # Multi-output stage: concatenate each output arg independently.
-        n_args = len(first)
-        return tuple(
-            _concat_arg([last_outputs[i][j] for i in range(m)])
-            for j in range(n_args)
+    def result(self):
+        """Block until every microbatch is done; return the batch output in
+        :meth:`Pipeline.infer`'s shape convention."""
+        outs = [self.wait_mb(i) for i in range(self.n_microbatches)]
+        return _gather_infer_outputs(
+            outs, self.n_microbatches, self._was_prediced, self._pad_rows
         )
-    # Single-tensor output: single concatenated tensor (dim 0).
-    return _concat_arg([last_outputs[i] for i in range(m)])
+
+    def _abort(self):
+        for b in self._boxes:
+            b.release()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -828,6 +1111,9 @@ class Pipeline:
         self.model = model
         self.overlap = overlap
         self.autocast_dtype = _normalize_autocast(autocast)
+        # Persistent streaming-inference session, created lazily by
+        # infer_submit/infer_open/infer_loop and stopped by close().
+        self._infer_sess: Optional[_InferSession] = None
 
         if chunk_modules is not None:
             # ── Flat-chunk convenience: dice into offloaded stages ────────────
@@ -1113,7 +1399,11 @@ class Pipeline:
 
     def close(self):
         """Release stage background resources (offloaded stages' loader and
-        writeback threads). Idempotent; plain stages no-op."""
+        writeback threads) and stop the streaming-inference session's worker
+        threads if one was started. Idempotent; plain stages no-op."""
+        if self._infer_sess is not None:
+            self._infer_sess.close()
+            self._infer_sess = None
         for st in self.stages:
             st.close()
 
@@ -1152,11 +1442,111 @@ class Pipeline:
         ``trace_path`` optionally writes an op-level Chrome-trace (Perfetto) of
         the forward spans so you can see the overlap. ``profile_path`` captures
         a full torch.profiler (kineto) trace of the run.
+
+        Each call is a FULL BARRIER (workers are joined and every device
+        synchronized before returning). For iterative inference loops where
+        microbatches are independent — e.g. diffusion denoising — see
+        :meth:`infer_submit` / :meth:`infer_open` / :meth:`infer_loop`, which
+        keep the pipeline flowing across iterations instead of draining it.
         """
         return _run_inference(
             self.stages, data, n_microbatches=n_microbatches,
             trace_path=trace_path, profile_path=profile_path,
         )
+
+    def _get_infer_session(self) -> _InferSession:
+        """Lazily start (or restart after close) the persistent streaming
+        inference workers."""
+        sess = self._infer_sess
+        if sess is None or sess._closed:
+            sess = self._infer_sess = _InferSession(self.stages)
+        sess._raise_if_failed()
+        return sess
+
+    def infer_submit(self, data, *, n_microbatches: int = 4) -> InferBatch:
+        """
+        Launch a pipelined inference batch WITHOUT waiting for it.
+
+        Same input forms and sharding as :meth:`infer`, but returns
+        immediately with an :class:`InferBatch` handle. The pipeline's
+        persistent stage workers process submitted batches back to back, so
+        submitting the next iteration of an outer loop (e.g. the next
+        denoising step) while the previous one is still draining keeps every
+        stage busy — no per-iteration refill bubble.
+
+        Use ``handle.wait_mb(i)`` to consume microbatch ``i``'s output the
+        moment it completes, or ``handle.result()`` to block for the whole
+        batch (same return convention as :meth:`infer`).
+        """
+        if isinstance(data, (tuple, list)) and not self._manual:
+            raise ValueError(
+                "tuple / nested-tuple pipeline inputs are only supported on the "
+                "manual stage_modules path (the traced PipelineModel path does "
+                "not support them)."
+            )
+        mbs, was_prediced, pad_rows = _prepare_infer_input(
+            self.stages, data, n_microbatches
+        )
+        sess = self._get_infer_session()
+        h = InferBatch(sess, len(mbs), was_prediced, pad_rows, open_=False)
+        for i, mb in enumerate(mbs):
+            sess._submit(h, i, mb)
+        return h
+
+    def infer_open(self, n_microbatches: int) -> InferBatch:
+        """
+        Open an async inference batch whose microbatches are submitted ONE AT
+        A TIME via ``handle.submit_mb(i, value)``.
+
+        This is the fully-streaming form: microbatch ``i`` enters stage 0 the
+        moment it is submitted, so a loop can feed the next iteration's first
+        microbatch while the later stages are still working on the previous
+        iteration's tail. Each submitted value is a tensor or a tuple
+        (unpacked as positional args into the stage-0 module), exactly like
+        one entry of a nested pre-diced :meth:`infer` input. The batch's
+        ``result()`` returns a nested tuple of per-microbatch outputs.
+        """
+        sess = self._get_infer_session()
+        return InferBatch(sess, int(n_microbatches), True, 0, open_=True)
+
+    @torch.no_grad()
+    def infer_loop(
+        self,
+        data,
+        *,
+        steps: int,
+        update_fn: Callable,
+        n_microbatches: int = 4,
+    ):
+        """
+        Run an iterative inference loop (``steps`` rounds) WITHOUT draining
+        the pipeline between rounds.
+
+        ``data`` (any :meth:`infer` input form) is round 0's batch. After
+        that, ``update_fn(output_mb, mb_index, step_index) -> next_input_mb``
+        computes each microbatch's next-round input from its output, on the
+        calling thread, the moment that microbatch finishes — so round t+1's
+        first microbatches enter stage 0 while the later stages are still
+        finishing round t's tail. Returns the final round's output in
+        :meth:`infer`'s shape convention.
+
+        ``update_fn`` must be PER-MICROBATCH independent (true for per-sample
+        denoising schedulers); any cross-microbatch operation is incompatible
+        with the overlap. Keep it cheap: it runs serially on the caller
+        thread, and the pipeline idles while it runs.
+        """
+        if steps < 1:
+            raise ValueError(f"steps must be >= 1, got {steps}")
+        h = self.infer_submit(data, n_microbatches=n_microbatches)
+        m = h.n_microbatches
+        was_prediced, pad_rows = h._was_prediced, h._pad_rows
+        for t in range(steps - 1):
+            nxt = self.infer_open(m)
+            for i in range(m):
+                nxt.submit_mb(i, update_fn(h.wait_mb(i), i, t))
+            h = nxt
+        outs = [h.wait_mb(i) for i in range(m)]
+        return _gather_infer_outputs(outs, m, was_prediced, pad_rows)
 
 
 def _shard_input(data, n_microbatches: int, device):

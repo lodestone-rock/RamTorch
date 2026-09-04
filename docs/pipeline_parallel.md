@@ -540,6 +540,59 @@ To size an inference deployment, `examples/offload_inference_memory.py
 [`set_offload_pinned`](#changing-offload_pin-at-runtime) and reports per-stage
 GPU bytes at rest and at peak plus the latency at each point.
 
+### Streaming inference across loop iterations
+
+`infer()` is a **full barrier**: it joins its worker threads and synchronizes
+every device before returning. In an iterative inference loop where each call
+feeds the next — diffusion denoising is the canonical case — that drains the
+pipeline between iterations: stage 0 idles while the later stages finish the
+tail, then the pipeline refills. The bubble costs ~(p−1) microbatch-forwards
+per iteration on every stage.
+
+When microbatches are **independent** (per-sample denoising: microbatch *i*'s
+next step needs only microbatch *i*'s last output), the streaming API keeps
+one persistent worker per stage and flows the next iteration in right behind
+the previous one — no drain, no refill:
+
+```python
+# Fully automatic: update_fn(out_mb, mb_index, step_index) -> next_input_mb
+# runs per microbatch the moment that microbatch finishes each round.
+x_final = pipe.infer_loop(x0, steps=50, n_microbatches=8,
+                          update_fn=lambda out, i, t: scheduler_step(out, i, t))
+
+# Or drive it by hand with handles:
+h = pipe.infer_submit(x0, n_microbatches=8)       # non-blocking launch
+for t in range(steps - 1):
+    nxt = pipe.infer_open(n_microbatches=8)        # trickle-fed batch
+    for i in range(8):
+        out_i = h.wait_mb(i)                       # block until mb i is done
+        nxt.submit_mb(i, scheduler_step(out_i, i, t))
+    h = nxt
+x_final = h.result()
+```
+
+- `infer_submit(data)` takes the same input forms as `infer()` and returns an
+  `InferBatch` immediately; `wait_mb(i)` streams per-microbatch outputs back
+  (they complete in order — the inter-stage handoffs are FIFO), `result()`
+  blocks for the whole batch and applies `infer()`'s shape convention.
+- `infer_open(m)` + `submit_mb(i, value)` is the fully-streaming form: a
+  microbatch enters stage 0 the instant it's submitted, without waiting for
+  the rest of its batch.
+- **The update must be per-microbatch independent.** Anything batch-global
+  (e.g. normalizing across microbatches) is incompatible with the overlap.
+  Keep `update_fn` cheap: it runs serially on the caller thread and the
+  pipeline idles while it runs.
+- Works with offloaded stages too — each stage's worker drives the engine's
+  streamed forward serially, the same access pattern as `infer()`.
+- `infer()` is unchanged and remains the right call for one-shot batches;
+  the streaming path exists for loops. `Pipeline.close()` stops the
+  persistent workers.
+
+Measured on `examples/pipeline_infer_stream_demo.py` (4 GPUs, 8 denoising
+steps × 8 microbatches, toy per-sample scheduler): ~1.2–1.3× wall-clock over
+barriered `infer()` per loop, bit-identical outputs. The win grows with
+pipeline depth and step count (the bubble is per-iteration).
+
 ---
 
 ## Profiling & debugging
@@ -581,3 +634,5 @@ sequential grad-accum final weights to **0.0** (bit-exact).
 | `pipeline_easy_demo.py` | `PipelineModel` forward + train + eval |
 | `mnist_pipeline_offload.py` | Pipeline + weight streaming end to end: memory/traffic/stall report vs full-resident |
 | `pipeline_offload_check.py` | Offloaded-stage bit-parity vs plain pipeline + sequential ref (schedules × modes × windows × tuples × bf16 × bypass) |
+| `pipeline_infer_stream_demo.py` | Streaming inference in a toy denoising loop: `infer_loop` / handle API vs barriered `infer()` — timing + bit-identity |
+| `pipeline_infer_stream_check.py` | Streaming-inference bit-parity vs sync `infer()` (submit/trickle/overlap/loop × tensor/tuple/nested × resident/offloaded) |

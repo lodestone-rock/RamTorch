@@ -21,6 +21,7 @@ Both are built for **PCIe bandwidth**, not NVLink — which is exactly what a si
 - **Single-Process Pipeline Parallelism**: split a model across GPUs with GPipe / 1F1B / staggered-1B1F schedules — no `torchrun`, no process groups, no NCCL.
 - **Pipeline + weight streaming combined**: a stage passed as a list of chunks streams its weights from CPU RAM through a small GPU window, prefetched in schedule order — for stages that don't fit their GPU.
 - **Mixed precision (`autocast=`)**, **tuple stage outputs**, and a **grad-bypass escape hatch** for custom losses.
+- **Streaming inference for iterative loops** (`infer_loop` / `infer_submit`): persistent stage workers keep the pipeline full across denoising-style iterations instead of draining it between steps — per-microbatch outputs stream back as they complete.
 - **Design simulators**: predict makespan / GPU-utilization / memory *before* you run — `ramtorch.schedule_simulator` (pipeline), `ramtorch.offload_simulator` (streaming), and `ramtorch.pipeline_offload_simulator` (both combined).
 - **ZeRO-1 / ZeRO-2 sharding** and the original per-layer `ramtorch.Linear` are kept for backward compatibility (see [Legacy](#legacy-zero-12--per-layer-ramtorchlinear)).
 
@@ -205,6 +206,7 @@ GPU weight memory per streamed stage ≈ `(window + pin)` chunks. Bit-identical 
 - **Inference batch size**: traced stages specialize to the example microbatch's batch size; `forward()` chunks and pads arbitrary batches (emitting a silence-able `PipelinePaddingWarning`).
 - **Numerics**: microbatch grad accumulation is *mean-of-microbatch-means*, bit-identical to sequential grad accumulation (differs from a single full-batch backward only by normal fp32 reduction-order noise).
 - **Inference-only deployments carry no gradient state**: the per-stage / per-chunk grad accumulators are allocated on the first backward, so `infer()` holds weights and nothing else (`flush_grads()` without a backward therefore leaves `.grad` as `None`).
+- **Iterative inference (diffusion-style loops)**: `infer()` is a full barrier per call. For per-sample recurrences (denoising steps), `pipe.infer_loop(x0, steps, update_fn=...)` — or the manual `infer_submit` / `infer_open` + `submit_mb` / `wait_mb` handles — keeps the pipeline flowing across iterations (~1.2-1.3× on a 4-GPU toy loop, growing with depth/steps). Requires the per-step update to be per-microbatch independent. See [docs/pipeline_parallel.md](docs/pipeline_parallel.md#streaming-inference-across-loop-iterations).
 - **Which pipeline API**: `Pipeline(chunk_modules=[...])` (flat chunk list) is the least code and the recommended default; `PipelineModel` (traced auto-split) is convenient for simple models; `Pipeline(stage_modules=...)` gives full manual stage control for exotic architectures.
 
 ---
