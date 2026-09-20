@@ -32,6 +32,7 @@ an incidental dependency. Legacy ZeRO utilities are separate and still supported
   banks, bounded admission, and optional CPU optimizer masters/state.
 - `ramtorch/pipeline_2bw_trace.py`: bounded Kineto traces and worker annotations.
 - `ramtorch/delayed_optim.py`: AdamEF/Lion/Muon and update-level error feedback.
+  `dion3.py` adds local Dion3; `_dion3_triton.py` is its optional attributed kernel port.
 - `ramtorch/offload.py`, `pipeline_offload.py`, `nvme_store.py`: streaming engines
   and backing storage. `pipeline_optimizer.py` provides parallel per-stage
   optimizer updates for synchronous pipelines.
@@ -97,6 +98,8 @@ paths, remote-machine credentials, or external-repository symlinks.
   Advance moments once, save the uncorrected update including its LR/decay, and
   preserve startup/missing-gradient/serialization semantics in `delayed_optim.py`.
   Optimizer `state_dict()` support is not a full 2BW-session checkpoint API.
+  Dion3's compression residual is separate from this optional update-level EF;
+  preserve upstream kernel attribution and keep Triton optional.
 
 ## Validation workflow
 
@@ -114,7 +117,8 @@ PYTHONPATH=. python examples/pipedream_2bw_optimizer_check.py --devices cpu,cpu 
 CUDA_VISIBLE_DEVICES= PYTHONPATH=. python examples/pipeline_infer_stream_check.py
 CUDA_VISIBLE_DEVICES= PYTHONPATH=. python examples/pipeline_infer_close_check.py
 
-# On an explicitly available two-GPU machine:
+# On an explicitly available two-GPU machine, probe transport before training:
+PYTHONPATH=. python examples/gpu_transport_check.py --devices 0,1
 PYTHONPATH=. python examples/pipedream_2bw_check.py --devices cuda:0,cuda:1
 PYTHONPATH=. python examples/pipedream_2bw_optimizer_check.py --devices cuda:0,cuda:1 --bf16
 
@@ -139,7 +143,7 @@ gradient accumulation, and simulators. NVMe checks require special care above.
   Host spans and simulator predictions are not measured GPU utilization.
 - For convergence, use matched initialization/data/hyperparameters and distinguish
   fresh from delayed gradients. `examples/mnist_pipedream_2bw.py` provides Adam/
-  Lion/Muon controls and EF with a short separate profiler replay. Do not claim EF
+  Lion/Muon/Dion3 controls and EF with a short separate profiler replay. Do not claim EF
   universally improves quality from one seed or select recipes on the test set.
 
 ## Change and handoff conventions

@@ -2,8 +2,8 @@ r"""MNIST convergence: synchronous 1F1B, delayed 2BW, and update-level EF.
 
     python examples/mnist_pipedream_2bw.py --devices cuda:0,cuda:1,cuda:2,cuda:3
 
-Defaults: Adam, Lion and Muon, five epochs, identical initial weights and batch order
-within each seed. Use --seeds 0,1,2 for repeated runs, --bf16 for autocast, or
+Defaults: Adam, Lion, Muon and Dion3, five epochs, identical initial weights and
+batch order within each seed. Use --seeds 0,1,2 for repeated runs, --bf16 for autocast, or
 --devices cpu,cpu --epochs 1 --train-limit 512 for a small CPU smoke run.
 
 Only a SEPARATE fresh-model replay is profiled: --profile-warmup updates then
@@ -11,12 +11,18 @@ Only a SEPARATE fresh-model replay is profiled: --profile-warmup updates then
 run during convergence training. The replay does not change convergence weights,
 optimizer counters, data order, or timings. Traces are gzip-compressed.
 
-Adam here means Adam with coupled L2 decay, NOT AdamW. Both plain and EF variants
-use AdamEF with c=0/c=1, so correction is the only implementation difference.
-Lion uses decoupled decay. Muon uses hidden block matrices only, with AdamW
-fallback for the stem, head and biases. Its Newton-Schulz computation defaults
-to FP32 independently of model autocast. Default decay is zero for all. This is
-a toy comparison, not a reproduction of the LLM recipe or evidence EF must win.
+Adam here means Adam with coupled L2 decay, NOT AdamW; select --optimizers adamw
+for decoupled decay. Both plain and EF variants use AdamEF with c=0/c=1, so
+correction is the only implementation difference. --adam-triton opts Adam/AdamW
+into fused CUDA updates; --lion-triton does the same for Lion. Both default to
+eager updates, require CUDA when selected, and work with or without EF.
+Lion uses decoupled decay. Muon and Dion3 use hidden block matrices only, with
+AdamW fallback for the stem, head and biases. Orthogonalization is independent
+of model autocast: Muon defaults to FP32; Dion3 (upstream NorDion2 alias) defaults
+to BF16 Polar Express, with optional --dion3-triton on CUDA. Dion3's compression
+error feedback is always active and is distinct from optional update-level EF.
+Default decay is zero for all. This is a toy comparison, not a reproduction of
+the LLM recipe or evidence EF must win.
 """
 from __future__ import annotations
 
@@ -47,7 +53,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ramtorch import Pipeline, AdamEF, Lion, Muon
+from ramtorch import Pipeline, AdamEF, Lion, Muon, Dion3
 from ramtorch.pipeline_2bw_trace import TraceCapture, inspect_trace
 
 MODES = ("sync", "2bw", "2bw_ef")
@@ -63,8 +69,8 @@ def positive(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--devices", default="cuda:0,cuda:1")
-    parser.add_argument("--optimizers", nargs="+", choices=("adam", "lion", "muon"),
-                        default=["adam", "lion", "muon"])
+    parser.add_argument("--optimizers", nargs="+", choices=("adam", "adamw", "lion", "muon", "dion3"),
+                        default=["adam", "lion", "muon", "dion3"])
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--seeds", default="0", help="comma-separated model/data seeds")
     parser.add_argument("--epochs", type=positive, default=5)
@@ -74,9 +80,15 @@ def parse_args(argv=None):
     parser.add_argument("--microbatches", type=positive, default=4)
     parser.add_argument("--eval-batch-size", type=positive, default=512)
     parser.add_argument("--adam-lr", type=float, default=1e-3)
+    parser.add_argument("--adamw-lr", type=float, default=1e-3)
     parser.add_argument("--lion-lr", type=float, default=1e-4)
     parser.add_argument("--adam-weight-decay", type=float, default=0.)
+    parser.add_argument("--adamw-weight-decay", type=float, default=0.)
     parser.add_argument("--lion-weight-decay", type=float, default=0.)
+    parser.add_argument("--adam-triton", action="store_true",
+                        help="use fused CUDA Triton updates for selected adam/adamw variants, with or without EF")
+    parser.add_argument("--lion-triton", action="store_true",
+                        help="use fused CUDA Triton updates for selected lion variants, with or without EF")
     parser.add_argument("--muon-lr", type=float, default=.02)
     parser.add_argument("--muon-adamw-lr", type=float, default=1e-3,
                         help="Muon fallback LR for stem/head/biases")
@@ -84,6 +96,17 @@ def parse_args(argv=None):
     parser.add_argument("--muon-momentum", type=float, default=.95)
     parser.add_argument("--muon-ns-steps", type=positive, default=5)
     parser.add_argument("--muon-ns-dtype", choices=("float32", "bfloat16"), default="float32")
+    parser.add_argument("--dion3-lr", type=float, default=.01)
+    parser.add_argument("--dion3-adamw-lr", type=float, default=1e-3,
+                        help="Dion3 fallback LR for stem/head/biases")
+    parser.add_argument("--dion3-fraction", type=float, default=.25)
+    parser.add_argument("--dion3-mu", type=float, default=.95)
+    parser.add_argument("--dion3-beta2", type=float, default=.95,
+                        help="Dion3 selected-row variance EMA coefficient")
+    parser.add_argument("--dion3-weight-decay", type=float, default=0.)
+    parser.add_argument("--dion3-ns-dtype", choices=("float32", "bfloat16"), default="bfloat16")
+    parser.add_argument("--dion3-triton", action="store_true",
+                        help="use vendored Dion3 Triton kernels (CUDA, BF16 orthogonalization only)")
     parser.add_argument("--ef-coefficient", type=float, default=1.)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--cpu-threads", type=positive, default=4)
@@ -109,7 +132,7 @@ def parse_args(argv=None):
             parser.error("use distinct indexed CUDA devices")
         if not torch.cuda.is_available() or any(d.index >= torch.cuda.device_count() for d in devices):
             parser.error("requested CUDA devices are unavailable")
-        if args.bf16:
+        if args.bf16 or ("dion3" in args.optimizers and args.dion3_ns_dtype == "bfloat16"):
             for device in devices:
                 with torch.cuda.device(device):
                     if not torch.cuda.is_bf16_supported():
@@ -120,10 +143,20 @@ def parse_args(argv=None):
         parser.error("microbatches must be >= stages and divide batch-size")
     if args.profile_steps < 0 or args.validation_size >= 60000:
         parser.error("profile-steps must be >=0 and validation-size <60000")
-    if not math.isfinite(args.muon_momentum) or not 0 <= args.muon_momentum < 1:
-        parser.error("muon-momentum must be finite and in [0,1)")
-    for key in ("adam_lr", "lion_lr", "adam_weight_decay", "lion_weight_decay", "ef_coefficient",
-                "muon_lr", "muon_adamw_lr", "muon_weight_decay"):
+    for key in ("muon_momentum", "dion3_mu", "dion3_beta2"):
+        if not math.isfinite(getattr(args, key)) or not 0 <= getattr(args, key) < 1:
+            parser.error(key.replace("_", "-") + " must be finite and in [0,1)")
+    if not math.isfinite(args.dion3_fraction) or not 0 < args.dion3_fraction <= 1:
+        parser.error("dion3-fraction must be finite and in (0,1]")
+    if args.dion3_triton and (devices[0].type != "cuda" or args.dion3_ns_dtype != "bfloat16"):
+        parser.error("dion3-triton requires CUDA devices and dion3-ns-dtype=bfloat16")
+    if devices[0].type != "cuda":
+        for flag in ("adam_triton", "lion_triton"):
+            if getattr(args, flag):
+                parser.error(flag.replace("_", "-") + " requires CUDA devices")
+    for key in ("adam_lr", "adamw_lr", "lion_lr", "adam_weight_decay", "adamw_weight_decay",
+                "lion_weight_decay", "ef_coefficient", "muon_lr", "muon_adamw_lr",
+                "muon_weight_decay", "dion3_lr", "dion3_adamw_lr", "dion3_weight_decay"):
         if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0:
             parser.error(key + " must be finite and nonnegative")
     if len(set(args.modes)) != len(args.modes) or len(set(args.optimizers)) != len(args.optimizers):
@@ -157,28 +190,42 @@ def make_pipe(args, devices, seed):
 
 def factory_for(args, name, mode, stage=None):
     coefficient = args.ef_coefficient if mode == "2bw_ef" else 0.
-    if name == "adam":
-        return functools.partial(AdamEF, lr=args.adam_lr, weight_decay=args.adam_weight_decay,
-                                 betas=(.9, .999), ef_coefficient=coefficient)
+    if name in ("adam", "adamw"):
+        return functools.partial(AdamEF, lr=getattr(args, name + "_lr"),
+                                 weight_decay=getattr(args, name + "_weight_decay"),
+                                 betas=(.9, .999), ef_coefficient=coefficient,
+                                 decoupled_weight_decay=name == "adamw", use_triton=args.adam_triton)
     if name == "lion":
         return functools.partial(Lion, lr=args.lion_lr, weight_decay=args.lion_weight_decay,
-                                 betas=(.9, .99), ef_coefficient=coefficient)
-    if name != "muon" or stage is None:
-        raise ValueError("Muon factory needs its stage's named parameter partition")
+                                 betas=(.9, .99), ef_coefficient=coefficient, use_triton=args.lion_triton)
+    if name not in ("muon", "dion3") or stage is None:
+        raise ValueError("Muon/Dion3 factory needs its stage's named parameter partition")
     # Persist a POSITIONAL role list, not Parameter references. A CPU-optimizer
     # factory may receive new master Parameters in this same named order.
-    use_muon = [key.startswith("block") and parameter.ndim == 2
-                for key, parameter in stage.module.named_parameters()]
+    use_matrix = [key.startswith("block") and parameter.ndim == 2
+                  for key, parameter in stage.module.named_parameters()]
 
     def build(parameters):
         parameters = list(parameters)
-        if len(parameters) != len(use_muon):
+        if len(parameters) != len(use_matrix):
             raise ValueError("stage factory parameter order/size changed")
         groups = []
-        for role, lr in ((True, args.muon_lr), (False, args.muon_adamw_lr)):
-            selected = [p for p, flag in zip(parameters, use_muon) if flag == role]
+        for role, lr in ((True, getattr(args, name + "_lr")),
+                         (False, getattr(args, name + "_adamw_lr"))):
+            selected = [p for p, flag in zip(parameters, use_matrix) if flag == role]
             if selected:
-                groups.append(dict(params=selected, use_muon=role, lr=lr))
+                group = dict(params=selected, lr=lr)
+                if name == "muon":
+                    group["use_muon"] = role
+                else:
+                    group["algorithm"] = "dion3" if role else "adamw"
+                groups.append(group)
+        if name == "dion3":
+            return Dion3(groups, lr=args.dion3_lr, fraction=args.dion3_fraction,
+                         mu=args.dion3_mu, muon_beta2=args.dion3_beta2, betas=(.9, .95),
+                         weight_decay=args.dion3_weight_decay, epsilon=1e-8,
+                         adjust_lr="spectral_norm", ef_coefficient=coefficient,
+                         ns_dtype=getattr(torch, args.dion3_ns_dtype), use_triton=args.dion3_triton)
         return Muon(groups, momentum=args.muon_momentum, nesterov=True,
                     ns_steps=args.muon_ns_steps, ns_dtype=getattr(torch, args.muon_ns_dtype),
                     adjust_lr_fn="original", weight_decay=args.muon_weight_decay,
@@ -295,13 +342,23 @@ def evaluate(pipe, evaluation, dataset, ids, args, device):
 
 
 def state_bytes(optimizers):
-    result = {"optimizer_tensor_bytes": 0, "ef_history_bytes": 0}
-    for optimizer in optimizers:
+    result = {"optimizer_tensor_bytes": 0, "ef_history_bytes": 0,
+              "optimizer_tensor_bytes_by_state": {}, "optimizer_groups": []}
+    for stage, optimizer in enumerate(optimizers):
+        for group in optimizer.param_groups:
+            options = {key: str(value) if isinstance(value, torch.dtype) else value
+                       for key, value in group.items() if key != "params"}
+            result["optimizer_groups"].append(dict(
+                stage=stage, optimizer=type(optimizer).__name__, options=options,
+                parameter_tensors=len(group["params"]),
+                parameter_elements=sum(p.numel() for p in group["params"])))
         for state in optimizer.state.values():
             for name, value in state.items():
                 if isinstance(value, torch.Tensor):
                     size = value.numel() * value.element_size()
                     result["optimizer_tensor_bytes"] += size
+                    by_state = result["optimizer_tensor_bytes_by_state"]
+                    by_state[name] = by_state.get(name, 0) + size
                     if name == "previous_update":
                         result["ef_history_bytes"] += size
     return result
@@ -362,6 +419,10 @@ def train_variant(args, devices, seed, optimizer_name, mode, data):
                                                 for group in optimizer.param_groups
                                                 if group.get("use_muon", False)
                                                 for p in group["params"])),
+                    dion3_parameter_elements=(sum(p.numel() for optimizer in optimizers
+                                                 for group in optimizer.param_groups
+                                                 if group.get("algorithm") == "dion3"
+                                                 for p in group["params"])),
                     **state_bytes(optimizers))
     finally:
         if trainer is not None:
@@ -471,9 +532,17 @@ def main(argv=None):
                                "muon_partition": "hidden block 2D weights: Muon; stem/head/all biases: AdamW; EF applies to both groups",
                                "muon_convention": "B=momentum*B+g; Nesterov g+momentum*B; quintic NS; original shape scaling; unscaled LR for decay",
                                "muon_ns_dtype": args.muon_ns_dtype,
+                               "dion3_partition": "hidden block 2D weights: Dion3; stem/head/all biases: AdamW; update-level EF applies to both groups",
+                               "dion3_convention": "upstream NorDion2 alias, not original Dion; M+=g; L1 top ceil(fraction*rows); selected residual*=mu; five-iteration Polar Express; selected-row variance EMA; norm-preserving rescale; spectral sqrt(rows/cols) without max clamp",
+                               "dion3_ns_dtype": args.dion3_ns_dtype,
+                               "dion3_use_triton": args.dion3_triton,
+                               "dion3_fallback_betas": [.9, .95], "dion3_epsilon": 1e-8,
+                               "dion3_compression_EF": "always active, independent of optional complete-update EF",
+                               "dion3_state": "full momentum plus rows-by-1 variance for initialized matrix parameters; AdamW has two full moments and step; optional previous_update is full-sized in both groups",
+                               "state_accounting": "actual persistent tensor bytes by state key; excludes transient updates, allocator overhead, gradients and evaluation replica",
                                "profile_seeds": seeds[:1], "epoch_boundary_drains": True,
                                "evaluation_weights": "latest trajectory; separate replica",
-                               "training_timing": "includes loading, transfers, updates and epoch drain; excludes evaluation, construction and profiling",
+                               "training_timing": "includes loading, transfers, updates, epoch drain and any cold kernel JIT/autotuning; excludes evaluation, construction and profiling; mode totals are not a clean speed comparison",
                                "EF": "first completed update ordinary; then x <- x-u-c*(u-u_prev); full uncorrected update stored, moments advanced once",
                                "checkpoint_scope": "optimizer state_dict supported; no full 2BW session checkpoint API",
                                "caveat": "toy convergence example, no claim EF helps all optimizers or reproduces LLM results"},

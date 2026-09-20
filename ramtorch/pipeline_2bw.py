@@ -2,7 +2,7 @@
 
 This is deliberately separate from the flush-per-batch Pipeline.step executor.
 Only deterministic, buffer-free resident modules and the explicit optimizer
-allowlist (torch.optim.SGD/Adam/AdamW and ramtorch.AdamEF/Lion/Muon) are supported.
+allowlist (torch.optim.SGD/Adam/AdamW and ramtorch.AdamEF/Lion/Muon/Dion3) are supported.
 Optimizer masters/state can optionally live and update on CPU; both compute
 weight banks and all forward/backward work remain on their stage devices.
 """
@@ -19,6 +19,7 @@ import torch
 from torch import nn
 
 from .delayed_optim import AdamEF, Lion, Muon
+from .dion3 import Dion3
 
 __all__ = ["PipeDream2BWTrainer"]
 
@@ -91,8 +92,8 @@ class _VersionedStage:
                 self.optimizer_named[name] = nn.Parameter(master, requires_grad=parameter.requires_grad)
         self.optimizer = optimizer_factory(list(self.optimizer_named.values()))
         if type(self.optimizer) not in (torch.optim.SGD, torch.optim.Adam,
-                                       torch.optim.AdamW, AdamEF, Lion, Muon):
-            raise ValueError("2BW supports only torch.optim.SGD/Adam/AdamW and ramtorch.AdamEF/Lion/Muon")
+                                       torch.optim.AdamW, AdamEF, Lion, Muon, Dion3):
+            raise ValueError("2BW supports only torch.optim.SGD/Adam/AdamW and ramtorch.AdamEF/Lion/Muon/Dion3")
         actual = [p for group in self.optimizer.param_groups for p in group["params"]]
         if len(actual) != len(self.optimizer_named) or {id(p) for p in actual} != {
             id(p) for p in self.optimizer_named.values()
@@ -295,8 +296,8 @@ class PipeDream2BWTrainer:
     External mutation of module parameters/optimizers during ownership is forbidden.
     With ``optimizer_device='cpu'`` the factory owns separate CPU masters and
     updates them on CPU; compute banks remain resident. Factories must return
-    exactly torch.optim.SGD/Adam/AdamW or ramtorch.AdamEF/Lion/Muon (not subclasses).
-    AdamEF/Lion/Muon require FP32/FP64 optimizer parameters and keep update history
+    exactly torch.optim.SGD/Adam/AdamW or ramtorch.AdamEF/Lion/Muon/Dion3 (not subclasses).
+    AdamEF/Lion/Muon/Dion3 require FP32/FP64 optimizer parameters and keep update history
     attached to stable Parameter identities across bank switches. Native fused
     AdamW remains available, e.g. ``torch.optim.AdamW(params, fused=True)``.
     CPU thread settings belong to the application, not this trainer.

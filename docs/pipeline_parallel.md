@@ -430,7 +430,7 @@ pipe.close()
 ```
 
 - `optimizer_factory(params)` must create a fresh **standard `torch.optim.SGD`,
-  `torch.optim.Adam`, `torch.optim.AdamW`, or RamTorch `AdamEF`/`Lion`/`Muon`**, owning
+  `torch.optim.Adam`, `torch.optim.AdamW`, or RamTorch `AdamEF`/`Lion`/`Muon`/`Dion3`**, owning
   exactly those stage parameters. Pass one
   factory for all stages or a list of one factory per stage. For example, use
   `lambda params: torch.optim.SGD(params, lr=0.01, momentum=0.9, foreach=False,
@@ -571,8 +571,10 @@ the former uses fresh gradients, the latter one-update-delayed gradients.
 
 ### MNIST convergence and update-level error feedback
 
-`examples/mnist_pipedream_2bw.py` compares **Adam, Lion, and Muon**, each with
-synchronous `staggered_1b1f`, ordinary delayed 2BW, and delayed 2BW + EF:
+`examples/mnist_pipedream_2bw.py` compares **Adam, Lion, Muon, and Dion3** by
+default, each with synchronous `staggered_1b1f`, ordinary delayed 2BW, and
+delayed 2BW + update-level EF. **AdamW** is also available as an explicit
+`--optimizers adamw` selection, without changing that default set:
 
 ```bash
 python examples/mnist_pipedream_2bw.py \
@@ -599,8 +601,9 @@ uses a separate latest-weight replica after a drain, without resetting the 2BW
 history. No clipping or LR schedule is used; this is not a reproduction of the
 paper's LLM recipes. A single seed is a demo, not statistical evidence EF helps.
 
-`ramtorch.AdamEF`, `ramtorch.Lion`, and `ramtorch.Muon` implement **update-level**, not raw-gradient,
-error feedback. For the complete uncorrected optimizer update `u`, they apply
+`ramtorch.AdamEF`, `ramtorch.Lion`, `ramtorch.Muon`, and `ramtorch.Dion3`
+implement **update-level**, not raw-gradient, error feedback. For the complete
+uncorrected optimizer update `u`, they apply
 `x <- x - u - c * (u - previous_update)`. The first completed optimizer call uses
 an ordinary update; correction begins on the second. This maps the paper's
 initial no-op and bootstrap onto the runtime's count of actual updates: no extra
@@ -608,8 +611,11 @@ no-op is inserted into the 2BW schedule. Each gradient advances moments exactly
 once. The saved buffer holds the **uncorrected update**, not the corrected
 parameter displacement or a subtraction of rounded before/after weights.
 
-All three accept `ef_coefficient` (`AdamEF` defaults to 1, `Lion`/`Muon` to 0).
-The example uses the same class with `c=0` for plain controls and `c=1` for EF.
+All four accept `ef_coefficient` (`AdamEF` defaults to 1, `Lion`/`Muon`/`Dion3`
+to 0). The example uses the same class with `c=0` for plain controls and `c=1`
+for EF (override with `--ef-coefficient`). Dion3's compression error feedback
+remains active in every mode; it is distinct from this optional update-level
+correction.
 `AdamEF` defaults to coupled L2 decay, i.e. **Adam, not AdamW**; setting
 `decoupled_weight_decay=True` gives AdamW-style decay. Lion uses decoupled decay.
 Decoupled decay is computed at the current/latest weights and included in `u`.
@@ -622,12 +628,144 @@ EF adds **one persistent parameter-sized history tensor** when `c>0`; `c=0`
 allocates none. Thus relative to ordinary synchronous training, 2BW+EF adds one
 compute-weight bank and one update-history state, besides existing moments,
 gradients, activation storage and transient update tensors. `metrics.json`
-reports logical state bytes rather than implying a peak-memory benchmark.
+reports actual logical tensor bytes by state key and effective per-stage
+optimizer-group options, including matrix/fallback parameter counts, rather
+than implying a peak-memory benchmark. CLI metadata records precision and
+Triton flags as well as optimizer hyperparameters.
 The new optimizers accept dense real FP32/FP64 parameters; mixed precision here
-means BF16 autocast, not BF16 optimizer parameters. They do not integrate fused,
-capturable or GradScaler skip semantics. Optimizer `state_dict()` restoration
-includes history and startup counters; this is **not** a full 2BW-session
-checkpoint API (which would also need both weight banks and version metadata).
+means BF16 autocast, not BF16 optimizer parameters. They do not integrate native
+PyTorch `fused=True`/`foreach`, capturable execution, or GradScaler skip semantics;
+the optional Triton backend below is a separate implementation. Optimizer
+`state_dict()` restoration includes history and startup counters; this is **not**
+a full 2BW-session checkpoint API (which would also need both weight banks and
+version metadata).
+
+#### Optional Triton Adam/AdamW and Lion
+
+`AdamEF(..., use_triton=True)` and `Lion(..., use_triton=True)` opt into fused
+CUDA updates. The default is **`use_triton=False`**, retaining the eager CPU/CUDA
+path; Triton is imported only when requested, not required for core imports.
+`AdamEF` supports both coupled Adam and decoupled AdamW with either backend.
+This does not change the legacy `ramtorch.AdamW` optimizer or the native
+`torch.optim.AdamW` CPU-fused recipe above.
+
+Choose one of these alternatives for ordinary contiguous CUDA FP32/FP64 model
+parameters (or use the same constructor inside each stage's optimizer factory):
+
+```python
+from ramtorch import AdamEF, Lion
+
+adamw = AdamEF(model.parameters(), lr=0.001, betas=(0.9, 0.999),
+               weight_decay=0.0, decoupled_weight_decay=True,
+               ef_coefficient=0.0, use_triton=True)
+adamw_ef = AdamEF(model.parameters(), lr=0.001, betas=(0.9, 0.999),
+                  weight_decay=0.0, decoupled_weight_decay=True,
+                  ef_coefficient=1.0, use_triton=True)
+lion = Lion(model.parameters(), lr=0.0001, betas=(0.9, 0.99),
+            weight_decay=0.0, ef_coefficient=0.0, use_triton=True)
+lion_ef = Lion(model.parameters(), lr=0.0001, betas=(0.9, 0.99),
+               weight_decay=0.0, ef_coefficient=1.0, use_triton=True)
+```
+
+Set `decoupled_weight_decay=False` (the default) for coupled Adam instead.
+Backend choice does not change EF: the first logical call is ordinary, moments
+advance once, history stores the complete uncorrected update including its LR
+and decay, and missing/frozen parameters zero existing history without advancing
+moments. Explicit zero gradients still update normally.
+
+The Triton path has deliberately narrow requirements:
+
+- Parameters, gradients, and tensor state must be ordinary **contiguous CUDA
+  FP32/FP64 tensors**, with state and gradients matching their parameter's dtype
+  and device. CPU, sparse/complex, noncontiguous, tensor-subclass/distributed, and
+  low-precision optimizer tensors are unsupported; invalid inputs fail rather
+  than silently switching to eager or CPU updates. A missing Triton installation
+  also fails explicitly when this backend is requested.
+- BF16 **model autocast with FP32 optimizer tensors** is compatible. Native
+  `fused=True`/`foreach`, GradScaler integration, capturable/differentiable
+  optimizer steps, and `optimizer_device="cpu"` are not supported by this path.
+  Keep `use_triton=False` for CPU optimizer placement.
+- One kernel per active parameter tensor fuses moment updates, optimizer math,
+  decay, parameter application, and optional EF-history storage. It creates no
+  full-sized update temporary. Persistent state remains two Adam moments or one
+  Lion momentum, plus exactly one `previous_update` when `c>0`; zero EF adds no
+  extra persistent tensor. Gradients, compute banks, and allocator overhead are
+  separate costs, not a peak-memory claim.
+- Cold JIT compilation is protected by a startup lock. Warmed kernel launches
+  have no steady-state global lock or added device synchronization; these kernels
+  do not autotune. The first convergence variant can pay compilation costs, so
+  MNIST mode totals are not a clean eager-versus-Triton speed comparison. Profile
+  a separate warmed replay and measure clean timings before claiming speedups.
+- Fusion can change rounding order. Compare eager versus Triton with arithmetic
+  tolerances, **not bitwise parity**; selecting Triton is not evidence of a
+  convergence improvement.
+
+The backend boolean is saved as `use_triton` in each optimizer parameter group.
+Pre-existing AdamEF/Lion checkpoints without this key load with
+**`use_triton=False`**, even if the destination constructor requested Triton.
+To select a different backend after loading, explicitly set
+`group["use_triton"] = True` (or `False`) in the desired `optimizer.param_groups`;
+all tensors must satisfy that backend's requirements. Moments, update history,
+and startup counters retain their existing checkpoint semantics. This remains
+an optimizer checkpoint, not a complete 2BW-session checkpoint.
+
+The MNIST switches are `--adam-triton` for selected `adam` **and** `adamw`
+variants, and `--lion-triton` for selected `lion` variants; both are off by
+default. They apply to `sync`, `2bw`, and `2bw_ef`, and a requested Triton flag
+with CPU devices is rejected before training. They do not alter Muon/Dion3
+fallback groups or the separate `--dion3-triton` option. AdamW has its own
+`--adamw-lr` (default **0.001**) and `--adamw-weight-decay` (default **0**), with
+`betas=(0.9, 0.999)`; coupled Adam retains its existing `--adam-*` hyperparameters.
+`metrics.json` records requested flags and the effective per-stage optimizer
+group options, including `use_triton`, decay convention, and EF coefficient.
+
+For plain versus EF with the same Triton backend, use the existing modes:
+
+```bash
+PYTHONPATH=. python examples/mnist_pipedream_2bw.py \
+  --devices cuda:0,cuda:1 --optimizers adamw lion --modes sync 2bw 2bw_ef \
+  --adam-triton --lion-triton --bf16 \
+  --output-dir scratchpad/pipedream_2bw/runs/mnist_adamw_lion_triton
+```
+
+`sync` and `2bw` use `ef_coefficient=0`; `2bw_ef` uses
+`--ef-coefficient` (default 1). Choose `--modes 2bw` or `--modes 2bw_ef` to run
+just one, or omit the Triton flags for the eager backend. Add `adam` to
+`--optimizers` to include coupled Adam. The commands here are runnable recipes,
+not measurements or claims that Triton or EF improves convergence.
+
+Focused CUDA checks (run only on explicitly available GPUs):
+
+```bash
+PYTHONPATH=. python examples/triton_optimizer_check.py --device cuda:0
+PYTHONPATH=. python examples/pipedream_2bw_optimizer_check.py \
+  --devices cuda:0,cuda:1 --optimizers adamw lion --triton --bf16
+```
+
+CPU checks cannot validate the CUDA kernels or real multi-GPU overlap. The
+historical Adam/Lion/Muon results below are not Triton-backend measurements.
+
+Validation on four RTX PRO 4000 Blackwell GPUs with PyTorch 2.8.0 / CUDA 12.8:
+
+- `examples/gpu_transport_check.py --devices 0,1,2,3`: all 576 blocking/event-ordered
+  transfer comparisons passed across all 12 directed pairs.
+- `examples/triton_optimizer_check.py --device cuda:0`: Adam, AdamW, and Lion
+  FP32/FP64 scalar/eager/native checks passed with EF 0, 0.35, and 1, including
+  changing LR/decay, skipped/frozen/late gradients, exact resume/storage rebinding,
+  autocast isolation, and strict backend validation. The CPU version passed too.
+- `examples/pipedream_2bw_optimizer_check.py --devices cuda:0,cuda:1,cuda:2,cuda:3
+  --optimizers adam adamw lion --bf16 --triton --pipeline-only`: weights, gradients,
+  and optimizer state were byte-exact against the same-backend delayed reference
+  at every update, including split continuation. CUDA placements used Triton;
+  CPU-master placements explicitly used eager updates. Both plain and EF passed.
+- A **smoke test, not a convergence comparison**, used the MNIST command above
+  with four devices, `--epochs 1 --train-limit 2048 --dim 64 --blocks 4
+  --batch-size 256 --microbatches 4 --profile-warmup 3 --profile-steps 3`.
+  All six variants completed. Each three-update gzip profile contained 60 real
+  `_update_kernel` CUDA launches distributed across all four GPUs, matching one
+  launch per active parameter per update. Artifacts are generated locally under
+  `scratchpad/pipedream_2bw/runs/adamw_lion_triton_smoke/`, including
+  `mnist_convergence_bundle.zip`; they are not shipped with the package.
 
 #### Muon parameter roles and numerical conventions
 
@@ -711,7 +849,144 @@ The independent optimizer check also covers Muon Float64 matrix equations,
 explicit AdamW fallback, FP32/FP64/BF16 NS autocast isolation, state budgets,
 serialization and bit-exact delayed pipeline continuation.
 
-Method source: [One-Step Gradient Delay is Not a Barrier for Large-Scale
+#### Dion3 row selection, compression feedback, and precision
+
+`Dion3` follows upstream **NorDion2, exported upstream as the Dion3 alias**
+([Microsoft Dion source](https://github.com/microsoft/dion/tree/1b4cd8b60f33add3e8753bd03c5281db176ab336));
+it is not the original Dion optimizer. This is a local optimizer port: it does
+not require DTensor, process groups, or NCCL. Parameter groups default to
+`algorithm="dion3"` and require nonempty **strictly 2D** matrices; vectors,
+scalars, and higher-rank tensors are rejected rather than reshaped. Explicit
+`algorithm="adamw"` or `algorithm="lion"` groups handle other parameter roles
+inside the same optimizer, with independently configurable learning rates.
+
+```python
+import torch
+from ramtorch import Dion3
+
+optimizer = Dion3([
+    {"params": hidden_matrix_parameters, "algorithm": "dion3", "lr": 0.01},
+    {"params": other_parameters, "algorithm": "adamw", "lr": 0.001},
+], fraction=0.25, mu=0.95, muon_beta2=0.95, betas=(0.9, 0.95),
+    weight_decay=0.0, epsilon=1e-8, adjust_lr="spectral_norm",
+    ef_coefficient=0.0, ns_dtype=torch.bfloat16, use_triton=False)
+```
+
+Construct stage-local groups from each factory's supplied parameters, as for
+Muon above. The example assigns only hidden residual-block matrices to Dion3;
+stem, head, and all biases use AdamW. Its zero decay default is deliberate for
+this toy comparison; the public `Dion3` constructor defaults to decay **0.01**.
+The example otherwise uses matrix LR **0.01**, fallback LR **0.001**, fraction
+**0.25**, `mu=0.95`, matrix variance `muon_beta2=0.95`, fallback
+`betas=(0.9, 0.95)`, `epsilon=1e-8`, and spectral-norm LR adjustment. Both
+parameter roles use the selected decay and optional update-level EF coefficient.
+
+For each matrix, Dion3 first accumulates `M <- M + G` into a full-sized momentum
+residual. It selects the **top `ceil(fraction * rows)` rows by L1 norm**,
+orthogonalizes those selected rows using Polar Express's default sequence of
+**five coefficient triples**, and retains compression feedback by scaling only
+the selected residual rows by `mu`; unselected rows remain accumulated for later
+updates. A per-neuron variance EMA is updated for selected rows only, without
+Adam bias correction, followed by variance normalization and a **norm-preserving
+rescale**. With
+`adjust_lr="spectral_norm"`, the direction uses `sqrt(rows/cols)` for the
+original parameter shape, **without Muon's `max(1, ...)` clamp**. Decoupled
+decay uses the current/latest weights and the unadjusted group LR.
+
+Compression feedback in that residual is always part of Dion3, even with
+`ef_coefficient=0`. Optional **update-level EF** then acts on the complete
+uncorrected update, including the current decay term, and saves that full
+update rather than only the selected rows. The sync / 2BW / 2BW+EF comparison
+therefore changes gradient freshness and this optional update correction, not
+the underlying compression algorithm. The first logical update and
+missing-gradient rules are the same as described above.
+
+Parameters and persistent state use FP32 or FP64. Each initialized Dion3 matrix
+has **one full-sized momentum residual and one `rows x 1` variance tensor**.
+AdamW fallback has two full-sized moments and a step counter; Lion fallback has
+one full-sized momentum. Nonzero update-level EF adds one full-sized
+`previous_update` per initialized parameter in either role; zero EF allocates
+none. These are persistent state costs, not peak memory: selected-row workspaces,
+orthogonalization intermediates, gradients, and two compute-weight banks are
+separate. Optimizer serialization is not a full 2BW-session checkpoint.
+
+Orthogonalization precision is explicit and independent of model autocast:
+`ns_dtype` accepts BF16 (default), FP32, or FP64, with internal autocast disabled.
+`use_triton=True` opts into the vendored upstream Triton kernels and requires
+**CUDA and BF16 orthogonalization**; it is not a CPU or FP32/FP64 path, and no
+Triton dependency is needed for the default PyTorch path. Do not assume bit
+identity or a throughput improvement between the two kernel implementations.
+First use of each device/shape/stride signature serializes JIT/autotuning to
+protect concurrent stage workers; autotuning can synchronize CUDA and take
+substantial time. Warm every expected signature before timing or profiling.
+Warmed calls do not hold the initialization lock. The MNIST example's first
+training epoch includes cold initialization when present; its separate profiler
+replay runs after warmup. This is not a clean kernel speed benchmark.
+
+The port keeps state lazy, uses parameter dtype for row normalization, and
+forms an explicit complete update for optional delay EF. Thus FP64 is a
+higher-precision reference alternative, and neither eager nor Triton promises
+bit parity with upstream's compiled/batched optimizer. Ties in L1 row scores
+follow `torch.topk(sorted=False)`; no cross-platform tie-order guarantee is made.
+
+Run the matched Dion3-only comparison with `--optimizers dion3`. Options are
+`--dion3-lr`, `--dion3-adamw-lr`, `--dion3-fraction`, `--dion3-mu`,
+`--dion3-beta2`, `--dion3-weight-decay`,
+`--dion3-ns-dtype {float32,bfloat16}` (default `bfloat16`), and the boolean flag
+`--dion3-triton` (off by default). `--bf16` still controls model autocast
+separately; it does not select optimizer orthogonalization precision. For a
+small CPU smoke run without profiler replay:
+
+```bash
+python examples/mnist_pipedream_2bw.py --devices cpu,cpu --optimizers dion3 \
+  --epochs 1 --dim 16 --blocks 2 --batch-size 32 --microbatches 2 \
+  --train-limit 64 --dion3-ns-dtype float32 --profile-steps 0
+```
+
+Focused correctness commands (GPU commands require an explicitly available pod):
+
+```bash
+PYTHONPATH=. python examples/dion3_optimizer_check.py --device cpu
+PYTHONPATH=. python examples/gpu_transport_check.py --devices 0,1,2,3
+PYTHONPATH=. python examples/dion3_optimizer_check.py --device cuda:0 --triton
+PYTHONPATH=. python examples/pipedream_2bw_optimizer_check.py \
+  --devices cuda:0,cuda:1,cuda:2,cuda:3 --optimizers dion3 --bf16 --dion3-triton
+```
+
+The last command checks all update snapshots against the same-backend sequential
+delayed oracle, including continued runs and CPU optimizer placement. CPU
+masters explicitly use eager PyTorch, not CUDA Triton. Float64 optimizer-equation
+checks are independent of production helpers. The transport diagnostic tests
+all directed pairs with FP32/BF16 patterns, blocking copies, and event-ordered
+nondefault streams; it does not benchmark bandwidth or prove the physical route.
+The Adam/Lion/Muon results above do not establish Dion3 convergence behavior.
+
+A five-epoch, seed-0 sanity run on four RTX PRO 4000 Blackwell GPUs (PyTorch
+2.8.0/CUDA 12.8, Triton 3.4, width 256, four residual blocks, full batch 256,
+four microbatches, BF16 model autocast and BF16 Triton orthogonalization) used
+55K/5K/10K train/validation/test samples and the defaults above. Final test
+loss/accuracy were **sync 0.0851 / 97.96%**, **2BW 0.0865 / 97.76%**, and
+**2BW+EF 0.0804 / 98.06%**. This is one matched seed with no recipe tuning or
+checkpoint selection, not statistical evidence of EF improvement. The first
+sync epoch includes cold JIT/autotuning; totals are not a throughput comparison.
+Reproduce with:
+
+```bash
+PYTHONPATH=. python examples/mnist_pipedream_2bw.py --optimizers dion3 \
+  --devices cuda:0,cuda:1,cuda:2,cuda:3 --epochs 5 --dim 256 --blocks 4 \
+  --batch-size 256 --microbatches 4 --bf16 --dion3-triton \
+  --profile-warmup 3 --profile-steps 3 \
+  --output-dir scratchpad/pipedream_2bw/runs/mnist_dion3_triton_bf16
+```
+
+The local generated bundle includes metrics, curves, and three compressed
+three-update traces. Each trace has 48 forward, 48 backward, and 12 update
+annotations, real GPU kernels on all four devices, 240 total `ns_line_1_kernel` /
+`ns_line_2_kernel` events, and 72 P2P copy events. The all-pairs transport probe
+separately passed 576 exact comparisons. These checks establish tested numerical
+and transport behavior, not universal hardware compatibility or overlap speedup.
+
+Update-level EF method source: [One-Step Gradient Delay is Not a Barrier for Large-Scale
 Asynchronous Pipeline Parallel LLM Pretraining](https://arxiv.org/abs/2606.30634v1),
 using the supplied Algorithm 1/2 description. No claim of paper-code reproduction
 or universal convergence improvement is made.

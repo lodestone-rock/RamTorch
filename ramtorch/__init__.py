@@ -3,6 +3,7 @@ __version__ = "1.10.0"
 from .modules.linear import Linear
 from .stochastic_optimizers.adamw import AdamW
 from .delayed_optim import AdamEF, Lion, Muon
+from .dion3 import Dion3
 from .pipeline import Stage, run_pipeline, PipelineResult
 from .pipeline_relay import run_pipeline_relay, Pipeline, InferBatch
 from .pipeline_2bw import PipeDream2BWTrainer
@@ -21,6 +22,7 @@ __all__ = [
     "AdamEF",
     "Lion",
     "Muon",
+    "Dion3",
     "Stage",
     "run_pipeline",
     "run_pipeline_relay",

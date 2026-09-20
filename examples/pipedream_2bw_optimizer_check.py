@@ -1,4 +1,4 @@
-"""Independent AdamEF/Lion/Muon equations and exact PipeDream-2BW checks.
+"""Independent AdamEF/Lion/Muon/Dion3 equations and exact PipeDream-2BW checks.
 
 Run from the repository root, using a Python environment with working PyTorch::
 
@@ -8,6 +8,10 @@ Run from the repository root, using a Python environment with working PyTorch::
 
 --bf16 ADDS autocast checks to the FP32 bank/pipeline suite; optimizer parameters
 and moments remain FP32. --unit-only and --pipeline-only isolate the two suites.
+--optimizers dion3 selects just Dion3; --dion3-triton uses its vendored backend
+only with CUDA optimizer placement (CPU masters still use eager PyTorch).
+--triton independently selects AdamEF/AdamW/Lion CUDA kernels and adds their
+standalone backend checks; CPU groups explicitly select use_triton=False.
 No production optimizer helper is used to compute expected optimizer updates:
 Python scalar equations and an independent Float64 Newton-Schulz polynomial
 check weights, moments and full update history; plain AdamEF and Muon's explicit
@@ -35,7 +39,7 @@ from ramtorch.pipeline import Stage
 from ramtorch.pipeline_2bw import _VersionedStage
 
 
-KINDS = ("adam", "adamw", "lion", "muon")
+KINDS = ("adam", "adamw", "lion", "muon", "dion3")
 INITIAL = ((0.8, -1.3, 0.0), (-0.6, 0.2, 1.1), (1.7, -0.4, 0.3), (3.0, 2.0, 1.0))
 GRADIENTS = (
     ((0.3, -0.7, 0.0), (-0.2, 0.4, 0.8), None, None),
@@ -78,10 +82,49 @@ def optimizer_factory(kind, coefficient, **overrides):
             return Muon([group for group in groups if group["params"]], **options)
 
         return make_muon
+    elif kind == "dion3":
+        from ramtorch.dion3 import Dion3
+
+        options.update(fraction=0.5, mu=0.7, muon_beta2=0.8, epsilon=1e-7,
+                       adjust_lr="spectral_norm", ns_dtype=torch.bfloat16)
+        options.update(overrides)
+
+        def make_dion3(parameters):
+            # Assign roles from the supplied parameters, including CPU masters.
+            parameters = list(parameters)
+            groups = [{"params": [p for p in parameters if p.ndim == 2], "algorithm": "dion3"},
+                      {"params": [p for p in parameters if p.ndim != 2], "algorithm": "adamw",
+                       "epsilon": 0.031}]
+            # A CUDA pipeline may place its optimizer on CPU. Triton is only
+            # requested for actual CUDA optimizer parameters, never CPU masters.
+            local_options = dict(options)
+            local_options["use_triton"] = bool(options.get("use_triton", False) and
+                                                all(p.device.type == "cuda" for p in parameters))
+            return Dion3([group for group in groups if group["params"]], **local_options)
+
+        return make_dion3
     else:
         raise ValueError(f"unknown optimizer {kind!r}")
+    options.update(use_triton=False)
     options.update(overrides)
-    return lambda parameters: cls(parameters, **options)
+
+    def make_dense(parameters):
+        # The factory, not the strict backend, opts CPU masters into eager.
+        # Materialize generators and preserve explicit per-group hyperparameters.
+        parameters = list(parameters)
+        groups = parameters if parameters and isinstance(parameters[0], dict) else [{"params": parameters}]
+        local_groups = []
+        for group in groups:
+            group = dict(group)
+            values = group["params"]
+            group["params"] = [values] if isinstance(values, torch.Tensor) else list(values)
+            requested = group.get("use_triton", options["use_triton"])
+            group["use_triton"] = bool(requested and group["params"] and
+                                       all(p.device.type == "cuda" for p in group["params"]))
+            local_groups.append(group)
+        return cls(local_groups, **options)
+
+    return make_dense
 
 
 def _parameters(device="cpu", dtype=torch.float64):
@@ -832,9 +875,19 @@ def check_muon_units(device):
     check_muon_closure(device)
 
 
-def check_units(device):
-    check_native_adam(device)
-    for kind in KINDS:
+def check_units(device, kinds=KINDS, *, dion3_triton=False, triton=False):
+    if triton and any(kind in ("adam", "adamw", "lion") for kind in kinds):
+        from triton_optimizer_check import check_triton_units
+
+        check_triton_units(device, kinds=tuple(kind for kind in kinds if kind in ("adam", "adamw", "lion")))
+    if any(kind in ("adam", "adamw") for kind in kinds):
+        check_native_adam(device)
+    for kind in kinds:
+        if kind == "dion3":
+            from dion3_optimizer_check import check_dion3_units
+
+            check_dion3_units(device, triton=dion3_triton and torch.device(device).type == "cuda")
+            continue
         if kind == "muon":
             check_muon_units(device)
             continue  # Scalar/vector fixtures are not legal implicit Muon matrices.
@@ -865,7 +918,11 @@ def _expected_snapshot(update, names):
             "optimizer": {name: update.optimizer_state[name] for name in names}}
 
 
-def _check_owners(bank, coefficient):
+def _check_owners(bank, coefficient, *, use_triton=None):
+    if use_triton is not None:
+        for group in bank.optimizer.param_groups:
+            expected = bool(use_triton and all(p.device.type == "cuda" for p in group["params"]))
+            assert group["use_triton"] is expected, "factory selected the wrong optimizer backend"
     for name, parameter in bank.optimizer_named.items():
         assert parameter.dtype == torch.float32, "autocast changed master dtype"
         assert parameter.device == (torch.device("cpu") if bank.cpu_optimizer else bank.stage.device)
@@ -879,10 +936,12 @@ def _check_owners(bank, coefficient):
                 assert value.dtype == torch.float32 and value.device == parameter.device
 
 
-def check_banks(kind, coefficient, device, optimizer_device, bf16, updates):
+def check_banks(kind, coefficient, device, optimizer_device, bf16, updates, *, dion3_triton=False, triton=False):
     model = _model(dim=8, layers=2)
     groups = make_batches(updates=updates, microbatches=1, dim=8, seed=43)
-    factory = optimizer_factory(kind, coefficient)
+    overrides = ({"use_triton": dion3_triton} if kind == "dion3" else
+                 {"use_triton": triton} if kind in ("adam", "adamw", "lion") else {})
+    factory = optimizer_factory(kind, coefficient, **overrides)
     expected = run_reference(model, groups, factory, device=device,
                              optimizer_device=optimizer_device, autocast_bf16=bf16)
     stage = Stage(copy.deepcopy(model), 0, 1, device=device,
@@ -911,7 +970,7 @@ def check_banks(kind, coefficient, device, optimizer_device, bf16, updates):
             for name, parameter in bank.named.items():
                 assert pointers[0][name] != pointers[1][name]
                 assert parameter.untyped_storage().data_ptr() in (pointers[0][name], pointers[1][name])
-            _check_owners(bank, coefficient)
+            _check_owners(bank, coefficient, use_triton=triton if kind in ("adam", "adamw", "lion") else None)
             assert_exact(records[group], _expected_snapshot(expected.updates[group], bank.named),
                          path=f"banks.{kind}.c{coefficient}.group{group}")
     finally:
@@ -924,11 +983,13 @@ def _loader(groups):
         yield torch.cat([inputs for inputs, _ in group]), torch.cat([targets for _, targets in group])
 
 
-def check_pipeline(kind, coefficient, devices, optimizer_device, bf16, updates):
+def check_pipeline(kind, coefficient, devices, optimizer_device, bf16, updates, *, dion3_triton=False, triton=False):
     depth, microbatches = len(devices), max(3, len(devices))
     model = _model(dim=8, layers=2 * depth)
     groups = make_batches(updates=updates, microbatches=microbatches, dim=8, seed=47)
-    factory = optimizer_factory(kind, coefficient)
+    overrides = ({"use_triton": dion3_triton} if kind == "dion3" else
+                 {"use_triton": triton} if kind in ("adam", "adamw", "lion") else {})
+    factory = optimizer_factory(kind, coefficient, **overrides)
     expected = run_reference(model, groups, factory, device=devices[0],
                              optimizer_device=optimizer_device, autocast_bf16=bf16)
     assert [update.eval_version for update in expected.updates] == [max(group - 1, 0) for group in range(updates)]
@@ -963,7 +1024,7 @@ def check_pipeline(kind, coefficient, devices, optimizer_device, bf16, updates):
                         assert_exact(records[stage, group], _expected_snapshot(update, names),
                                      path=f"pipeline.{kind}.c{coefficient}.continued{continuation}.stage{stage}.group{group}")
                 for bank in trainer.stages:
-                    _check_owners(bank, coefficient)
+                    _check_owners(bank, coefficient, use_triton=triton if kind in ("adam", "adamw", "lion") else None)
             for module in modules:
                 for name, parameter in module.named_parameters():
                     assert_exact(parameter, expected.updates[-1].weights[name], path="closed." + name)
@@ -981,6 +1042,12 @@ def main():
     parser.add_argument("--devices", default="cpu,cpu", help="comma-separated CPU or CUDA stage devices")
     parser.add_argument("--bf16", action="store_true", help="also test BF16 autocast; never BF16 optimizer parameters")
     parser.add_argument("--updates", type=int, default=6, help="pipeline updates (at least 3; default 6)")
+    parser.add_argument("--optimizers", nargs="+", choices=KINDS, default=KINDS,
+                        help="optimizer kinds to check (default: all)")
+    parser.add_argument("--dion3-triton", action="store_true",
+                        help="use vendored Dion3 kernels for CUDA optimizer placement only")
+    parser.add_argument("--triton", action="store_true",
+                        help="check AdamEF/AdamW/Lion Triton on CUDA; explicitly keep CPU masters eager")
     suite = parser.add_mutually_exclusive_group()
     suite.add_argument("--unit-only", action="store_true", help="only independent optimizer tests")
     suite.add_argument("--pipeline-only", action="store_true", help="only exact banks/pipeline/continuation tests")
@@ -993,20 +1060,24 @@ def main():
         parser.error("devices must be uniformly CPU or CUDA")
     if types == {"cuda"} and not torch.cuda.is_available():
         parser.error("CUDA devices requested but CUDA is unavailable")
+    if args.dion3_triton and (types != {"cuda"} or "dion3" not in args.optimizers):
+        parser.error("--dion3-triton requires CUDA devices and --optimizers including dion3")
+    if args.triton and not any(kind in ("adam", "adamw", "lion") for kind in args.optimizers):
+        parser.error("--triton requires --optimizers including adam, adamw or lion")
     configure_determinism()
-    # Fail clearly if the independently implemented classes are not present yet.
-    optimizer_factory("adam", 0.0)
     if not args.pipeline_only:
         for device in dict.fromkeys(["cpu", devices[0]]):
-            check_units(device)
+            check_units(device, args.optimizers, dion3_triton=args.dion3_triton, triton=args.triton)
     if not args.unit_only:
         placements = (None, "cpu") if types == {"cuda"} else (None,)
         for bf16 in ((False, True) if args.bf16 else (False,)):
             for optimizer_device in placements:
-                for kind in KINDS:
+                for kind in args.optimizers:
                     for coefficient in (0.0, 1.0):
-                        check_banks(kind, coefficient, devices[0], optimizer_device, bf16, args.updates)
-                        check_pipeline(kind, coefficient, devices, optimizer_device, bf16, args.updates)
+                        check_banks(kind, coefficient, devices[0], optimizer_device, bf16, args.updates,
+                                    dion3_triton=args.dion3_triton, triton=args.triton)
+                        check_pipeline(kind, coefficient, devices, optimizer_device, bf16, args.updates,
+                                       dion3_triton=args.dion3_triton, triton=args.triton)
     print("ALL REQUESTED OPTIMIZER CHECKS PASSED")
 
 

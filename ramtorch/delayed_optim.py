@@ -9,9 +9,11 @@ second call, matching a paper indexing convention with an initial no-op and
 ``ef_step``. Only actual calls count: an externally skipped call does nothing.
 
 Parameters, gradients, moments, and saved updates use float32 or float64 on the
-parameter's device (including CPU). No low-precision/master-weight conversion,
-sparse/complex parameters, AMP GradScaler integration, fused/foreach kernels,
-capturable execution, or differentiable optimizer steps are supported. Finite
+parameter's device (including CPU). AdamEF and Lion optionally fuse CUDA updates
+with ``use_triton=True``; eager remains the default. No low-precision/master-weight
+conversion, sparse/complex parameters, AMP GradScaler integration, native
+``fused=True``/foreach options, capturable execution, or differentiable steps
+are supported. Finite
 precision arithmetic can differ from native optimizers by rounding order; in
 particular, an update is computed explicitly, never recovered by subtracting
 rounded old/new parameters. Tiny updates may leave a parameter unchanged while
@@ -119,6 +121,10 @@ class _UpdateEFOptimizer(Optimizer):
         """Return per-group state requirements without mutating optimizer metadata."""
         return self._moment_names, self._has_adam_step
 
+    def _state_shape(self, group, parameter, name):
+        """Expected persistent tensor shape; matrix optimizers may use row state."""
+        return parameter.shape
+
     def _validate_state(self, group, parameter, state, *, loading=False):
         if not isinstance(state, dict):
             raise ValueError("parameter optimizer state must be a dict")
@@ -141,9 +147,10 @@ class _UpdateEFOptimizer(Optimizer):
         for name in expected - {"step"}:
             value = state[name]
             _dense_real(f"state[{name!r}]", value)
-            if value.shape != parameter.shape:
+            expected_shape = self._state_shape(group, parameter, name)
+            if value.shape != expected_shape:
                 raise ValueError(f"state[{name!r}] shape {tuple(value.shape)} does not "
-                                 f"match parameter shape {tuple(parameter.shape)}")
+                                 f"match expected shape {tuple(expected_shape)}")
             if not loading and (value.dtype != parameter.dtype or value.device != parameter.device):
                 raise ValueError(f"state[{name!r}] must match the parameter dtype/device; "
                                  "only same-dtype/device storage rebinding is supported")
@@ -219,6 +226,50 @@ class _UpdateEFOptimizer(Optimizer):
             state["previous_update"].zero_()
 
 
+class _TritonUpdateEFOptimizer(_UpdateEFOptimizer):
+    """Optional pointwise backend; never changes CPU/default eager behavior."""
+
+    def _validate_group(self, group):
+        super()._validate_group(group)
+        if not isinstance(group["use_triton"], bool):
+            raise ValueError("use_triton must be a bool")
+
+    def _validate_parameter(self, group, parameter):
+        super()._validate_parameter(group, parameter)
+        if group["use_triton"]:
+            from ._delayed_optim_triton import require_backend
+            require_backend(parameter)
+
+    def _validate_state(self, group, parameter, state, *, loading=False):
+        super()._validate_state(group, parameter, state, loading=loading)
+        if group["use_triton"]:
+            for value in state.values():
+                if isinstance(value, torch.Tensor):
+                    if type(value) not in (torch.Tensor, torch.nn.Parameter) or not value.is_contiguous():
+                        raise ValueError("Triton optimizer state must be ordinary contiguous tensors")
+
+    def _prepare_step(self):
+        super()._prepare_step()
+        # Preflight every gradient, including later groups, before any counters
+        # or weights change. This backend never silently copies strided tensors.
+        for group in self.param_groups:
+            if group["use_triton"]:
+                for parameter in group["params"]:
+                    if parameter.requires_grad and parameter.grad is not None:
+                        if (type(parameter.grad) not in (torch.Tensor, torch.nn.Parameter)
+                                or not parameter.grad.is_contiguous()):
+                            raise ValueError("Triton optimizer gradients must be ordinary contiguous tensors")
+
+    def load_state_dict(self, state_dict):
+        # Existing eager checkpoints predate this backend flag. Missing means
+        # eager, never silently opt an old checkpoint into CUDA-only execution.
+        if isinstance(state_dict, dict) and isinstance(state_dict.get("param_groups"), (list, tuple)):
+            state_dict = dict(state_dict, param_groups=[
+                dict(group, use_triton=group.get("use_triton", False)) if isinstance(group, dict) else group
+                for group in state_dict["param_groups"]])
+        return super().load_state_dict(state_dict)
+
+
 def _adam_update(parameter, grad, state, *, lr, betas, eps):
     """Advance Adam moments once and return its bias-corrected, undecayed update."""
     if not state:
@@ -236,7 +287,7 @@ def _adam_update(parameter, grad, state, *, lr, betas, eps):
     return moment.div(denominator).mul_(lr / bias1)
 
 
-class AdamEF(_UpdateEFOptimizer):
+class AdamEF(_TritonUpdateEFOptimizer):
     r"""Adam with optional update-level EF, not extrapolated gradients.
 
     Args:
@@ -250,6 +301,12 @@ class AdamEF(_UpdateEFOptimizer):
         decoupled_weight_decay: If False, add decay to the gradient before
             updating either moment, as in Adam. If True, add ``lr * wd * p``
             at CURRENT weights to the uncorrected update, as in AdamW.
+        use_triton: Fuse moment, weight, and optional EF updates in one CUDA
+            kernel per active tensor (default False). Requires optional Triton,
+            ordinary contiguous CUDA FP32/FP64 parameters, gradients and state.
+            No CPU fallback. Eager/Triton rounding can differ. State is compatible;
+            old checkpoints without this flag load as eager. Cold worker-local
+            JIT launches serialize, but warmed launches add no lock or sync.
 
     For each active parameter, advance the Adam step and moments once, then
     compute ``u = lr * m_hat / (sqrt(v_hat) + eps)`` (plus decoupled decay if
@@ -263,18 +320,21 @@ class AdamEF(_UpdateEFOptimizer):
     includes that call's LR, so LR scheduling does not rescale old history.
     State follows Parameter identity through same-shape/dtype/device storage
     rebinding, and can live on CPU. See module docs for serialization/startup
-    semantics and the unsupported low-precision/AMP/capturable/fused features.
+    semantics and unsupported low-precision/GradScaler/capturable features.
+    ``use_triton`` is separate from native PyTorch ``fused=True``.
     """
 
     _moment_names = ("exp_avg", "exp_avg_sq")
     _has_adam_step = True
 
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8,
-                 weight_decay=0, ef_coefficient=1.0, decoupled_weight_decay=False):
+                 weight_decay=0, ef_coefficient=1.0, decoupled_weight_decay=False,
+                 use_triton=False):
         super().__init__(params, dict(lr=lr, betas=betas, eps=eps,
                                      weight_decay=weight_decay,
                                      ef_coefficient=ef_coefficient,
-                                     decoupled_weight_decay=decoupled_weight_decay))
+                                     decoupled_weight_decay=decoupled_weight_decay,
+                                     use_triton=use_triton))
 
     def _validate_group(self, group):
         super()._validate_group(group)
@@ -295,6 +355,10 @@ class AdamEF(_UpdateEFOptimizer):
             for parameter in group["params"]:
                 if not parameter.requires_grad or parameter.grad is None:
                     self._skip_parameter(parameter)
+                    continue
+                if group["use_triton"]:
+                    from ._delayed_optim_triton import step_parameter
+                    step_parameter(parameter, self.state[parameter], group, adam=True)
                     continue
                 grad = parameter.grad
                 if group["weight_decay"] and not group["decoupled_weight_decay"]:
@@ -460,7 +524,7 @@ class Muon(_UpdateEFOptimizer):
         return loss
 
 
-class Lion(_UpdateEFOptimizer):
+class Lion(_TritonUpdateEFOptimizer):
     r"""Lion with optional update-level EF (ordinary Lion by default).
 
     Args:
@@ -470,6 +534,9 @@ class Lion(_UpdateEFOptimizer):
         weight_decay: Finite nonnegative decoupled decay (default: 0).
         ef_coefficient: Finite nonnegative EF coefficient (default: 0).
             Zero allocates no update history; one enables standard EF.
+        use_triton: Optional CUDA-only fusion, with the same contiguous FP32/FP64
+            requirements and checkpoint compatibility as AdamEF. Defaults False.
+            No parameter-sized temporary update or extra persistent tensor at c=0.
 
     Compute ``u = lr * (sign(beta1*m + (1-beta1)*g) + wd*p)`` at
     CURRENT weights using the old momentum, then advance momentum exactly once
@@ -485,16 +552,17 @@ class Lion(_UpdateEFOptimizer):
     uses zero history and immediately receives correction. State follows stable
     Parameter identities through storage rebinding and supports CPU placement.
     ``state_dict`` includes optimizer startup/history, not pipeline checkpoints.
-    No low-precision, sparse/complex, AMP GradScaler, fused/foreach, capturable,
-    or differentiable step support is provided; only actual step calls count.
+    No low-precision, sparse/complex, AMP GradScaler, native fused/foreach,
+    capturable, or differentiable step support; only actual step calls count.
+    Optional ``use_triton`` fusion is separate from native ``fused=True``.
     """
 
     _moment_names = ("exp_avg",)
 
     def __init__(self, params, lr=1e-4, betas=(0.9, 0.99), weight_decay=0,
-                 ef_coefficient=0):
+                 ef_coefficient=0, use_triton=False):
         super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay,
-                                     ef_coefficient=ef_coefficient))
+                                     ef_coefficient=ef_coefficient, use_triton=use_triton))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -512,6 +580,10 @@ class Lion(_UpdateEFOptimizer):
                     self._skip_parameter(parameter)
                     continue
                 state = self.state[parameter]
+                if group["use_triton"]:
+                    from ._delayed_optim_triton import step_parameter
+                    step_parameter(parameter, state, group, adam=False)
+                    continue
                 if not state:
                     state["exp_avg"] = torch.zeros_like(parameter, memory_format=torch.preserve_format)
                 moment = state["exp_avg"]
