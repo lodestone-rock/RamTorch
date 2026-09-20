@@ -2,8 +2,10 @@ __version__ = "1.9.0"
 
 from .modules.linear import Linear
 from .stochastic_optimizers.adamw import AdamW
+from .delayed_optim import AdamEF, Lion
 from .pipeline import Stage, run_pipeline, PipelineResult
-from .pipeline_relay import run_pipeline_relay, Pipeline
+from .pipeline_relay import run_pipeline_relay, Pipeline, InferBatch
+from .pipeline_2bw import PipeDream2BWTrainer
 from .pipeline_easy import PipelineModel, auto_split_spec, PipelinePaddingWarning
 from .pipeline_optimizer import PipelineOptimizer
 from .offload import OffloadModel, OffloadStepResult, offload_checkpoint
@@ -16,10 +18,14 @@ from . import pipeline_offload_simulator
 __all__ = [
     "Linear",
     "AdamW",
+    "AdamEF",
+    "Lion",
     "Stage",
     "run_pipeline",
     "run_pipeline_relay",
     "Pipeline",
+    "PipeDream2BWTrainer",
+    "InferBatch",
     "PipelineModel",
     "PipelineOptimizer",
     "auto_split_spec",
