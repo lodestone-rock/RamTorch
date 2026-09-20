@@ -11,8 +11,8 @@ bubble per step on every stage.
 
 The streaming API (``infer_submit`` / ``infer_open`` + ``submit_mb`` /
 ``wait_mb`` / ``infer_loop``) keeps one persistent worker per stage, so step
-t+1's first microbatch enters stage 0 the moment its step-t output is ready —
-the pipeline never drains:
+t+1's first microbatch can enter stage 0 once its step-t output is ready —
+avoiding a mandatory full-batch drain (the diagrams are idealized schedules):
 
     sync infer() per step (p=4, m=4, 4 steps — dots are bubbles):
         s0: f0 f1 f2 f3 . . . f0 f1 f2 f3 . . . ...
@@ -26,9 +26,10 @@ the pipeline never drains:
         s2: . . f0 f1 f2 f3 f0 f1 f2 f3 f0 f1 f2 f3 f0 f1 f2 f3
         s3: . . . f0 f1 f2 f3 f0 f1 f2 f3 f0 f1 f2 f3 f0 f1 f2 f3
 
-This demo runs a toy "denoising" loop — x <- x - lr * model(x), applied
-PER MICROBATCH (the scheduler must be per-sample independent for the overlap
-to be valid) — three ways and checks all three are BIT-IDENTICAL:
+This demo runs a toy refinement loop — out = model(x), then
+x <- out - lr * out between forwards (equivalently (1-lr)*out) — applied
+PER MICROBATCH. The scheduler must be per-sample independent for the overlap
+to be valid. It runs three ways and requires finite, byte-identical results:
 
   sync     : for t: x = sched(pipe.infer(x))          (barrier per step)
   handles  : infer_open/submit_mb/wait_mb driven by hand (fully streamed)
@@ -39,7 +40,7 @@ Run:  PYTHONPATH=. python examples/pipeline_infer_stream_demo.py
       PYTHONPATH=. python examples/pipeline_infer_stream_demo.py \
           --devices cuda:0,cuda:1 --steps 12 --mbs 8 --dim 2048
       PYTHONPATH=. python examples/pipeline_infer_stream_demo.py \
-          --profile loop --profile-path trace_loop.json   # Perfetto trace
+          --profile loop --profile-path trace_loop.json.gz   # Perfetto trace
 """
 
 import argparse
@@ -98,7 +99,7 @@ class Residual(nn.Module):
 
 
 def build_pipe(devices, chunks_per_stage, dim, hidden, vec_ops,
-               offload, window):
+               offload, window, bf16=False):
     n = len(devices) * chunks_per_stage
     chunks = [Residual(b) for b in make_chunks(n, dim, hidden, vec_ops)]
     if offload:
@@ -107,19 +108,23 @@ def build_pipe(devices, chunks_per_stage, dim, hidden, vec_ops,
             devices=devices,
             offload_window=window,
             offload_pin=0,
+            autocast="bf16" if bf16 else None,
         )
     per = [
         nn.Sequential(*chunks[i * chunks_per_stage:(i + 1) * chunks_per_stage])
         for i in range(len(devices))
     ]
-    return Pipeline(stage_modules=per, devices=devices)
+    return Pipeline(stage_modules=per, devices=devices,
+                    autocast="bf16" if bf16 else None)
 
 
+@torch.no_grad()
 def sched_step(out, lr):
-    """Toy per-sample scheduler: one Euler-ish denoising update."""
+    """Toy per-sample scheduler: shrink the model output between forwards."""
     return out - lr * out
 
 
+@torch.no_grad()
 def run_sync(pipe, x0, steps, m, lr):
     # Same semantics as infer_loop: `steps` forwards, `steps - 1` scheduler
     # updates between them (no update after the final forward).
@@ -129,6 +134,7 @@ def run_sync(pipe, x0, steps, m, lr):
     return pipe.infer(x, n_microbatches=m)
 
 
+@torch.no_grad()
 def run_handles(pipe, x0, steps, m, lr):
     """The streaming pattern, written out by hand: feed step t+1's first
     microbatch the moment its step-t output lands, while later stages are
@@ -143,11 +149,33 @@ def run_handles(pipe, x0, steps, m, lr):
     return torch.cat(outs, dim=0)
 
 
+@torch.no_grad()
 def run_loop(pipe, x0, steps, m, lr):
     return pipe.infer_loop(
         x0, steps=steps, n_microbatches=m,
         update_fn=lambda out, i, t: sched_step(out, lr),
     )
+
+
+def synchronize(devices):
+    """Timing/profile boundary drain, NOT part of the streaming hot path."""
+    for device in dict.fromkeys(map(torch.device, devices)):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+
+def require_exact(name, actual, expected):
+    if actual.requires_grad or actual.grad_fn is not None:
+        raise AssertionError(f"{name}: inference retained an autograd graph")
+    actual = actual.detach().cpu().contiguous()
+    expected = expected.detach().cpu().contiguous()
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        raise AssertionError(f"{name}: output shape/dtype mismatch")
+    if not torch.isfinite(actual).all() or not torch.isfinite(expected).all():
+        raise AssertionError(f"{name}: non-finite inference output")
+    if not torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)):
+        error = (actual.float() - expected.float()).abs().max().item()
+        raise AssertionError(f"{name}: byte mismatch (max error {error:.3e})")
 
 
 def main():
@@ -170,70 +198,120 @@ def main():
     ap.add_argument("--offload", action="store_true",
                     help="stream stage weights from CPU RAM (OffloadStage)")
     ap.add_argument("--window", type=int, default=2)
+    ap.add_argument("--bf16", action="store_true", help="BF16 autocast in stage workers")
     ap.add_argument("--profile", default=None,
                     choices=["sync", "handles", "loop"],
                     help="capture a kineto (Perfetto) trace of one loop in "
                          "this mode (runs AFTER the timing table)")
     ap.add_argument("--profile-path", default=None,
-                    help="trace output path (default: infer_stream_<mode>.json)")
+                    help="trace path; .gz enables compression "
+                         "(default: infer_stream_<mode>.json.gz)")
     args = ap.parse_args()
-
-    devices = [d.strip() for d in args.devices.split(",")]
+    for name in ("chunks_per_stage", "dim", "hidden", "batch", "mbs", "steps", "iters", "window"):
+        if getattr(args, name) < 1:
+            ap.error(f"--{name.replace('_', '-')} must be positive")
+    if args.vec_ops < 0:
+        ap.error("--vec-ops must be nonnegative")
+    # The manual-handle recipe concatenates padded microbatches itself. Keep
+    # this timing workload divisible rather than silently comparing extra rows.
+    if args.batch % args.mbs:
+        ap.error("--batch must be divisible by --mbs for the manual-handle demo")
+    devices = []
+    for value in args.devices.split(","):
+        device = torch.device(value.strip())
+        if device.type not in ("cpu", "cuda"):
+            ap.error("--devices supports CPU or CUDA only")
+        if device.type == "cuda" and device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
+        devices.append(str(device))
+    if args.bf16:
+        for device in map(torch.device, devices):
+            if device.type == "cuda":
+                with torch.cuda.device(device):
+                    if not torch.cuda.is_bf16_supported():
+                        ap.error(f"BF16 is unsupported on {device}")
     pipe = build_pipe(devices, args.chunks_per_stage, args.dim, args.hidden,
-                      args.vec_ops, args.offload, args.window)
-    p = len(devices)
-    torch.manual_seed(1)
-    x0 = torch.randn(args.batch, args.dim)
+                      args.vec_ops, args.offload, args.window, args.bf16)
+    try:
+        torch.manual_seed(1)
+        x0 = torch.randn(args.batch, args.dim)
+        print(f"{len(devices)} stages x {args.chunks_per_stage} blocks "
+              f"[Linear({args.dim}->{args.hidden}) + {args.vec_ops}x vector spam "
+              f"+ Linear] on {', '.join(devices)}"
+              + (f" (OFFLOADED, window={args.window})" if args.offload else ""))
+        print(f"torch={torch.__version__}, precision={'bf16 autocast' if args.bf16 else 'fp32'}, "
+              "optimizer=none (inference)")
+        for device in dict.fromkeys(map(torch.device, devices)):
+            if device.type == "cuda":
+                print(f"  {device}: {torch.cuda.get_device_name(device)}")
+        print(f"toy refinement: {args.steps} forwards x {args.mbs} microbatches of "
+              f"{args.batch // args.mbs} rows; between forwards, "
+              f"out=model(x), x <- out - {args.lr}*out")
+        print("Timing: unprofiled wall time, every participating CUDA device "
+              "drained before/after each repetition block.\n")
 
-    print(f"{p} stages x {args.chunks_per_stage} blocks "
-          f"[Linear({args.dim}->{args.hidden}) + {args.vec_ops}x vector spam "
-          f"+ Linear] on {', '.join(devices)}"
-          + (" (OFFLOADED, window=%d)" % args.window if args.offload else ""))
-    print(f"toy denoising: {args.steps} steps x {args.mbs} microbatches of "
-          f"{args.batch // args.mbs} rows, x <- x - {args.lr}*model(x)\n")
+        results, times = {}, {}
+        modes = {"sync": run_sync, "handles": run_handles, "loop": run_loop}
+        for name, fn in modes.items():
+            fn(pipe, x0, 2, args.mbs, args.lr)  # contexts, cuBLAS, workers
+            synchronize(devices)
+            t0 = time.perf_counter()
+            for _ in range(args.iters):
+                out = fn(pipe, x0, args.steps, args.mbs, args.lr)
+            synchronize(devices)
+            times[name] = (time.perf_counter() - t0) / args.iters
+            results[name] = out
 
-    results, times = {}, {}
-    for name, fn in [("sync", run_sync), ("handles", run_handles),
-                     ("loop", run_loop)]:
-        fn(pipe, x0, 2, args.mbs, args.lr)  # warmup (CUDA ctx, cuBLAS, workers)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(args.iters):
-            out = fn(pipe, x0, args.steps, args.mbs, args.lr)
-        torch.cuda.synchronize()
-        times[name] = (time.perf_counter() - t0) / args.iters
-        results[name] = out
+        base = results["sync"]
+        # Fail the process BEFORE printing successful timings if correctness
+        # fails; finite raw-byte equality is stronger than torch.equal.
+        for name, out in results.items():
+            require_exact(name, out, base)
+        print(f"{'mode':>8s} {'s/loop':>9s} {'sync/time':>9s}   vs sync")
+        for name in modes:
+            print(f"{name:>8s} {times[name]:9.3f} "
+                  f"{times['sync'] / times[name]:8.2f}x   FINITE / BIT-IDENTICAL")
+        print("\nRatios describe this run only; they are not GPU utilization "
+              "or a guarantee of an overlap speedup.")
 
-    base = results["sync"]
-    print(f"{'mode':>8s} {'s/loop':>9s} {'speedup':>8s}   vs sync")
-    for name in ("sync", "handles", "loop"):
-        same = torch.equal(base, results[name])
-        print(f"{name:>8s} {times[name]:9.3f} "
-              f"{times['sync'] / times[name]:7.2f}x   "
-              f"{'BIT-IDENTICAL' if same else 'MISMATCH (bug!)'}")
+        if args.profile is not None:
+            from ramtorch.pipeline_2bw_trace import TraceCapture, inspect_trace
 
-    drain = (p - 1)  # refill bubble per step, in microbatch-forwards
-    saved = times["sync"] - times["loop"]
-    print(f"\nstreaming saved {saved * 1e3:.0f} ms per {args.steps}-step loop "
-          f"(~{drain} microbatch-forwards of drain bubble per step with "
-          f"barriered infer())")
-
-    if args.profile is not None:
-        from torch.profiler import ProfilerActivity, profile as torch_profile
-
-        path = args.profile_path or f"infer_stream_{args.profile}.json"
-        fn = {"sync": run_sync, "handles": run_handles,
-              "loop": run_loop}[args.profile]
-        with torch_profile(activities=[ProfilerActivity.CPU,
-                                       ProfilerActivity.CUDA]) as prof:
-            fn(pipe, x0, args.steps, args.mbs, args.lr)
-            # Drain device work BEFORE the profiler stops so the full kernel
-            # timeline is captured.
-            torch.cuda.synchronize()
-        prof.export_chrome_trace(path)
-        print(f"profile ({args.profile} mode) written to {path} "
-              f"— open at https://ui.perfetto.dev")
-    pipe.close()
+            path = args.profile_path or f"infer_stream_{args.profile}.json.gz"
+            # Fresh workers start inside the capture; existing persistent
+            # threads can be invisible to some profiler implementations.
+            profile_pipe = build_pipe(
+                devices, args.chunks_per_stage, args.dim, args.hidden,
+                args.vec_ops, args.offload, args.window, args.bf16)
+            try:
+                synchronize(devices)
+                with TraceCapture(path):
+                    try:
+                        profiled = modes[args.profile](profile_pipe, x0, args.steps,
+                                                       args.mbs, args.lr)
+                    finally:
+                        try:
+                            profile_pipe.close()
+                        finally:
+                            # Real completion on ALL GPUs before Kineto stops;
+                            # this cost is outside the clean timing block.
+                            synchronize(devices)
+            finally:
+                # Also clean up if profiler initialization/export failed.
+                profile_pipe.close()
+            require_exact(f"profile {args.profile}", profiled, base)
+            stats = inspect_trace(path)
+            counts = stats["gpu_kernels_per_device"]
+            missing = [str(d) for d in map(torch.device, devices)
+                       if d.type == "cuda" and not counts.get(str(d.index), 0)]
+            print(f"profile ({args.profile}) written to {path}; "
+                  f"real CUDA kernels by device: {counts}")
+            if missing:
+                raise RuntimeError(f"trace has no real CUDA kernels for {missing}; "
+                                   "check CUPTI/profiler support before judging overlap")
+            print("Open at https://ui.perfetto.dev; host spans are not GPU utilization.")
+    finally:
+        pipe.close()
 
 
 if __name__ == "__main__":
