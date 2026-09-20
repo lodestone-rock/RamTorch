@@ -1,4 +1,4 @@
-"""Dense Adam and Lion with optional *update-level* extrapolation (EF).
+"""Dense Adam, Lion, and Muon with optional *update-level* extrapolation (EF).
 
 For the ordinary optimizer's full update ``u`` at the CURRENT weights, apply
 ``p <- p - u - c * (u - previous_update)``. Moments are advanced exactly once;
@@ -15,7 +15,9 @@ capturable execution, or differentiable optimizer steps are supported. Finite
 precision arithmetic can differ from native optimizers by rounding order; in
 particular, an update is computed explicitly, never recovered by subtracting
 rounded old/new parameters. Tiny updates may leave a parameter unchanged while
-still being present in EF history.
+still being present in EF history. Muon's transient Newton--Schulz working
+matrices use the explicitly selected ``ns_dtype`` (FP32 by default), independently
+of ambient autocast; its persistent optimizer state still uses parameter dtype.
 
 With ``ef_coefficient > 0``, the only additional persistent tensor per active
 parameter is ``previous_update``: the UNCORRECTED update, including its learning
@@ -41,7 +43,7 @@ from numbers import Integral, Real
 import torch
 from torch.optim import Optimizer
 
-__all__ = ["AdamEF", "Lion"]
+__all__ = ["AdamEF", "Lion", "Muon"]
 
 
 def _nonnegative(name, value):
@@ -107,16 +109,24 @@ class _UpdateEFOptimizer(Optimizer):
         candidate = dict(self.defaults, **group)
         self._validate_group(candidate)
         for parameter in params:
-            _dense_real("parameter", parameter)
+            self._validate_parameter(candidate, parameter)
         super().add_param_group(group)
+
+    def _validate_parameter(self, group, parameter):
+        _dense_real("parameter", parameter)
+
+    def _state_spec(self, group):
+        """Return per-group state requirements without mutating optimizer metadata."""
+        return self._moment_names, self._has_adam_step
 
     def _validate_state(self, group, parameter, state, *, loading=False):
         if not isinstance(state, dict):
             raise ValueError("parameter optimizer state must be a dict")
         if not state:
             return
-        expected = set(self._moment_names)
-        if self._has_adam_step:
+        moment_names, has_adam_step = self._state_spec(group)
+        expected = set(moment_names)
+        if has_adam_step:
             expected.add("step")
             _counter("Adam step", state.get("step"))
             if not 0 < state["step"] <= group["ef_step"]:
@@ -165,7 +175,7 @@ class _UpdateEFOptimizer(Optimizer):
                 if not isinstance(key, Integral) or key in parameter_ids:
                     raise ValueError("loaded parameter IDs must be unique integers")
                 parameter_ids.add(key)
-                _dense_real("parameter", parameter)
+                self._validate_parameter(group, parameter)
                 self._validate_state(group, parameter, saved_state.get(key, {}), loading=True)
         if not set(saved_state) <= parameter_ids:
             raise ValueError("loaded optimizer state contains unknown parameter IDs")
@@ -178,7 +188,7 @@ class _UpdateEFOptimizer(Optimizer):
         for group in self.param_groups:
             self._validate_group(group)
             for parameter in group["params"]:
-                _dense_real("parameter", parameter)
+                self._validate_parameter(group, parameter)
                 state = self.state.get(parameter, {})
                 self._validate_state(group, parameter, state)
                 if parameter.requires_grad and parameter.grad is not None:
@@ -207,6 +217,23 @@ class _UpdateEFOptimizer(Optimizer):
         state = self.state.get(parameter)
         if state and "previous_update" in state:
             state["previous_update"].zero_()
+
+
+def _adam_update(parameter, grad, state, *, lr, betas, eps):
+    """Advance Adam moments once and return its bias-corrected, undecayed update."""
+    if not state:
+        state["step"] = 0
+        state["exp_avg"] = torch.zeros_like(parameter, memory_format=torch.preserve_format)
+        state["exp_avg_sq"] = torch.zeros_like(parameter, memory_format=torch.preserve_format)
+    state["step"] += 1
+    beta1, beta2 = betas
+    moment, variance = state["exp_avg"], state["exp_avg_sq"]
+    moment.lerp_(grad, 1 - beta1)
+    variance.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+    bias1 = 1 - beta1 ** state["step"]
+    bias2 = 1 - beta2 ** state["step"]
+    denominator = variance.sqrt().div_(math.sqrt(bias2)).add_(eps)
+    return moment.div(denominator).mul_(lr / bias1)
 
 
 class AdamEF(_UpdateEFOptimizer):
@@ -265,7 +292,6 @@ class AdamEF(_UpdateEFOptimizer):
         self._prepare_step()
         for group in self.param_groups:
             group["ef_step"] += 1
-            beta1, beta2 = group["betas"]
             for parameter in group["params"]:
                 if not parameter.requires_grad or parameter.grad is None:
                     self._skip_parameter(parameter)
@@ -274,19 +300,161 @@ class AdamEF(_UpdateEFOptimizer):
                 if group["weight_decay"] and not group["decoupled_weight_decay"]:
                     grad = grad.add(parameter, alpha=group["weight_decay"])
                 state = self.state[parameter]
-                if not state:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(parameter, memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = torch.zeros_like(parameter, memory_format=torch.preserve_format)
-                state["step"] += 1
-                moment, variance = state["exp_avg"], state["exp_avg_sq"]
-                moment.lerp_(grad, 1 - beta1)
-                variance.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
-                bias1 = 1 - beta1 ** state["step"]
-                bias2 = 1 - beta2 ** state["step"]
-                denominator = variance.sqrt().div_(math.sqrt(bias2)).add_(group["eps"])
-                update = moment.div(denominator).mul_(group["lr"] / bias1)
+                update = _adam_update(parameter, grad, state, lr=group["lr"],
+                                      betas=group["betas"], eps=group["eps"])
                 if group["decoupled_weight_decay"] and group["weight_decay"]:
+                    update.add_(parameter, alpha=group["lr"] * group["weight_decay"])
+                self._apply_update(parameter, state, group, update)
+        return loss
+
+
+class Muon(_UpdateEFOptimizer):
+    r"""Matrix Muon with explicit AdamW groups and optional update-level EF.
+
+    Args:
+        params: Parameters or parameter-group dictionaries. Groups default to
+            ``use_muon=True`` and require nonempty 2D matrices. Explicitly set
+            ``use_muon=False`` for AdamW on biases, stems, heads, embeddings, or
+            other parameters; there is no automatic shape/name-based routing.
+        lr: Finite nonnegative learning rate (default: 0.02). Each group's
+            ``lr`` controls its own Muon or AdamW update independently.
+        momentum: Muon momentum in [0, 1) (default: 0.95).
+        nesterov: Whether to use Muon Nesterov momentum (default: True).
+        weight_decay: Finite nonnegative decoupled decay (default: 0).
+        ns_steps: Positive integer Newton--Schulz iterations (default: 5).
+        eps: Finite positive normalization epsilon (default: 1e-7).
+        ef_coefficient: Finite nonnegative EF coefficient (default: 0).
+        betas: AdamW fallback moment coefficients (default: (0.9, 0.999)).
+        adamw_eps: Finite nonnegative AdamW epsilon (default: 1e-8).
+        adjust_lr_fn: Muon shape scaling: ``'original'`` (default) uses
+            ``sqrt(max(1, rows / cols))``; ``'match_rms_adamw'`` uses
+            ``0.2 * sqrt(max(rows, cols))``. Does not affect fallback groups.
+        ns_dtype: Newton--Schulz working dtype (default: torch.float32), one of
+            torch.float32, torch.float64, torch.bfloat16. Parameters, momentum,
+            full updates, and EF history remain float32/float64.
+
+    Follows the momentum and LR convention documented for PyTorch 2.9 Muon:
+    initialize ``B=0``, advance ``B = momentum*B + g`` (NOT an EMA), and use
+    ``q = g + momentum*B`` with Nesterov, otherwise ``q = B``. Cast q to
+    ``ns_dtype`` and normalize by its Frobenius norm PLUS eps. Transpose tall
+    matrices, then iterate ``A = X @ X.T`` and
+    ``X = 3.4445*X + (-4.775*A + 2.0315*(A @ A)) @ X`` exactly ns_steps times.
+    Transpose back and cast to the parameter dtype. Ambient CPU/CUDA autocast
+    is explicitly disabled for this computation. Native Muon implementations
+    often use BF16 Newton--Schulz; the FP32 default and explicit full-update
+    arithmetic here do NOT promise native bit parity, even when EF is zero.
+
+    The full update at CURRENT weights is
+    ``u = lr*shape_scale*Q + lr*weight_decay*p``: decay uses UNADJUSTED lr.
+    Fallback groups compute ordinary bias-corrected AdamW, including decay in
+    u. Both paths apply EF exactly once through ``p -= u + c*(u-u_prev)``;
+    their first completed logical group call is ordinary. Missing/frozen
+    parameters leave weights and moments untouched and zero existing history;
+    later first-use parameters receive correction against zero history.
+    History is the uncorrected full u, including that call's LR and decay.
+
+    One optimizer object can therefore own every parameter in a 2BW stage.
+    Muon state contains only ``momentum_buffer``; AdamW state contains
+    ``exp_avg``, ``exp_avg_sq``, and ``step``. Each active parameter adds exactly
+    one persistent ``previous_update`` iff c>0. Serialization preserves group
+    choices, ns_dtype, and ef_step, not a full pipeline checkpoint. State follows
+    Parameter identity through same-shape/dtype/device storage rebinding.
+    Low-precision optimizer parameters, sparse/complex tensors, GradScaler,
+    fused/foreach, capturable, and differentiable steps are unsupported.
+    """
+
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True,
+                 weight_decay=0, ns_steps=5, eps=1e-7, ef_coefficient=0,
+                 betas=(0.9, 0.999), adamw_eps=1e-8, adjust_lr_fn="original",
+                 ns_dtype=torch.float32):
+        super().__init__(params, dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                                     weight_decay=weight_decay, ns_steps=ns_steps,
+                                     eps=eps, ef_coefficient=ef_coefficient,
+                                     betas=betas, adamw_eps=adamw_eps,
+                                     adjust_lr_fn=adjust_lr_fn, ns_dtype=ns_dtype,
+                                     use_muon=True))
+
+    def _validate_group(self, group):
+        super()._validate_group(group)
+        _nonnegative("momentum", group["momentum"])
+        if group["momentum"] >= 1:
+            raise ValueError("momentum must be less than 1")
+        for name in ("nesterov", "use_muon"):
+            if not isinstance(group[name], bool):
+                raise ValueError(f"{name} must be a bool")
+        _counter("ns_steps", group["ns_steps"])
+        if group["ns_steps"] == 0:
+            raise ValueError("ns_steps must be a positive integer")
+        _nonnegative("eps", group["eps"])
+        if group["eps"] == 0:
+            raise ValueError("eps must be positive")
+        _nonnegative("adamw_eps", group["adamw_eps"])
+        if group["adjust_lr_fn"] not in ("original", "match_rms_adamw"):
+            raise ValueError("adjust_lr_fn must be 'original' or 'match_rms_adamw'")
+        if group["ns_dtype"] not in (torch.float32, torch.float64, torch.bfloat16):
+            raise ValueError("ns_dtype must be torch.float32, torch.float64, or torch.bfloat16")
+
+    def _validate_parameter(self, group, parameter):
+        super()._validate_parameter(group, parameter)
+        if group["use_muon"] and (parameter.ndim != 2 or parameter.numel() == 0):
+            raise ValueError("Muon groups require nonempty 2D matrix parameters; "
+                             "set use_muon=False explicitly for AdamW fallback")
+
+    def _state_spec(self, group):
+        if group["use_muon"]:
+            return ("momentum_buffer",), False
+        return ("exp_avg", "exp_avg_sq"), True
+
+    @staticmethod
+    def _orthogonalize(direction, group):
+        # Autocast is thread-local: honor ns_dtype even inside an AMP worker.
+        with torch.autocast(device_type=direction.device.type, enabled=False):
+            matrix = direction.to(dtype=group["ns_dtype"])
+            matrix = matrix / (matrix.norm() + group["eps"])
+            transpose = matrix.shape[0] > matrix.shape[1]
+            if transpose:
+                matrix = matrix.T
+            for _ in range(group["ns_steps"]):
+                gram = matrix @ matrix.T
+                polynomial = -4.775 * gram + 2.0315 * (gram @ gram)
+                matrix = 3.4445 * matrix + polynomial @ matrix
+            if transpose:
+                matrix = matrix.T
+            return matrix.to(dtype=direction.dtype)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform one logical call; evaluate an optional closure with gradients."""
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        self._prepare_step()
+        for group in self.param_groups:
+            group["ef_step"] += 1
+            for parameter in group["params"]:
+                if not parameter.requires_grad or parameter.grad is None:
+                    self._skip_parameter(parameter)
+                    continue
+                state = self.state[parameter]
+                if group["use_muon"]:
+                    if not state:
+                        state["momentum_buffer"] = torch.zeros_like(
+                            parameter, memory_format=torch.preserve_format)
+                    momentum = state["momentum_buffer"]
+                    momentum.mul_(group["momentum"]).add_(parameter.grad)
+                    direction = (parameter.grad.add(momentum, alpha=group["momentum"])
+                                 if group["nesterov"] else momentum)
+                    update = self._orthogonalize(direction, group)
+                    rows, cols = parameter.shape
+                    scale = (math.sqrt(max(1.0, rows / cols))
+                             if group["adjust_lr_fn"] == "original" else
+                             0.2 * math.sqrt(max(rows, cols)))
+                    update.mul_(group["lr"] * scale)
+                else:
+                    update = _adam_update(parameter, parameter.grad, state, lr=group["lr"],
+                                          betas=group["betas"], eps=group["adamw_eps"])
+                if group["weight_decay"]:
                     update.add_(parameter, alpha=group["lr"] * group["weight_decay"])
                 self._apply_update(parameter, state, group, update)
         return loss

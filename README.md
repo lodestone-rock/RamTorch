@@ -19,6 +19,7 @@ Both are built for **PCIe bandwidth**, not NVLink — which is exactly what a si
 
 - **Single-GPU Weight Streaming (`OffloadModel`)**: weights live in CPU pinned memory and stream through a sliding GPU window (with optional pinned layers). Train/infer models too big for one GPU.
 - **Single-Process Pipeline Parallelism**: split a model across GPUs with GPipe / 1F1B / staggered-1B1F schedules — no `torchrun`, no process groups, no NCCL.
+- **Resident PipeDream-2BW training** (`Pipeline.train_session()`): continuous 1F1B execution with two consistent compute-weight versions and one-step delayed gradients. Optional CPU optimizer state; `AdamEF`, `Lion`, and `Muon` support update-level error feedback. See the [training guide](docs/pipeline_parallel.md#resident-pipedream-2bw-training) and `examples/mnist_pipedream_2bw.py` for matched convergence checks.
 - **Pipeline + weight streaming combined**: a stage passed as a list of chunks streams its weights from CPU RAM through a small GPU window, prefetched in schedule order — for stages that don't fit their GPU.
 - **Mixed precision (`autocast=`)**, **tuple stage outputs**, and a **grad-bypass escape hatch** for custom losses.
 - **Streaming inference for iterative loops** (`infer_loop` / `infer_submit`): persistent stage workers keep the pipeline full across denoising-style iterations instead of draining it between steps — per-microbatch outputs stream back as they complete.

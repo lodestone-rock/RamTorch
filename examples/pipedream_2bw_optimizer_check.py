@@ -1,4 +1,4 @@
-"""Independent AdamEF/Lion equations and exact PipeDream-2BW schedule checks.
+"""Independent AdamEF/Lion/Muon equations and exact PipeDream-2BW checks.
 
 Run from the repository root, using a Python environment with working PyTorch::
 
@@ -9,9 +9,10 @@ Run from the repository root, using a Python environment with working PyTorch::
 --bf16 ADDS autocast checks to the FP32 bank/pipeline suite; optimizer parameters
 and moments remain FP32. --unit-only and --pipeline-only isolate the two suites.
 No production optimizer helper is used to compute expected optimizer updates:
-Python scalar equations check Float64 weights, moments and full update history;
-plain AdamEF is also compared with native Adam/AdamW. The copied-history
-reference uses the same factory ONLY for independent bank/schedule comparisons.
+Python scalar equations and an independent Float64 Newton-Schulz polynomial
+check weights, moments and full update history; plain AdamEF and Muon's explicit
+fallback are also compared with native Adam/AdamW. The copied-history reference
+uses the same factory ONLY for independent bank/schedule comparisons.
 """
 from __future__ import annotations
 
@@ -34,7 +35,7 @@ from ramtorch.pipeline import Stage
 from ramtorch.pipeline_2bw import _VersionedStage
 
 
-KINDS = ("adam", "adamw", "lion")
+KINDS = ("adam", "adamw", "lion", "muon")
 INITIAL = ((0.8, -1.3, 0.0), (-0.6, 0.2, 1.1), (1.7, -0.4, 0.3), (3.0, 2.0, 1.0))
 GRADIENTS = (
     ((0.3, -0.7, 0.0), (-0.2, 0.4, 0.8), None, None),
@@ -62,6 +63,21 @@ def optimizer_factory(kind, coefficient, **overrides):
         cls = AdamEF
     elif kind == "lion":
         cls = Lion
+    elif kind == "muon":
+        from ramtorch.delayed_optim import Muon
+
+        options.update(momentum=0.7, nesterov=True, ns_steps=5, eps=1e-7,
+                       adamw_eps=0.031, adjust_lr_fn="original", ns_dtype=torch.float32)
+        options.update(overrides)
+
+        def make_muon(parameters):
+            # One optimizer per stage; vectors are explicit AdamW, never Muon.
+            parameters = list(parameters)
+            groups = [{"params": [p for p in parameters if p.ndim == 2], "use_muon": True},
+                      {"params": [p for p in parameters if p.ndim != 2], "use_muon": False}]
+            return Muon([group for group in groups if group["params"]], **options)
+
+        return make_muon
     else:
         raise ValueError(f"unknown optimizer {kind!r}")
     options.update(overrides)
@@ -408,9 +424,420 @@ def check_rejections(kind, device):
     _reject(sparse_gradient, kind + " sparse gradient", (ValueError, TypeError, RuntimeError, NotImplementedError))
 
 
+def _muon_polynomial(matrix, steps, eps):
+    """Independent double-precision scalar matrix algebra, not a production helper.
+
+    Keeping dot products in Python also avoids sharing torch's matmul kernels,
+    autocast, or a production transpose/normalization path with the unit oracle.
+    """
+    values = matrix.detach().cpu().double().tolist()
+    transpose = len(values) > len(values[0])
+    if transpose:
+        values = [list(column) for column in zip(*values)]
+    norm = math.sqrt(sum(value * value for row in values for value in row))
+    values = [[value / (norm + eps) for value in row] for row in values]
+
+    def multiply(left, right):
+        columns = list(zip(*right))
+        return [[sum(a * b for a, b in zip(row, column)) for column in columns]
+                for row in left]
+
+    for _ in range(steps):
+        gram = multiply(values, list(zip(*values)))
+        gram_squared = multiply(gram, gram)
+        polynomial = [[-4.775 * a + 2.0315 * b for a, b in zip(row_a, row_b)]
+                      for row_a, row_b in zip(gram, gram_squared)]
+        product = multiply(polynomial, values)
+        values = [[3.4445 * x + y for x, y in zip(row_x, row_y)]
+                  for row_x, row_y in zip(values, product)]
+    if transpose:
+        values = [list(column) for column in zip(*values)]
+    return torch.tensor(values, dtype=torch.float64)
+
+
+def _muon_parameters(device="cpu", dtype=torch.float64):
+    # Tall, wide, square, zero direction, late, unused, frozen; then explicit
+    # AdamW vector/scalar/matrix/frozen/unused fallbacks in the SAME optimizer.
+    shapes = ((5, 3), (3, 5), (3, 3), (2, 3), (2, 2), (2, 2), (2, 2),
+              (3,), (), (2, 3), (3,), (2,))
+    result = []
+    for index, shape in enumerate(shapes):
+        values = torch.arange(math.prod(shape), dtype=torch.float64).reshape(shape)
+        values = ((values + index * 0.7).cos() * 0.6).to(device=device, dtype=dtype)
+        result.append(nn.Parameter(values, requires_grad=index not in (6, 10)))
+    return result
+
+
+def _muon_gradients(parameters, call):
+    gradients = []
+    for index, parameter in enumerate(parameters):
+        if (call == 4 or index in (5, 11) or (index == 4 and call < 2)
+                or (call == 1 and index in (1, 7)) or (call == 3 and index == 2)):
+            gradients.append(None)
+            continue
+        values = torch.arange(parameter.numel(), dtype=torch.float64).reshape(parameter.shape)
+        values = (values * 0.43 + index * 0.37 + call * 0.61).sin() * 0.8
+        if index == 3 or (call in (2, 6) and index == 0):
+            values.zero_()
+        gradients.append(values.to(device=parameter.device, dtype=parameter.dtype))
+    return gradients
+
+
+def _muon_optimizer(parameters, coefficient, **overrides):
+    from ramtorch.delayed_optim import Muon
+
+    options = dict(lr=0.017, momentum=0.7, nesterov=True, weight_decay=0.13,
+                   ns_steps=5, eps=1e-7, ef_coefficient=coefficient, betas=(0.6, 0.8),
+                   adamw_eps=0.031, adjust_lr_fn="original", ns_dtype=torch.float64)
+    options.update(overrides)
+    return Muon([
+        {"params": parameters[:7]},  # use_muon=True must be the default.
+        {"params": parameters[7:9], "use_muon": False, "weight_decay": 0.04,
+         "betas": (0.4, 0.75), "adamw_eps": 0.013},
+        {"params": parameters[9:], "use_muon": False, "weight_decay": 0.09,
+         "betas": (0.3, 0.85), "adamw_eps": 0.007,
+         "ef_coefficient": coefficient * 0.35},
+    ], **options)
+
+
+def _muon_assign(parameters, gradients):
+    for parameter, gradient in zip(parameters, gradients):
+        parameter.grad = None if gradient is None else gradient.clone()
+
+
+def _muon_lrs(optimizer, call):
+    rates = [LEARNING_RATES[call % len(LEARNING_RATES)] * factor for factor in (1.0, 0.7, 1.3)]
+    for group, lr in zip(optimizer.param_groups, rates):
+        group["lr"] = lr
+    return rates
+
+
+class MuonEquations:
+    """Independent Float64 updates, current-weight decay, and per-group EF clocks."""
+
+    def __init__(self, parameters, optimizer):
+        self.weights = [parameter.detach().cpu().double().clone() for parameter in parameters]
+        self.active = [parameter.requires_grad for parameter in parameters]
+        indices = {id(parameter): index for index, parameter in enumerate(parameters)}
+        self.groups = [dict(copy.deepcopy({key: value for key, value in group.items() if key != "params"}),
+                            indices=[indices[id(p)] for p in group["params"]])
+                       for group in optimizer.param_groups]
+        self.states = [{} for _ in parameters]
+
+    def step(self, gradients, rates):
+        for group, lr in zip(self.groups, rates):
+            group["ef_step"] += 1
+            coefficient = group["ef_coefficient"]
+            for index in group["indices"]:
+                state, weight = self.states[index], self.weights[index]
+                if gradients[index] is None or not self.active[index]:
+                    if "previous_update" in state:
+                        state["previous_update"].zero_()
+                    continue
+                gradient = gradients[index].detach().cpu().double()
+                if group["use_muon"]:
+                    momentum = group["momentum"]
+                    old = state.get("momentum_buffer", torch.zeros_like(weight))
+                    buffer = momentum * old + gradient
+                    state["momentum_buffer"] = buffer
+                    direction = gradient + momentum * buffer if group["nesterov"] else buffer
+                    rows, columns = weight.shape
+                    scale = (math.sqrt(max(1.0, rows / columns)) if group["adjust_lr_fn"] == "original"
+                             else 0.2 * math.sqrt(max(rows, columns)))
+                    update = lr * scale * _muon_polynomial(direction, group["ns_steps"], group["eps"])
+                else:
+                    beta1, beta2 = group["betas"]
+                    state["step"] = state.get("step", 0) + 1
+                    moment = beta1 * state.get("exp_avg", torch.zeros_like(weight)) + (1 - beta1) * gradient
+                    variance = beta2 * state.get("exp_avg_sq", torch.zeros_like(weight)) + (1 - beta2) * gradient.square()
+                    state["exp_avg"], state["exp_avg_sq"] = moment, variance
+                    corrected_moment = moment / (1 - beta1 ** state["step"])
+                    corrected_variance = variance / (1 - beta2 ** state["step"])
+                    update = lr * corrected_moment / (corrected_variance.sqrt() + group["adamw_eps"])
+                # Decay is neither orthogonalized nor multiplied by Muon's scale.
+                update = update + lr * group["weight_decay"] * weight
+                corrected = update
+                if group["ef_step"] > 1 and coefficient:
+                    corrected = update + coefficient * (update - state.get("previous_update", torch.zeros_like(weight)))
+                self.weights[index] = weight - corrected
+                if coefficient:
+                    state["previous_update"] = update.clone()
+
+    def check(self, parameters, optimizer, path):
+        for actual, expected in zip(optimizer.param_groups, self.groups):
+            assert actual["ef_step"] == expected["ef_step"], path + ": wrong logical group clock"
+        for index, parameter in enumerate(parameters):
+            location = f"{path}.parameter{index}"
+            torch.testing.assert_close(parameter.detach().cpu(), self.weights[index],
+                                       rtol=2e-12, atol=2e-13, msg=location)
+            actual, expected = optimizer.state.get(parameter, {}), self.states[index]
+            assert actual.keys() == expected.keys(), location + ": unexpected persistent state"
+            for key, value in expected.items():
+                if isinstance(value, torch.Tensor):
+                    torch.testing.assert_close(actual[key].cpu(), value, rtol=2e-12, atol=2e-13,
+                                               msg=location + "." + key)
+                else:
+                    assert actual[key] == value, location + ": fallback moments advanced twice"
+
+
+def check_muon_equations(device):
+    for coefficient in (0.0, 1.0):
+        for steps in (1, 5):
+            for nesterov in (False, True):
+                for scaling in ("original", "match_rms_adamw"):
+                    for empty_start in (False, True):
+                        parameters = _muon_parameters(device)
+                        optimizer = _muon_optimizer(parameters, coefficient, ns_steps=steps,
+                                                    nesterov=nesterov, adjust_lr_fn=scaling)
+                        equations = MuonEquations(parameters, optimizer)
+                        for call in range(7 + int(empty_start)):
+                            rates = _muon_lrs(optimizer, call)
+                            gradients = ([None] * len(parameters) if empty_start and call == 0 else
+                                         _muon_gradients(parameters, call - int(empty_start)))
+                            _muon_assign(parameters, gradients)
+                            before = [p.detach().clone() for p in parameters]
+                            before_state = [copy.deepcopy(optimizer.state.get(p, {})) for p in parameters]
+                            optimizer.step()
+                            equations.step(gradients, rates)
+                            path = f"muon.c{coefficient}.ns{steps}.nesterov{nesterov}.{scaling}.empty{empty_start}.call{call}"
+                            equations.check(parameters, optimizer, path)
+                            for index, parameter in enumerate(parameters):
+                                assert_exact(parameter.grad, gradients[index], path=path + ".gradient")
+                                if gradients[index] is None or not parameter.requires_grad:
+                                    assert_exact(parameter, before[index], path=path + ".missing_or_frozen")
+                                    state = optimizer.state.get(parameter, {})
+                                    assert state.keys() == before_state[index].keys()
+                                    for key, value in before_state[index].items():
+                                        if key == "previous_update":
+                                            assert not torch.count_nonzero(state[key]).item()
+                                        else:
+                                            assert_exact(state[key], value, path=path + ".skipped." + key)
+    print(f"PASS Muon Float64 independent polynomial: tall/wide/square/zero, NS 1/5, both momentum/scales, "
+          f"current decay, mixed AdamW, EF, missing/frozen/late/empty startup: {device}")
+
+
+def check_muon_native_adamw(device):
+    from ramtorch.delayed_optim import Muon
+
+    for dtype in (torch.float32, torch.float64):
+        for decay in (0.0, 0.13):
+            actual, expected = _muon_parameters(device, dtype)[7:], _muon_parameters(device, dtype)[7:]
+            options = dict(lr=0.07, betas=(0.6, 0.8), weight_decay=decay)
+            optimizer = Muon([{"params": actual, "use_muon": False}], adamw_eps=0.031, **options)
+            native = torch.optim.AdamW(expected, eps=0.031, foreach=False, fused=False, **options)
+            tolerance = 3e-6 if dtype == torch.float32 else 3e-13
+            for call in range(7):
+                optimizer.param_groups[0]["lr"] = native.param_groups[0]["lr"] = LEARNING_RATES[call]
+                gradients = _muon_gradients(_muon_parameters(device, dtype), call)[7:]
+                # Native torch optimizers do not themselves skip frozen attached gradients.
+                gradients = [g if p.requires_grad else None for p, g in zip(actual, gradients)]
+                _muon_assign(actual, gradients)
+                _muon_assign(expected, gradients)
+                optimizer.step()
+                native.step()
+                for left, right in zip(actual, expected):
+                    torch.testing.assert_close(left, right, rtol=tolerance, atol=tolerance)
+                    ours, theirs = optimizer.state.get(left, {}), native.state.get(right, {})
+                    assert "previous_update" not in ours
+                    assert ours.keys() == theirs.keys()
+                    for key in ours:
+                        torch.testing.assert_close(torch.as_tensor(ours[key]).cpu().double(),
+                                                   torch.as_tensor(theirs[key]).cpu().double(),
+                                                   rtol=tolerance, atol=tolerance)
+    print(f"PASS Muon explicit AdamW fallback: native FP32/FP64 parity, vectors/scalars/matrices: {device}")
+
+
+def check_muon_budget_resume(device):
+    plain, corrected = _muon_parameters(device), _muon_parameters(device)
+    ordinary, ef = _muon_optimizer(plain, 0.0), _muon_optimizer(corrected, 1.0)
+    assert not ordinary.state and not ef.state, "Muon constructor allocated parameter state"
+    for parameters, optimizer in ((plain, ordinary), (corrected, ef)):
+        _muon_assign(parameters, _muon_gradients(parameters, 0))
+        optimizer.step()
+    for p, q in zip(plain, corrected):
+        base, extra = ordinary.state.get(p, {}), ef.state.get(q, {})
+        assert_exact(p, q, path="muon.budget.startup")
+        if not base:
+            assert not extra
+            continue
+        assert extra.keys() == base.keys() | {"previous_update"}
+        assert_exact({key: extra[key] for key in base}, base, path="muon.budget.moments")
+        history = extra["previous_update"]
+        assert history.shape == q.shape and history.dtype == q.dtype and history.device == q.device
+        assert not history.requires_grad
+        for tensor in [q, q.grad] + [value for value in base.values() if isinstance(value, torch.Tensor)] + [
+                value for key, value in extra.items() if key != "previous_update" and isinstance(value, torch.Tensor)]:
+            assert history.untyped_storage().data_ptr() != tensor.untyped_storage().data_ptr()
+        nbytes = lambda state: sum(value.numel() * value.element_size() for value in state.values()
+                                  if isinstance(value, torch.Tensor))
+        assert nbytes(extra) - nbytes(base) == q.numel() * q.element_size(), "EF must add one tensor only"
+
+    for coefficient in (0.0, 1.0):
+        original = _muon_parameters(device)
+        optimizer = _muon_optimizer(original, coefficient)
+        snapshots = [(copy.deepcopy(original), copy.deepcopy(optimizer.state_dict()))]
+        calls = [[None] * len(original)] + [_muon_gradients(original, call) for call in range(7)]
+        for call, gradients in enumerate(calls):
+            _muon_lrs(optimizer, call)
+            _muon_assign(original, gradients)
+            optimizer.step()
+            snapshots.append((copy.deepcopy(original), copy.deepcopy(optimizer.state_dict())))
+        for split in (0, 1, 2, 4, 6):
+            buffer = io.BytesIO()
+            weights, state = snapshots[split]
+            torch.save({"weights": [p.detach().clone() for p in weights], "optimizer": state}, buffer)
+            buffer.seek(0)
+            saved = torch.load(buffer, map_location=device, weights_only=True)
+            resumed = [nn.Parameter(value, requires_grad=p.requires_grad)
+                       for value, p in zip(saved["weights"], weights)]
+            restored = _muon_optimizer(resumed, 0.37, lr=0.9, momentum=0.1, ns_steps=1,
+                                       nesterov=False, ns_dtype=torch.bfloat16, adjust_lr_fn="match_rms_adamw")
+            restored.load_state_dict(saved["optimizer"])
+            assert_exact(restored.state_dict(), state, path=f"muon.resume{split}.loaded")
+            for call in range(split, len(calls)):
+                _muon_lrs(restored, call)
+                _muon_assign(resumed, calls[call])
+                restored.step()
+                expected_weights, expected_state = snapshots[call + 1]
+                assert_exact(resumed, expected_weights, path=f"muon.resume{split}.call{call}.weights")
+                assert_exact(restored.state_dict(), expected_state, path=f"muon.resume{split}.call{call}.state")
+    print(f"PASS Muon one-history-tensor bytes, changing LR and byte-exact serialized continuation: {device}")
+
+
+def check_muon_autocast(device):
+    from ramtorch.delayed_optim import Muon
+
+    if torch.device(device).type == "cuda" and not torch.cuda.is_bf16_supported():
+        print(f"SKIP Muon BF16 ambient autocast: unsupported device {device}")
+        return
+    for dtype in (torch.float32, torch.float64):
+        histories = {}
+        for ns_dtype in (torch.float32, torch.float64, torch.bfloat16):
+            actual = _muon_parameters(device, dtype)[:4]
+            expected = [nn.Parameter(p.detach().clone()) for p in actual]
+            options = dict(lr=0.07, ef_coefficient=1.0, weight_decay=0.13, ns_dtype=ns_dtype)
+            ambient, ordinary = Muon(actual, **options), Muon(expected, **options)
+            for call in range(3):
+                gradients = _muon_gradients(actual, call)
+                _muon_assign(actual, gradients)
+                _muon_assign(expected, gradients)
+                with torch.autocast(torch.device(device).type, dtype=torch.bfloat16):
+                    ambient.step()
+                ordinary.step()
+                assert_exact(actual, expected, path=f"muon.autocast.{dtype}.{ns_dtype}.weights")
+                assert_exact(ambient.state_dict(), ordinary.state_dict(), path="muon.autocast.state")
+                for parameter in actual:
+                    for value in ambient.state.get(parameter, {}).values():
+                        if isinstance(value, torch.Tensor):
+                            assert value.dtype == dtype, "NS precision leaked into persistent state"
+            histories[ns_dtype] = [ambient.state[p]["previous_update"].clone() for p in actual]
+        # Matching ambient/off runs alone would also pass an implementation
+        # that ignores ns_dtype entirely. These nontrivial fixtures must differ.
+        for first, second in ((torch.float32, torch.float64), (torch.float32, torch.bfloat16)):
+            assert any(not torch.equal(a, b) for a, b in zip(histories[first], histories[second])), \
+                f"Muon ignored explicit NS precision {first} versus {second}"
+    print(f"PASS Muon explicit FP32/FP64/BF16 NS is byte-exact with/without ambient BF16 autocast: {device}")
+
+
+def check_muon_rejections(device):
+    from ramtorch.delayed_optim import Muon
+
+    invalid = [
+        ("lr", -0.1), ("lr", math.nan), ("lr", math.inf),
+        ("weight_decay", -0.1), ("weight_decay", math.nan), ("weight_decay", math.inf),
+        ("ef_coefficient", -0.1), ("ef_coefficient", math.nan), ("ef_coefficient", math.inf),
+        ("ef_coefficient", "1"),
+        ("momentum", -0.1), ("momentum", 1.0), ("momentum", math.nan), ("momentum", math.inf),
+        ("nesterov", 1), ("nesterov", "true"),
+        ("ns_steps", 0), ("ns_steps", -1), ("ns_steps", 1.5), ("ns_steps", True),
+        ("eps", -1e-7), ("eps", 0.0), ("eps", math.nan), ("eps", math.inf),
+        ("adamw_eps", -1e-8), ("adamw_eps", math.nan), ("adamw_eps", math.inf),
+        ("betas", (-0.1, 0.9)), ("betas", (0.9, 1.0)), ("betas", (math.nan, 0.9)),
+        ("betas", (0.9,)), ("betas", (0.1, 0.2, 0.3)),
+        ("adjust_lr_fn", "unknown"), ("adjust_lr_fn", None),
+        ("ns_dtype", torch.float16), ("ns_dtype", torch.int64), ("ns_dtype", "float32"),
+    ]
+    for key, value in invalid:
+        _reject(lambda: Muon([_muon_parameters(device)[0]], **{key: value}), f"Muon default {key}={value!r}")
+        _reject(lambda: Muon([{"params": [_muon_parameters(device)[0]], key: value}]),
+                f"Muon group {key}={value!r}")
+    for key, value in (("use_muon", 1), ("use_muon", "false"), ("ef_step", -1),
+                       ("ef_step", 0.5), ("fused", True), ("foreach", True)):
+        _reject(lambda: Muon([{"params": [_muon_parameters(device)[0]], key: value}]),
+                f"Muon group {key}={value!r}")
+    for shape in ((), (3,), (2, 2, 2), (0, 3), (3, 0)):
+        parameter = nn.Parameter(torch.ones(shape, device=device, dtype=torch.float64))
+        _reject(lambda: Muon([parameter]), f"Muon implicit matrix ndim={len(shape)}")
+        _reject(lambda: Muon([{"params": [parameter], "use_muon": True}]),
+                f"Muon explicit matrix ndim={len(shape)}")
+        fallback = Muon([{"params": [parameter], "use_muon": False}])
+        parameter.grad = torch.ones_like(parameter)
+        fallback.step()  # Nonmatrices are legal only with explicit fallback.
+    for dtype in (torch.float16, torch.bfloat16, torch.complex64):
+        _reject(lambda: Muon([nn.Parameter(torch.ones(2, 3, device=device, dtype=dtype))]),
+                f"Muon parameter dtype={dtype}")
+
+    def sparse_gradient():
+        parameter = _muon_parameters(device)[0]
+        optimizer = Muon([parameter])
+        parameter.grad = torch.sparse_coo_tensor([[0, 2], [1, 0]], [0.1, -0.2], parameter.shape,
+                                                 device=device, dtype=parameter.dtype,
+                                                 check_invariants=True)
+        optimizer.step()
+    _reject(sparse_gradient, "Muon sparse gradient", (ValueError, TypeError, RuntimeError, NotImplementedError))
+    # Live group edits are validated too, before any earlier valid group mutates.
+    parameters = _muon_parameters(device)
+    optimizer = _muon_optimizer(parameters, 1.0)
+    _muon_assign(parameters, _muon_gradients(parameters, 0))
+    before = [p.detach().clone() for p in parameters]
+    optimizer.param_groups[-1]["lr"] = -0.1
+    _reject(optimizer.step, "Muon mutated invalid group")
+    assert_exact(parameters, before, path="muon.invalid_group.atomic_weights")
+    assert not optimizer.state and all(group["ef_step"] == 0 for group in optimizer.param_groups)
+    print(f"PASS Muon default/group validation, explicit fallback and dense matrix restrictions: {device}")
+
+
+def check_muon_closure(device):
+    for coefficient in (0.0, 1.0):
+        actual, expected = _muon_parameters(device), _muon_parameters(device)
+        optimizer, direct = (_muon_optimizer(params, coefficient) for params in (actual, expected))
+        for call in range(3):
+            returned = []
+
+            def closure():
+                assert torch.is_grad_enabled(), "Muon closure disabled gradients"
+                optimizer.zero_grad(set_to_none=True)
+                loss = sum(p.square().sum() * (call + 1) for p in actual if p.requires_grad)
+                loss.backward()
+                returned.append(loss)
+                return loss
+
+            result = optimizer.step(closure)
+            assert len(returned) == 1 and result is returned[0]
+            direct.zero_grad(set_to_none=True)
+            loss = sum(p.square().sum() * (call + 1) for p in expected if p.requires_grad)
+            loss.backward()
+            direct.step()
+            assert_exact(actual, expected, path="muon.closure.weights")
+            assert_exact(optimizer.state_dict(), direct.state_dict(), path="muon.closure.state")
+    print(f"PASS Muon closure executes once with gradients and returns its loss: {device}")
+
+
+def check_muon_units(device):
+    check_muon_equations(device)
+    check_muon_native_adamw(device)
+    check_muon_budget_resume(device)
+    check_muon_autocast(device)
+    check_muon_rejections(device)
+    check_muon_closure(device)
+
+
 def check_units(device):
     check_native_adam(device)
     for kind in KINDS:
+        if kind == "muon":
+            check_muon_units(device)
+            continue  # Scalar/vector fixtures are not legal implicit Muon matrices.
         check_state_budget(kind, device)
         check_rejections(kind, device)
         check_group_overrides(kind, device)

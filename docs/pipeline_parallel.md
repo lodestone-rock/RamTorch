@@ -430,7 +430,7 @@ pipe.close()
 ```
 
 - `optimizer_factory(params)` must create a fresh **standard `torch.optim.SGD`,
-  `torch.optim.Adam`, `torch.optim.AdamW`, or RamTorch `AdamEF`/`Lion`**, owning
+  `torch.optim.Adam`, `torch.optim.AdamW`, or RamTorch `AdamEF`/`Lion`/`Muon`**, owning
   exactly those stage parameters. Pass one
   factory for all stages or a list of one factory per stage. For example, use
   `lambda params: torch.optim.SGD(params, lr=0.01, momentum=0.9, foreach=False,
@@ -571,7 +571,7 @@ the former uses fresh gradients, the latter one-update-delayed gradients.
 
 ### MNIST convergence and update-level error feedback
 
-`examples/mnist_pipedream_2bw.py` compares **Adam and Lion**, each with
+`examples/mnist_pipedream_2bw.py` compares **Adam, Lion, and Muon**, each with
 synchronous `staggered_1b1f`, ordinary delayed 2BW, and delayed 2BW + EF:
 
 ```bash
@@ -599,7 +599,7 @@ uses a separate latest-weight replica after a drain, without resetting the 2BW
 history. No clipping or LR schedule is used; this is not a reproduction of the
 paper's LLM recipes. A single seed is a demo, not statistical evidence EF helps.
 
-`ramtorch.AdamEF` and `ramtorch.Lion` implement **update-level**, not raw-gradient,
+`ramtorch.AdamEF`, `ramtorch.Lion`, and `ramtorch.Muon` implement **update-level**, not raw-gradient,
 error feedback. For the complete uncorrected optimizer update `u`, they apply
 `x <- x - u - c * (u - previous_update)`. The first completed optimizer call uses
 an ordinary update; correction begins on the second. This maps the paper's
@@ -608,7 +608,7 @@ no-op is inserted into the 2BW schedule. Each gradient advances moments exactly
 once. The saved buffer holds the **uncorrected update**, not the corrected
 parameter displacement or a subtraction of rounded before/after weights.
 
-Both classes accept `ef_coefficient` (`AdamEF` defaults to 1, `Lion` to 0).
+All three accept `ef_coefficient` (`AdamEF` defaults to 1, `Lion`/`Muon` to 0).
 The example uses the same class with `c=0` for plain controls and `c=1` for EF.
 `AdamEF` defaults to coupled L2 decay, i.e. **Adam, not AdamW**; setting
 `decoupled_weight_decay=True` gives AdamW-style decay. Lion uses decoupled decay.
@@ -629,6 +629,58 @@ capturable or GradScaler skip semantics. Optimizer `state_dict()` restoration
 includes history and startup counters; this is **not** a full 2BW-session
 checkpoint API (which would also need both weight banks and version metadata).
 
+#### Muon parameter roles and numerical conventions
+
+`Muon` orthogonalizes **2D matrices only**. Its default `use_muon=True`
+parameter groups reject vectors, scalars, and higher-rank tensors rather than
+silently reshaping them. Put non-Muon parameters into explicit
+`use_muon=False` groups, which use bias-corrected AdamW (`betas`, `adamw_eps`)
+inside the same optimizer/state dictionary. These groups can have separate
+learning rates. Being 2D is necessary, not sufficient: embeddings and output
+heads should normally use the fallback too.
+
+```python
+from ramtorch import Muon
+
+optimizer = Muon([
+    {"params": hidden_matrix_parameters, "use_muon": True, "lr": 0.02},
+    {"params": other_parameters, "use_muon": False, "lr": 0.001},
+], momentum=0.95, ef_coefficient=1.0)
+```
+
+For 2BW, construct those groups inside each stage's `optimizer_factory` from
+its supplied parameters, not from captured GPU parameters (CPU placement gives
+the factory separate masters). The MNIST example preserves named parameter
+roles by position for this purpose. Both groups must together own exactly the
+parameters supplied by that stage.
+
+The MNIST example selects only the hidden residual-block matrices for Muon;
+the stem, classifier head, and all biases use AdamW. Defaults are Muon LR
+0.02, fallback LR 0.001, momentum history coefficient 0.95, Nesterov enabled,
+five Newton–Schulz iterations, and zero decay. EF applies to **both** kinds of
+groups. Run just this comparison with `--optimizers muon`; configure it with
+`--muon-lr`, `--muon-adamw-lr`, `--muon-momentum`, `--muon-weight-decay`,
+`--muon-ns-steps`, and `--muon-ns-dtype`.
+
+The implementation follows the documented [PyTorch Muon conventions](https://docs.pytorch.org/docs/2.9/generated/torch.optim.Muon.html):
+`B <- momentum * B + g`, starting from zero; Nesterov uses `g + momentum * B`.
+This is the **unscaled momentum-buffer convention**, not the paper's alternative
+EMA-injection coefficient. The matrix is transposed when tall, Frobenius-normalized
+with `eps=1e-7`, and passed through the quintic polynomial with coefficients
+`(3.4445, -4.775, 2.0315)`. `adjust_lr_fn="original"` scales the direction by
+`sqrt(max(1, rows/cols))`; `"match_rms_adamw"` uses
+`0.2 * sqrt(max(rows, cols))`. Decay uses the **unadjusted** group LR and the
+latest weights, and is included in the saved uncorrected update.
+
+`ns_dtype` defaults to FP32, independently of model BF16 autocast; explicit
+FP64 and BF16 are also supported. Internal autocast is disabled for this
+computation, making worker/caller precision agree. This deliberate numerical
+recipe is not a claim of bit-parity with native PyTorch Muon or a reproduction
+of the paper's unspecified mixed-precision recipe. Matrix groups have one
+momentum tensor, fallback groups have two moments and a step counter, and EF
+adds one history tensor per initialized parameter. Changing parameter roles
+mid-training is unsupported; checkpoint restoration validates role/state keys.
+
 Validate the equations and pipeline/reference parity with:
 
 ```bash
@@ -645,6 +697,19 @@ but not final test accuracy. Do not generalize these single-seed differences.
 Results and six three-update gzip traces are in
 `scratchpad/pipedream_2bw/runs/mnist_ef_bf16/`. Logical EF history is 9,223,208
 bytes across this model; plain variants allocate zero history bytes.
+
+A matched Muon run with the same five-epoch model/data/seed/BF16 setup and the
+above default Muon/AdamW parameter partition completed the same 1,070 updates.
+Test accuracy in sync / 2BW / 2BW+EF order was **97.85% / 97.61% / 97.54%**.
+Epoch-1 validation CE was **0.1001 / 0.1190 / 0.1020**; final validation CE
+was **0.0951 / 0.1034 / 0.0905**. EF improved early and final validation CE
+relative to uncorrected delay here, but not test accuracy; no seed sweep or
+hyperparameter tuning was performed. Muon uses 2,097,152 hidden matrix elements
+and AdamW the remaining 208,650 elements. Results and three independently
+captured three-update traces are in `scratchpad/pipedream_2bw/runs/mnist_muon_bf16/`.
+The independent optimizer check also covers Muon Float64 matrix equations,
+explicit AdamW fallback, FP32/FP64/BF16 NS autocast isolation, state budgets,
+serialization and bit-exact delayed pipeline continuation.
 
 Method source: [One-Step Gradient Delay is Not a Barrier for Large-Scale
 Asynchronous Pipeline Parallel LLM Pretraining](https://arxiv.org/abs/2606.30634v1),
@@ -972,7 +1037,7 @@ x_final = h.result()
 
 - `infer_submit(data)` takes the same input forms as `infer()` and returns an
   `InferBatch` immediately; `wait_mb(i)` streams per-microbatch outputs back
-  (they complete in order — the inter-stage handoffs are FIFO), `result()`
+  (they complete in submission order — the inter-stage handoffs are FIFO), `result()`
   blocks for the whole batch and applies `infer()`'s shape convention.
 - `infer_open(m)` + `submit_mb(i, value)` is the fully-streaming form: a
   microbatch enters stage 0 the instant it's submitted, without waiting for
@@ -984,13 +1049,49 @@ x_final = h.result()
 - Works with offloaded stages too — each stage's worker drives the engine's
   streamed forward serially, the same access pattern as `infer()`.
 - `infer()` is unchanged and remains the right call for one-shot batches;
-  the streaming path exists for loops. `Pipeline.close()` stops the
-  persistent workers.
+  the streaming path exists for loops. `Pipeline.close()` drains already
+  submitted work upstream-to-downstream before stopping the persistent workers.
+  Delivered results remain readable; an unsubmitted slot of a partially filled
+  open handle raises on `wait_mb()` after close instead of blocking forever.
+  Manual `submit_mb()` rejects further input after close. Do not submit new work
+  concurrently with closing the same pipeline.
 
-Measured on `examples/pipeline_infer_stream_demo.py` (4 GPUs, 8 denoising
-steps × 8 microbatches, toy per-sample scheduler): ~1.2–1.3× wall-clock over
-barriered `infer()` per loop, bit-identical outputs. The win grows with
-pipeline depth and step count (the bubble is per-iteration).
+`examples/pipeline_infer_stream_demo.py` compares all three APIs with finite,
+byte-identical output checks, all-participating-device synchronization for clean
+timings, and optional gzip profiles captured separately. Performance is
+workload-dependent: avoiding repeated drain/refill does not guarantee a measured
+speedup when host launch/scheduling or transfers dominate. Historical timing
+ratios should not be extrapolated to another model or GPU setup.
+
+Four distinct RTX PRO 4000 Blackwell GPUs with PyTorch 2.8.0 / CUDA 12.8 passed
+`pipeline_infer_stream_check.py --devices cuda:0,cuda:1,cuda:2,cuda:3 --bf16`
+and `pipeline_infer_close_check.py --devices cuda:0,cuda:1,cuda:2,cuda:3`.
+Coverage includes finite byte parity, FP32/BF16, non-default input and output
+streams with a different current device, continued loops, tuple/padded inputs,
+no-grad/no-gradient-accumulator checks, worker failures, and offload eviction at
+windows 1/2 with three chunks per stage. The close regression holds stage 0
+behind an event, verifies all 32 submitted results survive close, and verifies
+partial handles cannot hang after shutdown. This is correctness validation,
+not proof of bubble-free hardware execution.
+
+For a bounded comparison trace, use e.g.:
+
+```bash
+PYTHONPATH=. python examples/pipeline_infer_stream_demo.py \
+  --devices cuda:0,cuda:1,cuda:2,cuda:3 --chunks-per-stage 3 \
+  --dim 256 --hidden 1024 --vec-ops 4 --batch 256 --mbs 8 \
+  --steps 8 --iters 3 --bf16 --profile loop --profile-path infer_loop.json.gz
+# Repeat with --profile sync; add --offload --window 1 for CPU weight streaming.
+```
+
+The demo checks for real CUDA kernels on every requested device in each trace;
+CPU annotations alone do not establish GPU overlap. On the four-GPU machine
+above, this small BF16 shape gave about **0.90 s sync vs 1.01–1.03 s loop**
+resident and **1.79 s sync vs 1.90–1.91 s loop** with offload window 1, averaged
+over three loops in each of two separate invocations. All outputs were finite
+and byte-identical. This launch-heavy workload did **not** show a streaming
+speedup. The corresponding sync/loop gzip traces contain real kernels on all
+four devices; inspect them rather than inferring utilization from these times.
 
 ---
 
@@ -1037,4 +1138,5 @@ sequential grad-accum final weights to **0.0** (bit-exact).
 | `mnist_pipeline_offload.py` | Pipeline + weight streaming end to end: memory/traffic/stall report vs full-resident |
 | `pipeline_offload_check.py` | Offloaded-stage bit-parity vs plain pipeline + sequential ref (schedules × modes × windows × tuples × bf16 × bypass) |
 | `pipeline_infer_stream_demo.py` | Streaming inference in a toy denoising loop: `infer_loop` / handle API vs barriered `infer()` — timing + bit-identity |
-| `pipeline_infer_stream_check.py` | Streaming-inference bit-parity vs sync `infer()` (submit/trickle/overlap/loop × tensor/tuple/nested × resident/offloaded) |
+| `pipeline_infer_stream_check.py` | Streaming-inference bit-parity vs sync `infer()` including custom caller streams, BF16, continuation and offload eviction |
+| `pipeline_infer_close_check.py` | In-flight close drains queued work; partial handles wake instead of hanging (CPU/CUDA and offloaded stages) |

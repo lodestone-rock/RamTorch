@@ -2,7 +2,7 @@ r"""MNIST convergence: synchronous 1F1B, delayed 2BW, and update-level EF.
 
     python examples/mnist_pipedream_2bw.py --devices cuda:0,cuda:1,cuda:2,cuda:3
 
-Defaults: Adam and Lion, five epochs, identical initial weights and batch order
+Defaults: Adam, Lion and Muon, five epochs, identical initial weights and batch order
 within each seed. Use --seeds 0,1,2 for repeated runs, --bf16 for autocast, or
 --devices cpu,cpu --epochs 1 --train-limit 512 for a small CPU smoke run.
 
@@ -13,8 +13,10 @@ optimizer counters, data order, or timings. Traces are gzip-compressed.
 
 Adam here means Adam with coupled L2 decay, NOT AdamW. Both plain and EF variants
 use AdamEF with c=0/c=1, so correction is the only implementation difference.
-Lion uses decoupled decay. Default decay is zero for both. This is a toy MNIST
-comparison, not a reproduction of the paper's LLM recipe or evidence EF must win.
+Lion uses decoupled decay. Muon uses hidden block matrices only, with AdamW
+fallback for the stem, head and biases. Its Newton-Schulz computation defaults
+to FP32 independently of model autocast. Default decay is zero for all. This is
+a toy comparison, not a reproduction of the LLM recipe or evidence EF must win.
 """
 from __future__ import annotations
 
@@ -45,7 +47,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ramtorch import Pipeline, AdamEF, Lion
+from ramtorch import Pipeline, AdamEF, Lion, Muon
 from ramtorch.pipeline_2bw_trace import TraceCapture, inspect_trace
 
 MODES = ("sync", "2bw", "2bw_ef")
@@ -61,7 +63,8 @@ def positive(value):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--devices", default="cuda:0,cuda:1")
-    parser.add_argument("--optimizers", nargs="+", choices=("adam", "lion"), default=["adam", "lion"])
+    parser.add_argument("--optimizers", nargs="+", choices=("adam", "lion", "muon"),
+                        default=["adam", "lion", "muon"])
     parser.add_argument("--modes", nargs="+", choices=MODES, default=list(MODES))
     parser.add_argument("--seeds", default="0", help="comma-separated model/data seeds")
     parser.add_argument("--epochs", type=positive, default=5)
@@ -74,6 +77,13 @@ def parse_args(argv=None):
     parser.add_argument("--lion-lr", type=float, default=1e-4)
     parser.add_argument("--adam-weight-decay", type=float, default=0.)
     parser.add_argument("--lion-weight-decay", type=float, default=0.)
+    parser.add_argument("--muon-lr", type=float, default=.02)
+    parser.add_argument("--muon-adamw-lr", type=float, default=1e-3,
+                        help="Muon fallback LR for stem/head/biases")
+    parser.add_argument("--muon-weight-decay", type=float, default=0.)
+    parser.add_argument("--muon-momentum", type=float, default=.95)
+    parser.add_argument("--muon-ns-steps", type=positive, default=5)
+    parser.add_argument("--muon-ns-dtype", choices=("float32", "bfloat16"), default="float32")
     parser.add_argument("--ef-coefficient", type=float, default=1.)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--cpu-threads", type=positive, default=4)
@@ -110,7 +120,10 @@ def parse_args(argv=None):
         parser.error("microbatches must be >= stages and divide batch-size")
     if args.profile_steps < 0 or args.validation_size >= 60000:
         parser.error("profile-steps must be >=0 and validation-size <60000")
-    for key in ("adam_lr", "lion_lr", "adam_weight_decay", "lion_weight_decay", "ef_coefficient"):
+    if not math.isfinite(args.muon_momentum) or not 0 <= args.muon_momentum < 1:
+        parser.error("muon-momentum must be finite and in [0,1)")
+    for key in ("adam_lr", "lion_lr", "adam_weight_decay", "lion_weight_decay", "ef_coefficient",
+                "muon_lr", "muon_adamw_lr", "muon_weight_decay"):
         if not math.isfinite(getattr(args, key)) or getattr(args, key) < 0:
             parser.error(key + " must be finite and nonnegative")
     if len(set(args.modes)) != len(args.modes) or len(set(args.optimizers)) != len(args.optimizers):
@@ -142,13 +155,35 @@ def make_pipe(args, devices, seed):
                     autocast=torch.bfloat16 if args.bf16 else None)
 
 
-def factory_for(args, name, mode):
+def factory_for(args, name, mode, stage=None):
     coefficient = args.ef_coefficient if mode == "2bw_ef" else 0.
     if name == "adam":
         return functools.partial(AdamEF, lr=args.adam_lr, weight_decay=args.adam_weight_decay,
                                  betas=(.9, .999), ef_coefficient=coefficient)
-    return functools.partial(Lion, lr=args.lion_lr, weight_decay=args.lion_weight_decay,
-                             betas=(.9, .99), ef_coefficient=coefficient)
+    if name == "lion":
+        return functools.partial(Lion, lr=args.lion_lr, weight_decay=args.lion_weight_decay,
+                                 betas=(.9, .99), ef_coefficient=coefficient)
+    if name != "muon" or stage is None:
+        raise ValueError("Muon factory needs its stage's named parameter partition")
+    # Persist a POSITIONAL role list, not Parameter references. A CPU-optimizer
+    # factory may receive new master Parameters in this same named order.
+    use_muon = [key.startswith("block") and parameter.ndim == 2
+                for key, parameter in stage.module.named_parameters()]
+
+    def build(parameters):
+        parameters = list(parameters)
+        if len(parameters) != len(use_muon):
+            raise ValueError("stage factory parameter order/size changed")
+        groups = []
+        for role, lr in ((True, args.muon_lr), (False, args.muon_adamw_lr)):
+            selected = [p for p, flag in zip(parameters, use_muon) if flag == role]
+            if selected:
+                groups.append(dict(params=selected, use_muon=role, lr=lr))
+        return Muon(groups, momentum=args.muon_momentum, nesterov=True,
+                    ns_steps=args.muon_ns_steps, ns_dtype=getattr(torch, args.muon_ns_dtype),
+                    adjust_lr_fn="original", weight_decay=args.muon_weight_decay,
+                    ef_coefficient=coefficient, betas=(.9, .999))
+    return build
 
 
 def load_data(args):
@@ -277,7 +312,7 @@ def train_variant(args, devices, seed, optimizer_name, mode, data):
     pipe = make_pipe(args, devices, seed)
     trainer = None
     loss_fn = MeanTrainingLoss()
-    factory = factory_for(args, optimizer_name, mode)
+    factories = [factory_for(args, optimizer_name, mode, stage) for stage in pipe.stages]
     # A separate evaluation copy avoids violating trainer ownership. Its memory
     # is not included in a claimed pipeline memory benchmark (none is made).
     evaluation = make_model(args, seed).to(devices[0])
@@ -287,9 +322,10 @@ def train_variant(args, devices, seed, optimizer_name, mode, data):
     training_seconds = 0.
     try:
         if mode == "sync":
-            optimizers = [factory(stage.module.parameters()) for stage in pipe.stages]
+            optimizers = [factory(stage.module.parameters())
+                          for factory, stage in zip(factories, pipe.stages)]
         else:
-            trainer = pipe.train_session(optimizer_factory=factory, n_microbatches=args.microbatches,
+            trainer = pipe.train_session(optimizer_factory=factories, n_microbatches=args.microbatches,
                                          loss_fn=loss_fn)
             optimizers = trainer.optimizers
         initial = evaluate(pipe, evaluation, train, validation_ids, args, devices[0])
@@ -322,6 +358,10 @@ def train_variant(args, devices, seed, optimizer_name, mode, data):
         return dict(seed=seed, optimizer=optimizer_name, mode=mode, curve=curve,
                     test=heldout, training_seconds=training_seconds, parameter_bytes=params,
                     compute_weight_banks=1 if mode == "sync" else 2,
+                    muon_parameter_elements=(sum(p.numel() for optimizer in optimizers
+                                                for group in optimizer.param_groups
+                                                if group.get("use_muon", False)
+                                                for p in group["params"])),
                     **state_bytes(optimizers))
     finally:
         if trainer is not None:
@@ -332,17 +372,18 @@ def train_variant(args, devices, seed, optimizer_name, mode, data):
 def profile_variant(args, devices, seed, optimizer_name, mode, data):
     train, _, ids, _ = data
     pipe = make_pipe(args, devices, seed)
-    factory = factory_for(args, optimizer_name, mode)
+    factories = [factory_for(args, optimizer_name, mode, stage) for stage in pipe.stages]
     trainer = None
     path = args.output_dir / ("{}_{}_seed{}_profile.json.gz".format(optimizer_name, mode, seed))
     loader = replay_batches(train, ids, args, seed, devices[0].type == "cuda")
     try:
         if mode == "sync":
-            optimizers = [factory(stage.module.parameters()) for stage in pipe.stages]
+            optimizers = [factory(stage.module.parameters())
+                          for factory, stage in zip(factories, pipe.stages)]
             run_sync(pipe, optimizers, loader, args.profile_warmup, args.microbatches, F.cross_entropy)
             run_sync(pipe, optimizers, loader, args.profile_steps, args.microbatches, F.cross_entropy, path)
         else:
-            trainer = pipe.train_session(optimizer_factory=factory, n_microbatches=args.microbatches,
+            trainer = pipe.train_session(optimizer_factory=factories, n_microbatches=args.microbatches,
                                          loss_fn=F.cross_entropy)
             trainer.run(loader, updates=args.profile_warmup)
             trainer.run(loader, updates=args.profile_steps, profile_path=path)
@@ -427,6 +468,9 @@ def main(argv=None):
                                "test_examples": len(data[1]), "drop_last": True, "split_seed": 1729,
                                "parameter_dtype": "float32", "constant_lr": True, "gradient_clipping": False,
                                "optimizer_placement": "stage device", "profile_is_separate_replay": True,
+                               "muon_partition": "hidden block 2D weights: Muon; stem/head/all biases: AdamW; EF applies to both groups",
+                               "muon_convention": "B=momentum*B+g; Nesterov g+momentum*B; quintic NS; original shape scaling; unscaled LR for decay",
+                               "muon_ns_dtype": args.muon_ns_dtype,
                                "profile_seeds": seeds[:1], "epoch_boundary_drains": True,
                                "evaluation_weights": "latest trajectory; separate replica",
                                "training_timing": "includes loading, transfers, updates and epoch drain; excludes evaluation, construction and profiling",

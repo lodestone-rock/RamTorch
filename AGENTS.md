@@ -31,7 +31,7 @@ an incidental dependency. Legacy ZeRO utilities are separate and still supported
 - `ramtorch/pipeline_2bw.py`: persistent resident PipeDream-2BW workers, two weight
   banks, bounded admission, and optional CPU optimizer masters/state.
 - `ramtorch/pipeline_2bw_trace.py`: bounded Kineto traces and worker annotations.
-- `ramtorch/delayed_optim.py`: AdamEF/Lion and update-level error feedback.
+- `ramtorch/delayed_optim.py`: AdamEF/Lion/Muon and update-level error feedback.
 - `ramtorch/offload.py`, `pipeline_offload.py`, `nvme_store.py`: streaming engines
   and backing storage. `pipeline_optimizer.py` provides parallel per-stage
   optimizer updates for synchronous pipelines.
@@ -112,6 +112,7 @@ PYTHONPATH=. python examples/pipedream_2bw_optimizer_check.py --devices cpu,cpu 
 
 # Mailbox/streaming-inference regression, CPU only:
 CUDA_VISIBLE_DEVICES= PYTHONPATH=. python examples/pipeline_infer_stream_check.py
+CUDA_VISIBLE_DEVICES= PYTHONPATH=. python examples/pipeline_infer_close_check.py
 
 # On an explicitly available two-GPU machine:
 PYTHONPATH=. python examples/pipedream_2bw_check.py --devices cuda:0,cuda:1
@@ -138,7 +139,7 @@ gradient accumulation, and simulators. NVMe checks require special care above.
   Host spans and simulator predictions are not measured GPU utilization.
 - For convergence, use matched initialization/data/hyperparameters and distinguish
   fresh from delayed gradients. `examples/mnist_pipedream_2bw.py` provides Adam/
-  Lion controls and EF with a short separate profiler replay. Do not claim EF
+  Lion/Muon controls and EF with a short separate profiler replay. Do not claim EF
   universally improves quality from one seed or select recipes on the test set.
 
 ## Change and handoff conventions
