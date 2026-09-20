@@ -5,13 +5,13 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="ramtorch",
-    version="1.9.1",
+    version="1.10.0",
     author="Lodestone",
     author_email="lodestone.rock@gmail.com",
     description="RAM is All You Need",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    license="Apache 2.0 License",
+    license="Apache-2.0",
     url="https://github.com/lodestone-rock/RamTorch",
     packages=find_packages(include=["ramtorch", "ramtorch.*"]),
     install_requires=["torch"],

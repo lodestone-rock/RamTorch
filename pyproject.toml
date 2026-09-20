@@ -1,10 +1,17 @@
+[build-system]
+requires = ["setuptools>=77.0.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "RamTorch"
-version = "1.9.1"
+version = "1.10.0"
 authors = [{name = "Lodestone", email = "lodestone.rock@gmail.com"}]
 description = "RAM is All You Need"
 readme = "README.md"
 requires-python = ">=3.8"
+dependencies = ["torch"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -21,6 +28,3 @@ Homepage = "https://github.com/lodestone-rock/RamTorch"
 [tool.setuptools.packages.find]
 include = ["ramtorch*"]
 exclude = ["examples*", "env*", "scraped*", "kernels*", "data*", "tests*"]
-
-[tool.setuptools]
-license-files = []
