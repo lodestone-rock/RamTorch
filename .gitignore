@@ -11,7 +11,14 @@ data
 __pycache__
 *.json
 *.zip
+*.json.gz
 *.ipynb
 /scraped
 /agents_notepad
+# Local research, external checkouts, and generated experiment artifacts.
+/scratchpad
+# Local development environments and agent-specific private notes.
+/.venv/
+/env/
+/CLAUDE.local.md
 /explore_pipeline_split.py

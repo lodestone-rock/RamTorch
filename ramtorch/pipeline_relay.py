@@ -1114,6 +1114,7 @@ class Pipeline:
         # Persistent streaming-inference session, created lazily by
         # infer_submit/infer_open/infer_loop and stopped by close().
         self._infer_sess: Optional[_InferSession] = None
+        self._train_sess = None
 
         if chunk_modules is not None:
             # ── Flat-chunk convenience: dice into offloaded stages ────────────
@@ -1272,6 +1273,52 @@ class Pipeline:
             )
         return devices
 
+    def _check_no_training(self):
+        if self._train_sess is not None:
+            raise RuntimeError(
+                "a training session is active; close it or call pipe.close() first"
+            )
+
+    def train_session(
+        self,
+        *,
+        optimizer_factory,
+        n_microbatches: int = 4,
+        loss_fn,
+        schedule: str = "pipedream_2bw",
+        max_inflight=None,
+        optimizer_device=None,
+    ):
+        """Create a persistent PipeDream-2BW training session.
+
+        Close any existing training session first. After async inference, call
+        ``pipe.close()`` before creating a trainer, even if inference is idle.
+        Session lifecycle and pipeline entry calls must be serialized by callers.
+        ``optimizer_device='cpu'`` passes CPU master Parameters to the factory:
+        optimizer state and update math stay on CPU, while both compute weight
+        banks remain resident on their stage devices. Default None updates there.
+        """
+        self._check_no_training()
+        if self._infer_sess is not None:
+            raise RuntimeError(
+                "an async inference session exists; call pipe.close() before "
+                "creating a training session, even if inference is idle"
+            )
+        if schedule != "pipedream_2bw":
+            raise ValueError(
+                f"unsupported training schedule {schedule!r}; expected 'pipedream_2bw'"
+            )
+        from .pipeline_2bw import PipeDream2BWTrainer
+
+        return PipeDream2BWTrainer(
+            self,
+            optimizer_factory=optimizer_factory,
+            n_microbatches=n_microbatches,
+            loss_fn=loss_fn,
+            max_inflight=max_inflight,
+            optimizer_device=optimizer_device,
+        )
+
     def step(
         self,
         data: torch.Tensor,
@@ -1299,6 +1346,7 @@ class Pipeline:
         ``dL/dOutput`` directly into the last stage (mutually exclusive with
         ``loss_fn``; no loss is reported). See :func:`run_pipeline_relay`.
         """
+        self._check_no_training()
         if self.autocast_dtype == torch.float16:
             raise ValueError(
                 "fp16 autocast training is not supported: fp16 gradients "
@@ -1357,6 +1405,7 @@ class Pipeline:
 
         Returns ``{stage_index: summary}``.
         """
+        self._check_no_training()
         from .pipeline_offload import OffloadStage
 
         offloaded = [i for i, st in enumerate(self.stages)
@@ -1401,6 +1450,8 @@ class Pipeline:
         """Release stage background resources (offloaded stages' loader and
         writeback threads) and stop the streaming-inference session's worker
         threads if one was started. Idempotent; plain stages no-op."""
+        if self._train_sess is not None:
+            self._train_sess.close()
         if self._infer_sess is not None:
             self._infer_sess.close()
             self._infer_sess = None
@@ -1449,6 +1500,7 @@ class Pipeline:
         :meth:`infer_submit` / :meth:`infer_open` / :meth:`infer_loop`, which
         keep the pipeline flowing across iterations instead of draining it.
         """
+        self._check_no_training()
         return _run_inference(
             self.stages, data, n_microbatches=n_microbatches,
             trace_path=trace_path, profile_path=profile_path,
@@ -1478,6 +1530,7 @@ class Pipeline:
         moment it completes, or ``handle.result()`` to block for the whole
         batch (same return convention as :meth:`infer`).
         """
+        self._check_no_training()
         if isinstance(data, (tuple, list)) and not self._manual:
             raise ValueError(
                 "tuple / nested-tuple pipeline inputs are only supported on the "
@@ -1506,6 +1559,7 @@ class Pipeline:
         one entry of a nested pre-diced :meth:`infer` input. The batch's
         ``result()`` returns a nested tuple of per-microbatch outputs.
         """
+        self._check_no_training()
         sess = self._get_infer_session()
         return InferBatch(sess, int(n_microbatches), True, 0, open_=True)
 
@@ -1535,6 +1589,7 @@ class Pipeline:
         with the overlap. Keep it cheap: it runs serially on the caller
         thread, and the pipeline idles while it runs.
         """
+        self._check_no_training()
         if steps < 1:
             raise ValueError(f"steps must be >= 1, got {steps}")
         h = self.infer_submit(data, n_microbatches=n_microbatches)

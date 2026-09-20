@@ -303,7 +303,11 @@ optimizer = AdamW(rank_groups[rank])
 
 ## Contributing
 
-We welcome contributions! Please see our contributing guidelines for details.
+We welcome contributions from people and coding agents. Start with
+[AGENTS.md](AGENTS.md) for the architecture map, environment setup, correctness
+and safety invariants, and validation commands. It is the shared, tracked
+entrypoint for Cursor and other agents; [CLAUDE.md](CLAUDE.md) imports the same
+guide for Claude Code. No local `agents_notepad/` or research checkout is needed.
 
 ## License
 

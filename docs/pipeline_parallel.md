@@ -373,6 +373,405 @@ python -m ramtorch.schedule_simulator --p 8 --m 16 --plot gantt.png
 
 ---
 
+## Resident PipeDream-2BW training
+
+`Pipeline.train_session(...)` creates a `PipeDream2BWTrainer` with persistent
+stage workers and stage-local updates. It is a **separate, one-update-stale
+training algorithm**, not another `Pipeline.step` schedule. Existing synchronous
+`step` / `flush_grads` / external-optimizer training and inference are unchanged;
+2BW weights are **not** expected to match synchronous training.
+
+### Update semantics and two weight banks
+
+Let \(w_0\) be the initial weights, \(g\) the zero-based update group,
+\(s_g\) the current optimizer state, and \(p\) the pipeline depth. Set
+\(m =\) `n_microbatches`, with **\(m \ge p\)**. All microbatches in group \(g\)
+evaluate at \(w_{\max(g-1,0)}\), using that same version for forward and backward.
+Accumulate gradients in ascending microbatch order and scale **once** by \(1/m\):
+
+\[
+G_g = \frac{1}{m}\sum_{j=0}^{m-1}
+\nabla_w \ell_{g,j}\!\left(w_{\max(g-1,0)}\right),\qquad
+(w_{g+1}, s_{g+1}) = \operatorname{Optimizer}(w_g, s_g, G_g).
+\]
+
+The bootstrap is intentional: **groups 0 and 1 both evaluate \(w_0\)**, but
+apply their gradients to \(w_0\) and \(w_1\), respectively. The optimizer always
+uses the latest weights and its current state, never a rewound momentum or
+Adam state. Each stage holds **two weight banks but only one optimizer/state
+set**. A bank remains intact until its live backward graphs retire.
+
+### API and ownership
+
+```python
+import torch
+from torch import nn
+from torch.nn import functional as F
+from ramtorch import Pipeline
+
+# Fresh, deterministic, buffer-free resident stages; use ["cpu", "cpu"] on CPU.
+pipe = Pipeline(
+    stage_modules=[nn.Sequential(nn.Linear(16, 32), nn.GELU()), nn.Linear(32, 16)],
+    devices=["cuda:0", "cuda:1"], offload=False,
+    # autocast=torch.bfloat16,  # optional; FP32 parameters, no GradScaler
+)
+factory = lambda params: torch.optim.AdamW(
+    params, lr=1e-3, foreach=False, fused=False)
+
+# train_loader yields at least 10 full (inputs, targets) batches, e.g. [32, 16].
+loader = iter(train_loader)
+with pipe.train_session(optimizer_factory=factory, n_microbatches=4,
+                        loss_fn=F.mse_loss, schedule="pipedream_2bw",
+                        max_inflight=10) as trainer:
+    result = trainer.run(loader, updates=8)
+    result = trainer.run(loader, updates=2)  # continues history; total_updates == 10
+# close() publishes the latest weights to the original stage modules.
+pipe.close()
+```
+
+- `optimizer_factory(params)` must create a fresh **standard `torch.optim.SGD`,
+  `torch.optim.Adam`, `torch.optim.AdamW`, or RamTorch `AdamEF`/`Lion`**, owning
+  exactly those stage parameters. Pass one
+  factory for all stages or a list of one factory per stage. For example, use
+  `lambda params: torch.optim.SGD(params, lr=0.01, momentum=0.9, foreach=False,
+  fused=False)` for momentum SGD. Custom subclasses and differentiable/capturable
+  optimizer modes are unsupported. The trainer owns stepping and gradient
+  clearing: **no external optimizer, `flush_grads()`, or parameter mutation**
+  while the session owns the pipeline.
+- `run(loader, updates=N)` consumes exactly `N` full batches and performs `N`
+  updates per stage. Each finite run has **one fill and one drain**, not one
+  per update group; repeated one-update runs give up cross-group overlap.
+  Further runs preserve weight versions, optimizer state, and global group /
+  microbatch counters. Each call uses `iter(loader)`; retain an iterator as
+  above to continue consuming data instead of restarting a reiterable loader.
+  The result contains `updates`, `total_updates`, and `peak_inflight`, not
+  retained outputs or a loss history.
+- **Caller-serialize the entire lifecycle**, including creation, `run`, `close`,
+  and other pipeline entry calls. Close any asynchronous inference session with
+  `pipe.close()` first, even if idle. Do not call `step`, inference, or mutate
+  modules while a trainer is open. Context exit / `trainer.close()` joins its
+  workers and exposes the latest weights. A failed run poisons the session:
+  close it; partial updates are **not rolled back**.
+- Start with **clean stages**: no cached graphs, parameter `.grad`, or prior
+  `stage.grad_acc`. Ordinary `flush_grads()` / `zero_grad()` can leave allocated,
+  zero-filled stage accumulators, which still fail this check; prefer a fresh
+  `Pipeline` rather than reusing one previously trained through `step()`.
+- Initial support is **manual, fully resident, deterministic, buffer-free**
+  `stage_modules`, or `chunk_modules` with **`offload=False`** (chunks otherwise
+  default to offload). Every stage needs trainable parameters. No auto-traced
+  `PipelineModel`, weight/activation offload, shared/tied parameters, dropout /
+  stochastic or stateful forwards, activation checkpointing, or fp16 training.
+  Use FP32 or BF16 autocast. Forward-mutating embedding `max_norm` and internal
+  attention/RNN dropout are rejected; custom forwards must obey the same
+  no-mutation/no-randomness restrictions. Stages must all be CUDA-resident
+  (or all CPU for tests); mixed CPU/CUDA stages are not supported.
+
+### CPU optimizer state and fused updates (experimental)
+
+`optimizer_device="cpu"` leaves **both compute weight banks on each GPU** but
+creates a separate CPU master parameter set for the optimizer. Forward/backward
+remain GPU-resident; this is optimizer offload, not weight/activation offload.
+The factory receives these CPU masters instead of the module's GPU Parameters:
+
+```python
+factory = lambda params: torch.optim.AdamW(
+    params, lr=1e-3, foreach=False, fused=True)
+with pipe.train_session(optimizer_factory=factory, optimizer_device="cpu",
+                        n_microbatches=4, loss_fn=F.mse_loss) as trainer:
+    trainer.run(train_loader, updates=12)
+```
+
+- Masters, gradient transfer buffers, Adam moments, and step counters are on
+  CPU; the **update math executes on CPU** using PyTorch's native fused kernel.
+  CUDA stages use pinned CPU masters and gradient buffers. Moments do not move
+  between devices. `optimizer_device=None` preserves the GPU optimizer default.
+- Each local update scales the accumulated CUDA gradient once, copies it D2H,
+  waits for a **stage-stream event**, runs the CPU optimizer, then uploads the
+  updated master into the retired GPU bank. The live old bank is not modified.
+  Uploads and subsequent compute use the same stage stream; the next update's
+  D2H event also fences CPU-master reuse after the preceding H2D read.
+- There is no global update barrier, but a stage's worker waits for its own
+  transfer and CPU update. Other stages may proceed. This implementation does
+  **not** bucket or overlap a stage's CPU update with that same stage's compute.
+- CPU storage adds a master copy and persistent gradient buffers alongside Adam
+  state. GPU storage no longer contains Adam moments. Choose CPU thread counts
+  deliberately: multiple stage workers can enter multithreaded CPU kernels at
+  once. The library does not change the application's thread settings.
+- CPU fused versus GPU non-fused optimizer rounding is not guaranteed identical.
+  Correctness comparisons must use the same optimizer implementation/device in
+  the independent oracle. Profiling spans separate `optimizer_d2h`,
+  `optimizer_d2h_wait`, `optimizer_cpu`, and `optimizer_h2d` from F/B operations.
+
+For the larger/deeper paired experiment, both variants use **the same 2BW
+schedule** (GPU non-fused AdamW versus CPU fused AdamW), not synchronous 1F1B:
+
+```bash
+PYTHONPATH=. python -u examples/pipedream_2bw_demo.py --compare-cpu-optimizer \
+    --devices cuda:0,cuda:1,cuda:2,cuda:3 --dim 4096 --layers 16 \
+    --microbatches 4 --batch-size 128 --updates 12 --optimizer adamw \
+    --lr 0.001 --bf16 --cpu-threads 6 \
+    --output-dir scratchpad/pipedream_2bw/runs/cpu_fused_4096_16layers
+```
+
+Replace `--compare-cpu-optimizer` with **`--compare-all`** to also run synchronous
+`staggered_1b1f` with GPU AdamW and CPU-fused AdamW. The synchronous CPU baseline
+uses a single resident GPU weight copy, drains each batch's forward/backward,
+then runs per-stage CPU updates concurrently. Each stage explicitly fences
+D2H before CPU access and completes H2D before the next full batch. It uses
+fresh gradients, not the delayed-gradient 2BW rule. This adapter is a demo
+comparison path, not a change to the `Pipeline.step()` API.
+
+The demo captures separate fresh-model clean timings and profiles, writes gzip
+traces and a ZIP bundle, and records CPU optimizer placement/storage separately
+from CUDA allocator usage. This compares a placement **and kernel** change;
+it does not isolate CPU-vs-GPU hardware with an identical optimizer kernel.
+
+Focused CPU-fused correctness checks (both FP32 and BF16, frozen/unused/zero
+gradients, continuation, no-observer runs, and transfer-storage lifetimes):
+
+```bash
+PYTHONPATH=. python examples/pipedream_2bw_check.py --cpu-optimizer-only \
+    --devices cuda:0,cuda:1,cuda:2,cuda:3
+```
+
+The reference also accepts `--optimizer-device cpu --fused`; the checker's
+`--long-run` mode accepts the same flags for custom longer comparisons.
+
+**Measured 2026-09-20:** four RTX PRO 4000 Blackwell GPUs, EPYC 7352 CPU,
+PyTorch 2.8.0/CUDA 12.8, six intra-op CPU threads. At width 4096, 16 blocks,
+BF16, four microbatches of 128, and 12 updates, clean elapsed time was **3.683 s
+GPU optimizer vs 12.280 s CPU fused** (0.300x throughput). Peak stage-0 CUDA
+allocation fell from **15.45 GiB to 11.52 GiB**. CPU storage for the whole model
+was about **8 GiB masters + 8 GiB retained gradients + 16 GiB Adam state**;
+these are logical tensor bytes, not process RSS. Each update transfers about
+8 GiB of gradients D2H and 8 GiB of updated weights H2D across all four stages.
+
+The paired gzip traces and ZIP are in
+`scratchpad/pipedream_2bw/runs/cpu_fused_4096_16layers/`. Both traces have real
+CUDA kernels on all four devices; the CPU trace has 768 D2H and 864 H2D copies
+(the latter includes input/target loading). Each stage has 48 F, 48 B, 12 U and
+12 of each CPU-optimizer span; weight-version ordering and next-group forwards
+before the previous update were verified. Small-model FP32/BF16 checks matched
+the independent CPU-fused oracle byte-for-byte, including no-observer runs.
+This is an initial stage-local blocking implementation, not a claim about an
+optimized bucketed/overlapped CPU optimizer. Timings include first-step state
+allocation; profiler spans are not clean isolated kernel timings.
+
+A subsequent matched **four-way `--compare-all` run** on the same workload
+measured 2BW / synchronous 1F1B at **3.687 / 4.447 s with GPU AdamW**, and
+**12.439 / 14.371 s with CPU-fused AdamW**. That is 1.206x and 1.155x 2BW
+throughput respectively. Each is one clean timing sample; all four modes were
+rerun together rather than mixing measurements from separate experiments.
+All four profiles and metadata are in
+`scratchpad/pipedream_2bw/runs/four_way_4096_16layers/`. The synchronous CPU path
+also passed small-model FP32/BF16 bytewise checks against an independent
+**fresh-gradient** CPU-fused oracle (`--sync-cpu-optimizer-only`), including
+continued calls and single-bank storage. 1F1B versus 2BW is not weight parity:
+the former uses fresh gradients, the latter one-update-delayed gradients.
+
+### MNIST convergence and update-level error feedback
+
+`examples/mnist_pipedream_2bw.py` compares **Adam and Lion**, each with
+synchronous `staggered_1b1f`, ordinary delayed 2BW, and delayed 2BW + EF:
+
+```bash
+python examples/mnist_pipedream_2bw.py \
+  --devices cuda:0,cuda:1,cuda:2,cuda:3 --epochs 5 \
+  --dim 256 --blocks 4 --batch-size 256 --microbatches 4 \
+  --profile-warmup 3 --profile-steps 3
+```
+
+The example requires `torchvision` (MNIST); `matplotlib` is optional for the PNG.
+Outputs include `metrics.json`, `curves.csv`, `convergence.png` when available,
+one gzip trace per variant, and `mnist_convergence_bundle.zip`. Use
+`--seeds 0,1,2` for repeated convergence runs, `--bf16` for BF16 autocast with
+FP32 parameters, or `--profile-steps 0` to disable profiling. Traces use only the
+first seed and a **separate fresh-model replay** after warmup, not the full
+training run. These short captures include their own fill/drain and are not
+steady-state throughput measurements.
+
+The fixed split holds 5,000 training-set examples out for validation, trains on
+55,000 with `drop_last=True`, and evaluates the untouched 10,000-example test
+set at the end. All variants share initialization, epoch permutations, effective
+batch size, and optimizer-specific hyperparameters. Parameters and optimizer
+state remain on stage devices. The session persists between epochs; validation
+uses a separate latest-weight replica after a drain, without resetting the 2BW
+history. No clipping or LR schedule is used; this is not a reproduction of the
+paper's LLM recipes. A single seed is a demo, not statistical evidence EF helps.
+
+`ramtorch.AdamEF` and `ramtorch.Lion` implement **update-level**, not raw-gradient,
+error feedback. For the complete uncorrected optimizer update `u`, they apply
+`x <- x - u - c * (u - previous_update)`. The first completed optimizer call uses
+an ordinary update; correction begins on the second. This maps the paper's
+initial no-op and bootstrap onto the runtime's count of actual updates: no extra
+no-op is inserted into the 2BW schedule. Each gradient advances moments exactly
+once. The saved buffer holds the **uncorrected update**, not the corrected
+parameter displacement or a subtraction of rounded before/after weights.
+
+Both classes accept `ef_coefficient` (`AdamEF` defaults to 1, `Lion` to 0).
+The example uses the same class with `c=0` for plain controls and `c=1` for EF.
+`AdamEF` defaults to coupled L2 decay, i.e. **Adam, not AdamW**; setting
+`decoupled_weight_decay=True` gives AdamW-style decay. Lion uses decoupled decay.
+Decoupled decay is computed at the current/latest weights and included in `u`.
+The saved update includes that step's learning rate; changing LR does not
+rescale historical updates. Missing gradients skip parameter/moment updates and
+zero any existing update history for that logical call, rather than replaying an
+older update. Explicit zero gradients still perform normal optimizer updates.
+
+EF adds **one persistent parameter-sized history tensor** when `c>0`; `c=0`
+allocates none. Thus relative to ordinary synchronous training, 2BW+EF adds one
+compute-weight bank and one update-history state, besides existing moments,
+gradients, activation storage and transient update tensors. `metrics.json`
+reports logical state bytes rather than implying a peak-memory benchmark.
+The new optimizers accept dense real FP32/FP64 parameters; mixed precision here
+means BF16 autocast, not BF16 optimizer parameters. They do not integrate fused,
+capturable or GradScaler skip semantics. Optimizer `state_dict()` restoration
+includes history and startup counters; this is **not** a full 2BW-session
+checkpoint API (which would also need both weight banks and version metadata).
+
+Validate the equations and pipeline/reference parity with:
+
+```bash
+PYTHONPATH=. python examples/pipedream_2bw_optimizer_check.py --devices cpu,cpu --bf16
+PYTHONPATH=. python examples/pipedream_2bw_optimizer_check.py --devices cuda:0,cuda:1,cuda:2,cuda:3 --bf16
+```
+
+A five-epoch seed-0 BF16 run on four RTX PRO 4000 Blackwell GPUs (width 256,
+four blocks, batch 256, four microbatches) completed 1,070 updates per variant.
+Final test accuracy, in synchronous / 2BW / 2BW+EF order: **Adam 97.78% /
+97.87% / 97.48%**, **Lion 97.51% / 97.48% / 97.61%**. Adam EF improved the
+early validation loss (epoch 1: 0.1762 delayed -> 0.1249 EF, versus 0.1145 sync)
+but not final test accuracy. Do not generalize these single-seed differences.
+Results and six three-update gzip traces are in
+`scratchpad/pipedream_2bw/runs/mnist_ef_bf16/`. Logical EF history is 9,223,208
+bytes across this model; plain variants allocate zero history bytes.
+
+Method source: [One-Step Gradient Delay is Not a Barrier for Large-Scale
+Asynchronous Pipeline Parallel LLM Pretraining](https://arxiv.org/abs/2606.30634v1),
+using the supplied Algorithm 1/2 description. No claim of paper-code reproduction
+or universal convergence improvement is made.
+
+### Loader, loss, and bounded overlap
+
+The loader must yield `(inputs, targets)`; use `(inputs, None)` for a loss that
+needs no targets. Inputs and non-`None` targets are batched tensors or flat
+tuples of batched tensors. Batch dimensions must agree, be at least `m`, and
+split evenly into `m` equal-size microbatches. There is **no padding, partial
+update group, or nested pre-diced input** in this API. An exhausted loader
+before `updates` groups is an error. Do not reuse/mutate yielded storage while
+asynchronous consumers may still be copying it.
+
+`loss_fn(output, target)` runs on the last stage, receiving `None` when targets
+are absent, and must return a **scalar microbatch-mean loss**. The trainer
+averages accumulated gradients across the `m` microbatches; do not pre-divide
+the loss by `m`. Tuple stage outputs and forward-only `out_no_grad` masks are
+supported, but the session has no `grad_outputs=` bypass.
+
+`max_inflight` counts admitted microbatches and must be at least the pipeline
+depth (default `2 * m + depth`). Credits return only after stage-0 backward
+retirement, including its CUDA completion event, not merely host enqueueing.
+This bounds the runtime's live microbatch window, not memory held by the loader
+or debug snapshots. Each **producing stage** transfers its outgoing activation /
+input-gradient boundary tensors to the next consumer device, with event-ordered
+handoffs. Workers update locally: **no global synchronization per group**.
+Backpressure may wait on an individual retirement event; each run drains its
+participating streams before returning.
+
+### Correctness checks and profiling
+
+`trainer.run(..., observer=callback)` calls `callback(stage, group, snapshot)`
+with detached CPU copies of named `grads` (mean-scaled, before optimizer weight
+decay), post-update `weights`, and post-update `optimizer` state. These copies
+**synchronize CUDA and are a correctness/debug path, never a benchmark path**.
+The independent reference uses copied historical models, not the pipeline
+scheduler; exact comparisons are for the same device, dtype, and environment,
+not CPU-versus-CUDA bit identity.
+
+`trainer.run(..., profile_path="run.json.gz")` captures a bounded run as a
+compressed Kineto trace; create the parent directory first. CPU spans include
+stage/group/version/slot annotations, loading, transfers, waits, weight copies,
+and optimizer work. They describe host execution/enqueueing, not GPU execution:
+real GPU kernel events require working CUDA/Kineto/CUPTI.
+
+Run from the repository root (substitute your environment's Python):
+
+```bash
+PYTHONPATH=. python examples/pipedream_2bw_reference.py --device cpu --self-test
+PYTHONPATH=. python examples/pipedream_2bw_reference.py --device cuda:0 --optimizer adamw --bf16 --updates 8
+PYTHONPATH=. python examples/pipedream_2bw_check.py --devices cpu,cpu
+PYTHONPATH=. python examples/pipedream_2bw_check.py --devices cuda:0,cuda:1
+PYTHONPATH=. python examples/pipedream_2bw_demo.py --devices cuda:0,cuda:1 \
+    --dim 512 --layers 8 --microbatches 8 --updates 16 --batch-size 32 \
+    --optimizer adamw --bf16 --output-dir scratchpad/pipedream_2bw/demo
+```
+
+For a longer **four-GPU vs single-GPU delayed-gradient** comparison at the
+original workload (width 1024, eight residual MLP blocks, four microbatches of
+128 samples), use the bounded-snapshot mode:
+
+```bash
+PYTHONPATH=. python -u examples/pipedream_2bw_check.py --long-run \
+    --devices cuda:0,cuda:1,cuda:2,cuda:3 --dim 1024 --layers 8 \
+    --microbatches 4 --batch-size 128 --updates 100 --optimizer adamw \
+    --lr 0.001 --bf16 --report scratchpad/pipedream_2bw/runs/long_exact/bf16_100.json
+```
+
+Omit `--bf16` for FP32. The oracle executes the complete unsplit model on the
+first listed device, while the pipeline performs one continuous `run()` across
+all listed devices. Every update compares named scaled gradients, post-update
+weights, and optimizer state directly with zero tolerance **and byte equality**
+(including signed zero), rejecting nonfinite tensors. Snapshots are checked and
+released through bounded per-stage queues instead of retaining all steps. This
+adds debug synchronization/backpressure and shares the oracle's GPU with stage
+0: **do not use this run's wall time as throughput**. Input fixtures are still
+pre-generated on CPU; their memory grows with the requested update count.
+
+To run just the independent single-GPU reference at the same workload:
+
+```bash
+PYTHONPATH=. python -u examples/pipedream_2bw_reference.py --device cuda:0 \
+    --dim 1024 --layers 8 --microbatches 4 --batch-size 128 --updates 100 \
+    --optimizer adamw --lr 0.001 --bf16 --stream
+```
+
+`--stream` prints each reference update without retaining the tensor trajectory;
+it is not itself a pipeline parity test. The reference uses two ordinary models
+and a bounded deque of copied historical states, without runtime bank swapping.
+
+The CUDA-only demo compares 2BW with synchronous `staggered_1b1f`, with separate
+warmups, fresh clean-timing models, and separate fresh-model profiles; no
+observer or profiling overhead enters reported speedup. Loading, transfers,
+optimizer updates, and the final drain count toward timing. `--batch-size` is
+**per microbatch**. It writes `pipedream_2bw.json.gz`, `staggered_1b1f.json.gz`,
+`metadata.json`, and a compressed `pipedream_2bw_bundle.zip`; missing real GPU
+kernel events on any requested device make the demo fail after saving the
+diagnostic bundle. This is a throughput comparison of **different update
+semantics**, not a final-weight parity test.
+
+**Validation (2026-09-20):** the complete per-update exact suite passed on four
+RTX PRO 4000 Blackwell GPUs with PyTorch 2.8.0 / CUDA 12.8, including BF16,
+SGD/momentum, AdamW, tuple relays, continuation, minimum-capacity admission,
+and failure cleanup. A separate no-observer run also matched final weights and
+optimizer state exactly; debug snapshot synchronization is not required for
+correctness. Existing resident, tuple/autocast, and streaming-inference checks
+passed. The longer base-workload comparison (width 1024, eight blocks, four
+microbatches of 128 samples, AdamW at lr=0.001) also passed **100 updates / 400
+microbatches separately in BF16 and FP32**, comparing all gradients, weights,
+and optimizer state byte-for-byte at every update against the unsplit single-GPU
+oracle. Reports are in `scratchpad/pipedream_2bw/runs/long_exact/` as
+`bf16_100.json` and `fp32_100.json`. These results are not a claim of bit identity
+across precisions or software releases.
+
+The example capture (8 residual blocks, width 1024, 128 samples per microbatch,
+4 microbatches/update, 12 updates, BF16/AdamW) contains real CUDA kernels on all
+four devices and 48 F / 48 B / 12 U operations per stage. Version ordering and
+next-group forwards before the preceding update were checked in the trace.
+Clean timing in the final capture run was 0.556 s for 2BW versus 0.864 s for
+synchronous 1F1B (1.55x throughput); this is a workload-specific observation,
+not a guarantee.
+
+---
+
 ## Streaming stage weights from CPU RAM (pipeline + offload)
 
 When a stage's shard doesn't fit in its GPU's memory, combine the pipeline
@@ -632,6 +1031,9 @@ sequential grad-accum final weights to **0.0** (bit-exact).
 | `mnist_pipeline_vs_single.py` | Pipeline vs single-GPU loss/grad/weight parity |
 | `mnist_seq_vs_gradaccum.py` | Pipeline vs sequential grad-accum (liability check) |
 | `pipeline_easy_demo.py` | `PipelineModel` forward + train + eval |
+| `pipedream_2bw_reference.py` | Independent copied-history stale-gradient oracle, scalar recurrence self-tests, SGD/AdamW, CPU/CUDA and optional BF16 |
+| `pipedream_2bw_check.py` | Per-update 2BW gradient/weight/optimizer-state checks against the oracle; bank lifetime, schedule/bootstrap, continuation, bounded admission, and failure cleanup |
+| `pipedream_2bw_demo.py` | CUDA 2BW vs synchronous throughput with separate clean timings/profiles, per-device kernel checks, metadata and compressed trace ZIP; not weight parity |
 | `mnist_pipeline_offload.py` | Pipeline + weight streaming end to end: memory/traffic/stall report vs full-resident |
 | `pipeline_offload_check.py` | Offloaded-stage bit-parity vs plain pipeline + sequential ref (schedules × modes × windows × tuples × bf16 × bypass) |
 | `pipeline_infer_stream_demo.py` | Streaming inference in a toy denoising loop: `infer_loop` / handle API vs barriered `infer()` — timing + bit-identity |
