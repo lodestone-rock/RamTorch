@@ -853,10 +853,19 @@ class _InferSession:
         if self._closed:
             return
         self._closed = True
-        for q in self._qs:
+        # Drain upstream before stopping downstream. Enqueuing all sentinels
+        # at once lets a later stage exit before its predecessor has relayed
+        # the already-submitted microbatches, leaving their handles blocked.
+        for q, worker in zip(self._qs, self._workers):
             q.put(None)
-        for w in self._workers:
-            w.join()
+            worker.join()
+        # An infer_open() batch can be only partially submitted. Complete
+        # results survive release(); missing results must wake and fail rather
+        # than waiting forever after their workers have exited.
+        with self._live_lock:
+            live = list(self._live)
+        for handle in live:
+            handle._abort()
 
 
 class InferBatch:
@@ -868,8 +877,8 @@ class InferBatch:
     :meth:`submit_mb`). Results stream back per microbatch:
 
     * :meth:`wait_mb` blocks until microbatch ``i``'s output is ready and
-      returns it. Outputs complete in microbatch order (the inter-stage
-      queues are FIFO), so waiting in order is never wasteful.
+      returns it. Outputs follow submission order (the inter-stage queues
+      are FIFO); ``infer_submit`` submits indices in ascending order.
     * :meth:`result` waits for ALL microbatches and applies
       :meth:`Pipeline.infer`'s return convention: nested pre-diced input (or
       an ``infer_open`` batch) -> nested tuple of per-microbatch outputs;
